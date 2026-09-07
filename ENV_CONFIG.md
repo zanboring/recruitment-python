@@ -25,6 +25,13 @@ OLLAMA_ENABLED=true
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=qwen2:7b
 
+# ========== 知识库语义检索（向量 RAG）==========
+# 复用上面的 ZHIPUAI_API_KEY；不填 Key 时自动降级为关键词检索
+EMBEDDING_ENABLED=true
+EMBEDDING_MODEL=embedding-3
+EMBEDDING_API_URL=https://open.bigmodel.cn/api/paas/v4/embeddings
+EMBEDDING_DIMENSIONS=1024
+
 # ========== 爬虫 ==========
 CRAWL_MAX_JOBS=200
 CRAWL_RETRY_TIMES=4
@@ -108,8 +115,8 @@ logging:
 # 1. 创建数据库
 mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS recruitment_db DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 
-# 2. 运行建表脚本 (表结构见 TECH_SPEC.md 第1节)
-# 或使用 SQLAlchemy 的 create_all()
+# 2. 运行初始化脚本（自动建表 + 插入默认管理员 admin/admin123）
+python scripts/init_db.py
 ```
 
 ## Playwright 浏览器安装

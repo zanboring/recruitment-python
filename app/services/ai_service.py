@@ -91,6 +91,40 @@ async def call_glm4_stream(message: str, session_id: str = "", db=None) -> Async
                         continue
 
 
+async def _call_glm4_sync(messages: list) -> str:
+    """非流式调用 GLM-4-Flash，返回完整回复文本。用于工具识别阶段。"""
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {settings.zhipuai_api_key}"
+    }
+    payload = {
+        "model": "glm-4-flash",
+        "messages": messages,
+        "stream": False,
+        "temperature": 0.1,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(settings.zhipuai_api_url, headers=headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+
+
+async def _detect_tool_call(message: str) -> dict | None:
+    """判断用户消息是否需要调用岗位查询工具。
+
+    用低温度 + 强约束的 system prompt 引导模型输出 JSON 工具调用或 NONE，
+    再解析返回结果。返回 None 表示无需调用工具。
+    """
+    from app.services.tool_service import build_tool_detection_prompt, extract_tool_call
+
+    reply = await _call_glm4_sync([
+        {"role": "system", "content": build_tool_detection_prompt()},
+        {"role": "user", "content": message},
+    ])
+    return extract_tool_call(reply)
+
+
 async def call_ollama_stream(message: str, session_id: str = "", db=None) -> AsyncGenerator[str, None]:
     history = await _get_conversation_history(session_id)
 
@@ -128,6 +162,27 @@ async def call_ollama_stream(message: str, session_id: str = "", db=None) -> Asy
 
 async def call_chat_stream(message: str, session_id: str = "", db=None) -> AsyncGenerator[str, None]:
     response_content = ""
+
+    # ===== Function Calling：工具识别 → 执行 → 结果注入二次生成 =====
+    if db and settings.zhipuai_api_key:
+        try:
+            from app.services.tool_service import build_tool_result_context, execute_tool
+
+            tool_call = await _detect_tool_call(message)
+            if tool_call:
+                tool_result = await execute_tool(
+                    tool_call["tool"], tool_call.get("args", {}), db
+                )
+                augmented = build_tool_result_context(tool_result) + f"\n用户的问题：{message}"
+                async for chunk in call_glm4_stream(augmented, session_id, db):
+                    response_content += chunk
+                    yield chunk
+                if response_content:
+                    from app.services.knowledge_service import KnowledgeService
+                    await KnowledgeService.learn_from_response(db, message, response_content)
+                return
+        except Exception as e:
+            logger.warning(f"Function calling 失败，回退到普通对话: {e}")
 
     if settings.zhipuai_api_key:
         try:

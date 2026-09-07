@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     zhipuai_api_key: str = ""
     zhipuai_api_url: str = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 
+    embedding_enabled: bool = True
+    embedding_model: str = "embedding-3"
+    embedding_api_url: str = "https://open.bigmodel.cn/api/paas/v4/embeddings"
+    embedding_dimensions: int = 1024
+
     ollama_enabled: bool = True
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2:7b"

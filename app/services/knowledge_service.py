@@ -1,9 +1,16 @@
+import logging
 import time
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func, update
 
+from app.config import settings
 from app.models.knowledge_base import KnowledgeBase
 from app.schemas.knowledge import KnowledgeBaseCreate, KnowledgeBaseUpdate
+
+logger = logging.getLogger(__name__)
+
+# 语义检索相似度阈值：低于该值的命中视为噪音，不注入上下文，改走关键词降级
+SEMANTIC_THRESHOLD = 0.3
 
 KEYWORDS = {
     "薪资", "推荐", "分析", "统计", "爬虫", "AI", "招聘", "岗位",
@@ -125,6 +132,71 @@ class KnowledgeService:
 
     @staticmethod
     async def get_context_for_ai(db: AsyncSession, keyword: str) -> str:
+        matches = await KnowledgeService._retrieve(db, keyword)
+
+        for m in matches:
+            await db.execute(
+                update(KnowledgeBase).where(KnowledgeBase.id == m.id).values(
+                    usage_count=KnowledgeBase.usage_count + 1
+                )
+            )
+        await db.commit()
+
+        if not matches:
+            return ""
+        context = "以下是相关知识库内容，请参考回答：\n\n"
+        for m in matches:
+            context += f"问：{m.question}\n答：{m.answer}\n\n"
+        return context
+
+    @staticmethod
+    async def _retrieve(db: AsyncSession, keyword: str) -> list:
+        """知识库检索：语义向量检索优先，失败或无命中时降级为关键词匹配。
+
+        语义检索能把「工资多少」和「薪资水平」这类表述不同但语义相近的问题
+        关联起来；向量化不可用（无 key / 网络失败 / 接口报错）时自动回退，
+        保证服务不中断。
+        """
+        if settings.embedding_enabled:
+            try:
+                semantic = await KnowledgeService._semantic_search(db, keyword, top_k=5)
+                if semantic:
+                    return semantic
+            except Exception as e:
+                logger.warning(f"语义检索失败，降级关键词检索: {e}")
+        return await KnowledgeService._keyword_search(db, keyword)
+
+    @staticmethod
+    async def _semantic_search(db: AsyncSession, query: str, top_k: int = 5) -> list:
+        """语义向量检索：查询与所有启用条目向量化后按余弦相似度排序取 Top-K。
+
+        返回相似度不低于 SEMANTIC_THRESHOLD 的条目；若最高分仍低于阈值，视为
+        无相关命中返回空列表（由 _retrieve 继续降级关键词）。
+        """
+        from app.services.embedding_service import embed_texts, cosine
+
+        items = await KnowledgeService.get_all_enabled(db)
+        if not items:
+            return []
+
+        doc_texts = [f"{it.question}\n{it.answer}\n{it.tags or ''}" for it in items]
+        vectors = await embed_texts([query] + doc_texts)
+        query_vec = vectors[0]
+        doc_vecs = vectors[1:]
+
+        scored = [
+            (cosine(query_vec, vec), it)
+            for it, vec in zip(items, doc_vecs)
+        ]
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        if not scored or scored[0][0] < SEMANTIC_THRESHOLD:
+            return []
+        return [it for sim, it in scored[:top_k] if sim >= SEMANTIC_THRESHOLD]
+
+    @staticmethod
+    async def _keyword_search(db: AsyncSession, keyword: str) -> list:
+        """关键词检索（降级方案）：精确匹配优先，其次模糊匹配。"""
         stmt = select(KnowledgeBase).where(
             KnowledgeBase.status == 1,
             KnowledgeBase.question == keyword
@@ -145,20 +217,7 @@ class KnowledgeService:
             result = await db.execute(stmt)
             matches = result.scalars().all()
 
-        for m in matches:
-            await db.execute(
-                update(KnowledgeBase).where(KnowledgeBase.id == m.id).values(
-                    usage_count=KnowledgeBase.usage_count + 1
-                )
-            )
-        await db.commit()
-
-        if not matches:
-            return ""
-        context = "以下是相关知识库内容，请参考回答：\n\n"
-        for m in matches:
-            context += f"问：{m.question}\n答：{m.answer}\n\n"
-        return context
+        return matches
 
     @staticmethod
     async def learn_from_response(db: AsyncSession, question: str, answer: str, tags: str = ""):
