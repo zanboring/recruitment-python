@@ -11,7 +11,7 @@
 
 本仓库是毕设的 **Python 重构版**：用 FastAPI + SQLAlchemy 2.0 异步 ORM 重写后端，保留全部业务能力，并强化了 AI 服务、知识库检索与推荐模块。
 
-**规模**：9 个路由模块 / 79 个 REST 接口（含 21 个 Java 版前端兼容接口）/ 12 个业务服务 / 7 张数据表
+**规模**：9 个路由模块 / 82 个 REST 接口（含 21 个 Java 版前端兼容接口）/ 13 个业务服务 / 7 张数据表
 
 ## 二、技术栈
 
@@ -71,7 +71,7 @@ recruitment-python/
 │   ├── database.py          # 异步引擎与会话工厂
 │   ├── scheduler.py         # APScheduler 定时爬取
 │   ├── init_data.py         # 建表 + 初始化数据
-│   ├── routers/             # 9 个路由模块（79 个接口，含 compat.py 兼容层）
+│   ├── routers/             # 9 个路由模块（82 个接口，含 compat.py 兼容层）
 │   │   ├── auth.py          #   4  认证
 │   │   ├── jobs.py          #   20 岗位 / 统计 / 导出
 │   │   ├── ai.py            #   5  AI 对话
@@ -81,7 +81,7 @@ recruitment-python/
 │   │   ├── user.py          #   5  用户管理
 │   │   ├── log.py           #   3  系统日志
 │   │   └── compat.py        #   21 Java 版前端兼容层（别名路由）
-│   ├── services/            # 12 个业务服务
+│   ├── services/            # 13 个业务服务
 │   │   ├── ai_service.py           # 三级降级 + SSE + 工具调用调度
 │   │   ├── llm_client.py           # 云端统一调用层（OpenAI 兼容 + 多供应商容灾）
 │   │   ├── ollama_client.py        # 本地统一调用层（按角色路由两个本地模型）
@@ -110,7 +110,7 @@ recruitment-python/
 
 ## 五、模块说明
 
-### 1. AI 服务（ai.py 5 个 + model.py 6 个接口）
+### 1. AI 服务（ai.py 5 个 + model.py 7 个接口）
 
 - **三级降级链**：云端模型（DeepSeek 优先 → 智谱备选）→ 本地模型（按角色分工，见下）→ 规则引擎兜底，
   任一后端不可用时自动降级，保证服务不中断
@@ -171,9 +171,9 @@ recruitment-python/
 - **SSE 流式输出**：httpx 流式响应 + `EventSourceResponse`，前端打字机效果
 - **Function Calling（工具调用）**：用户问「长沙有多少 Java 岗位」时，模型判断需要查库并输出结构化工具调用，代码执行 `query_jobs` 查询真实岗位数据，再把结果回填给模型组织自然语言回答。采用「prompt 引导 + JSON 解析」实现，不依赖具体模型的 native tool calling（见 `app/services/tool_service.py`）
 - **会话管理**：支持会话取消、最大会话数 1000、单会话保留最近 20 条历史
-- **模型管理**：6 个接口，支持模型配置的增删改查与启用切换
+- **模型管理**：7 个接口（含 `GET /api/model/usage` 用量成本统计），支持模型配置的增删改查与启用切换
 
-### 2. 知识库（knowledge.py 10 个接口）
+### 2. 知识库（knowledge.py 12 个接口）
 
 - **语义向量检索（RAG）**：用云端 `embedding-3`（或本地 Ollama 向量模型）把查询与知识条目向量化，按余弦相似度取 Top-5 注入 AI 上下文，能把「工资多少」和「薪资水平」这类语义相近但字面不同的问题关联起来（见 `app/services/embedding_service.py`）
 - **关键词降级**：向量化不可用（无 API Key / 网络失败 / 接口报错）时自动回退到关键词检索（43 个关键词打标签 + 精确匹配 Top-3 / 模糊匹配 Top-5），保证服务不中断
