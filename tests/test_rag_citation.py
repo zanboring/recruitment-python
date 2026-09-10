@@ -117,7 +117,7 @@ async def test_原有接口仍只返回文本(kb):
 async def test_构建上下文时转发来源给回调(kb):
     captured = []
 
-    await ai_service._build_context(kb, "薪资", on_sources=captured.extend)
+    await ai_service.build_rag_context(kb, "薪资", on_sources=captured.extend)
 
     assert captured
     assert captured[0]["index"] == 1
@@ -125,7 +125,7 @@ async def test_构建上下文时转发来源给回调(kb):
 
 @pytest.mark.asyncio
 async def test_没有数据库时不回调也不报错():
-    context = await ai_service._build_context(None, "薪资", on_sources=lambda s: None)
+    context = await ai_service.build_rag_context(None, "薪资", on_sources=lambda s: None)
     assert context == ""
 
 
@@ -136,6 +136,89 @@ async def test_来源回调抛异常不影响上下文构建(kb):
     def boom(_items):
         raise RuntimeError("前端回调炸了")
 
-    context = await ai_service._build_context(kb, "薪资", on_sources=boom)
+    context = await ai_service.build_rag_context(kb, "薪资", on_sources=boom)
 
     assert context, "回调异常时仍应返回可用的上下文"
+
+
+@pytest.mark.asyncio
+async def test_降级链不会重复检索知识库(db_session, monkeypatch):
+    """知识库检索必须在降级链之外只发生一次。
+
+    原实现把检索放在每一级的内部：云端失败后重试本地会再检索一遍。实测一次提问
+    触发了 **3 次**检索，后果有两个，都属于「看不出来但确实是错的」：
+
+    1. ``usage_count`` 被虚增 3 倍 —— 该字段参与知识条目的质量排序，属数据污染；
+    2. ``on_sources`` 被回调 3 次 —— 前端会展示 3 条完全相同的「引用来源」。
+
+    检索结果与「最终用哪个模型回答」无关，本就应该只算一次。
+    """
+    from app.config import settings
+    from app.services.llm_client import CloudProvider
+
+    db_session.add(KnowledgeBase(
+        question="薪资水平如何",
+        answer="薪资水平由城市、经验与技能共同决定，具体可在岗位列表中查看。",
+        source="manual", status=1
+    ))
+    await db_session.commit()
+
+    # 构造两个云端 provider 并让它们全部失败，再关掉本地模型 ——
+    # 强制走完「云端 → 本地 → 规则引擎」整条链，覆盖最多重试次数的情况
+    fake_providers = [
+        CloudProvider(name="A", provider="a", api_url="http://x", api_key="k", model="m"),
+        CloudProvider(name="B", provider="b", api_url="http://x", api_key="k", model="m"),
+    ]
+    monkeypatch.setattr(
+        "app.services.llm_client.get_cloud_providers", lambda *a, **k: fake_providers
+    )
+
+    async def _cloud_down(*args, **kwargs):
+        raise RuntimeError("云端不可用")
+        yield  # noqa: 使其成为异步生成器
+
+    monkeypatch.setattr("app.services.llm_client.stream_chat", _cloud_down)
+    monkeypatch.setattr(settings, "ollama_enabled", False)
+
+    received: list = []
+    async for _ in ai_service.call_chat_stream(
+        "薪资水平如何", "rag-once-1", db_session, None,
+        on_sources=lambda items: received.append(list(items)),
+    ):
+        pass
+
+    # 来源回调只发生一次，且内容不重复
+    assert len(received) == 1
+    assert len(received[0]) == 1
+
+    # 关键：usage_count 只加了 1，而不是每重试一级就加一次
+    row = (await db_session.execute(select(KnowledgeBase))).scalars().one()
+    assert row.usage_count == 1
+
+
+@pytest.mark.asyncio
+async def test_未检索时各层仍可独立工作(kb, monkeypatch):
+    """rag_context 为 None 表示调用方没检索 —— 函数自行检索，保持可独立调用。
+
+    这条保证「上提检索」没有破坏 call_cloud_stream / call_ollama_stream
+    作为公开函数的可用性（例如分析报告走的是独立调用）。
+    """
+    captured: list = []
+    monkeypatch.setattr("app.services.llm_client.stream_chat", _fake_stream)
+
+    chunks = []
+    async for chunk in ai_service.call_cloud_stream(
+        None, "薪资水平如何", "s1", kb, None,
+        on_sources=lambda items: captured.append(list(items)),
+    ):
+        chunks.append(chunk)
+
+    # 未传 rag_context → 内部自行检索一次，来源照常透出
+    assert captured and captured[0]
+    assert "".join(chunks) == "薪资水平如何"
+
+
+async def _fake_stream(*args, **kwargs):
+    """固定内容的流式桩：让「来源透出」的验证不依赖真实模型调用。"""
+    for piece in ("薪资", "水平", "如何"):
+        yield piece

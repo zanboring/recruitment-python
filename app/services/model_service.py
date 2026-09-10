@@ -357,6 +357,13 @@ class ModelService:
         # 保证两条对话入口（/api/ai/chat-stream 与 /api/model/chat）的用量口径一致。
         from app.services.ai_service import _record_usage, _usage_sink
 
+        # 知识库检索**在降级链之外只做一次**。原实现由底层层层自检索，每重试一级
+        # 就重查一次库，导致 usage_count 被虚增（该字段参与知识条目的质量排序）。
+        # 检索结果与「最终用哪个模型回答」无关，只应算一次。
+        from app.services.ai_service import build_rag_context
+
+        rag_context = await build_rag_context(db, message)
+
         async def try_local(model: str, tag: str):
             """尝试用指定本地模型作答；失败返回 None，由调用方继续降级。"""
             box, sink = _usage_sink()
@@ -364,7 +371,8 @@ class ModelService:
             try:
                 response = await _collect(
                     call_ollama_stream(
-                        message, session_id, db, user_id, model=model, on_usage=sink
+                        message, session_id, db, user_id, model=model,
+                        on_usage=sink, rag_context=rag_context,
                     )
                 )
                 await _record_usage(
@@ -409,7 +417,8 @@ class ModelService:
                 try:
                     response = await _collect(
                         call_cloud_stream(
-                            provider, message, session_id, db, user_id, on_usage=sink
+                            provider, message, session_id, db, user_id,
+                            on_usage=sink, rag_context=rag_context,
                         )
                     )
                     await _record_usage(

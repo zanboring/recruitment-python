@@ -122,11 +122,15 @@ def _emit_meta(on_meta, **payload) -> None:
         logger.warning("模型元信息回调失败（已忽略）：%s", e)
 
 
-async def _build_context(db, message: str, on_sources=None) -> str:
+async def build_rag_context(db, message: str, on_sources=None) -> str:
     """检索知识库并返回注入用上下文；有命中时通过 ``on_sources`` 回调透出引用来源。
 
     把「检索 + 来源回调」收敛到一处，避免云端 / 本地 / 规则引擎三条路径各写一遍
     （三处都做同一件事时，最容易出现的行为不一致就是有人忘了回调来源）。
+
+    **调用方必须在降级链之外只调用一次**（见 ``call_chat_stream`` 开头的说明）：
+    检索结果与「最终用哪个模型回答」无关，每重试一级就重检索一次会让
+    ``usage_count`` 被虚增、``on_sources`` 被重复回调。
     """
     if not db:
         return ""
@@ -200,14 +204,18 @@ async def call_cloud_stream(
     on_usage=None,
     max_tokens: int = None,
     on_sources=None,
+    rag_context: str = None,
 ) -> AsyncGenerator[str, None]:
     """调用指定云端服务商的流式对话（OpenAI 兼容协议，DeepSeek / 智谱通用）。
 
     流程：取会话历史 → 拼接知识库上下文（RAG）→ 交给 llm_client 发起请求。
+
+    ``rag_context`` 为 ``None`` 表示调用方未检索，此处自行检索（函数可独立调用）；
+    传空字符串表示「已检索但无命中」，此时不再重复检索。
     """
     history = await _get_conversation_history(session_id, user_id)
 
-    context = await _build_context(db, message, on_sources)
+    context = rag_context if rag_context is not None else await build_rag_context(db, message, on_sources)
 
     full_message = context + message if context else message
     messages = history + [{"role": "user", "content": full_message}]
@@ -289,17 +297,20 @@ async def call_ollama_stream(
     on_usage=None,
     max_tokens: int = None,
     on_sources=None,
+    rag_context: str = None,
 ) -> AsyncGenerator[str, None]:
     """本地模型流式对话。
 
     ``model`` 为空时由本地调用层按角色路由（默认「语言类」模型，负责对话表达）；
     传入具体模型名可精确指定，供模型切换接口使用。
+
+    ``rag_context`` 语义同 ``call_cloud_stream``。
     """
     from app.services import ollama_client
 
     history = await _get_conversation_history(session_id, user_id)
 
-    context = await _build_context(db, message, on_sources)
+    context = rag_context if rag_context is not None else await build_rag_context(db, message, on_sources)
 
     full_message = context + message if context else message
     messages = history + [{"role": "user", "content": full_message}]
@@ -335,6 +346,15 @@ async def call_chat_stream(
     response_content = ""
     providers = get_cloud_providers()
 
+    # ===== 知识库检索：在整个降级链之外**只做一次** =====
+    #
+    # 原实现把检索放在每一级的内部，于是「云端失败 → 本地重试」这类降级会重复检索。
+    # 实测一次提问触发了 3 次检索，后果有两个（都属于「看不出来但确实是错的」）：
+    #   1) ``usage_count`` 被虚增 3 倍 —— 该字段参与知识条目的质量排序，属数据污染；
+    #   2) ``on_sources`` 被回调 3 次 —— 前端展示出 3 条完全相同的「引用来源」。
+    # 检索结果与「最终用哪个模型回答」无关，本就应该只算一次。
+    rag_context = await build_rag_context(db, message, on_sources)
+
     # ===== Function Calling：工具识别 → 执行 → 结果注入二次生成 =====
     # should_detect_tool 是廉价前置过滤：不涉及数据库的消息直接跳过这次识别调用，
     # 省下一次完整的 LLM 往返（实测本机约 2.9s，云端则是一次额外 token 消耗）。
@@ -353,7 +373,7 @@ async def call_chat_stream(
                 started = time.time()
                 async for chunk in call_cloud_stream(
                     primary, augmented, session_id, db, user_id,
-                    on_usage=sink, on_sources=on_sources,
+                    on_usage=sink, on_sources=on_sources, rag_context=rag_context,
                 ):
                     response_content += chunk
                     yield chunk
@@ -387,7 +407,7 @@ async def call_chat_stream(
         try:
             async for chunk in call_cloud_stream(
                 provider, message, session_id, db, user_id,
-                on_usage=sink, on_sources=on_sources,
+                on_usage=sink, on_sources=on_sources, rag_context=rag_context,
             ):
                 response_content += chunk
                 yield chunk
@@ -468,7 +488,7 @@ async def call_chat_stream(
             try:
                 async for chunk in call_ollama_stream(
                     message, session_id, db, user_id, model=model,
-                    on_usage=sink, on_sources=on_sources,
+                    on_usage=sink, on_sources=on_sources, rag_context=rag_context,
                 ):
                     response_content += chunk
                     yield chunk
@@ -499,8 +519,8 @@ async def call_chat_stream(
                 logger.warning("本地模型 %s 调用失败，尝试下一个本地模型: %s", model, e)
 
     from app.services.local_model_service import LocalModelService
-    # 规则引擎兜底也接入知识库 RAG，保证降级时核心检索能力不失效
-    rag_context = await _build_context(db, message, on_sources)
+    # 规则引擎兜底同样带上知识库 RAG，保证降级时核心检索能力不失效。
+    # 这里**复用**开头已检索的 rag_context —— 再查一次会让 usage_count 又加一遍。
     started = time.time()
     response = await LocalModelService.chat(message, db, rag_context)
     # 规则引擎不消耗 token，但这条记录本身就是「降级事件」，用于统计

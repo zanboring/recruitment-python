@@ -103,7 +103,7 @@ recruitment-python/
 │   ├── eval_rag.py          # RAG 检索效果评估入口
 │   └── bench_local_models.py# 本地模型能力对比基准（决定模型分工）
 ├── reports/                 # 评估报告输出（rag_evaluation.md、local_model_benchmark.md）
-├── tests/                   # 385 个单元测试
+├── tests/                   # 387 个单元测试
 ├── _archive/                # 开发过程文档（审计报告 / 提示词，不进仓库逻辑）
 └── requirements.txt
 ```
@@ -176,6 +176,11 @@ recruitment-python/
     在流结束后发出。前端据此显示「本次由规则引擎回答」，用户才知道自己看到的是降级结果。
 
   正文仍保持原有的裸 `data:` 分片格式，避免已上线的客户端出现乱码。
+
+  **知识库检索在降级链之外只做一次**：检索结果与「最终用哪个模型回答」无关。
+  曾把它写在每一级的内部，于是「云端失败 → 本地重试」会重复检索 —— 实测一次提问
+  触发 3 次，导致 `usage_count` 被虚增 3 倍（该字段参与知识条目质量排序，属数据污染），
+  `on_sources` 被回调 3 次（前端展示出 3 条相同的引用来源）。
 - **Function Calling（工具调用）**：用户问「长沙有多少 Java 岗位」时，模型判断需要查库并输出结构化工具调用，代码执行 `query_jobs` 查询真实岗位数据，再把结果回填给模型组织自然语言回答。采用「prompt 引导 + JSON 解析」实现，不依赖具体模型的 native tool calling（见 `app/services/tool_service.py`）
 - **会话管理**：支持会话取消、最大会话数 1000、单会话保留最近 20 条历史
 - **模型管理**：7 个接口（含 `GET /api/model/usage` 用量成本统计），支持模型配置的增删改查与启用切换
@@ -384,7 +389,7 @@ python -m pytest tests/ -q
 ## 七、测试
 
 ```bash
-python -m pytest tests/ -v        # 全量 385 项
+python -m pytest tests/ -v        # 全量 387 项
 python -m pytest tests/test_auth_api.py -v   # 单个模块
 ```
 
@@ -408,7 +413,7 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 | `test_tool_prefilter.py` | 19 | 工具识别前置过滤：数据类问题不漏判、短消息跳过、开关可回退 |
 | `test_embedding_service.py` | 10 | 余弦计算、向量缓存、无 Key 行为、测试内禁止真实网络出口 |
 | `test_rag_evaluation.py` | 15 | 评估指标边界、黄金集自洽性、数据集区分度、混合检索降级 |
-| `test_rag_citation.py` | 10 | 引用编号与来源严格对应、禁用条目不可见、无命中不编造依据、usage_count 累加 |
+| `test_rag_citation.py` | 12 | 引用编号与来源严格对应、禁用条目不可见、无命中不编造依据、usage_count 累加 |
 | `test_route_order.py` | 4 | 静态路由不被动态路径参数吞掉（batch / all / stats 回归） |
 | `test_log_action.py` | 7 | 操作日志落库、失败留痕、uri/ip 采集、密码脱敏 |
 | `test_compat_api.py` | 20 | Java 版前端兼容层：爬取 / 用户 / 数据 / 字段命名 / 生产环境禁 auto-login |
@@ -420,7 +425,7 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 | `test_output_limits.py` | 7 | 云端 `max_tokens` / 本地 `num_predict` 上限、配置接线 |
 | `test_login_lockout.py` | 6 | 锁定期结束后恢复完整重试次数、剩余分钟数向上取整 |
 | `test_analysis_report.py` | 7 | AI 分析报告生成与降级、空库处理 |
-| **合计** | **385** | |
+| **合计** | **387** | |
 
 ### 稳定性与安全加固（P1 修复记录）
 
