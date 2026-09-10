@@ -191,6 +191,11 @@ async def test_后台任务被强引用持有直到完成():
 
 @pytest.mark.asyncio
 async def test_可选项接口暴露真实支持范围(client, db_session):
+    """平台以结构化列表返回（含中文名与是否已实现），城市为全量收录清单。
+
+    这份信息必须由后端提供：前端硬编码时，能选到必然失败的可选项，同时又用不到
+    一半的可用城市 —— 支持范围一变，前端就错，且没有任何提示。
+    """
     from tests.helpers import admin_token, auth_headers
 
     token = await admin_token(client, db_session, "admin_crawlopt")
@@ -198,10 +203,36 @@ async def test_可选项接口暴露真实支持范围(client, db_session):
     assert resp.status_code == 200, resp.text
 
     data = resp.json()["data"]
-    assert data["platforms"] == sorted(SUPPORTED_PLATFORMS)
+    by_value = {p["value"]: p for p in data["platforms"]}
+
+    # 已实现平台：带中文名、标记为可用
+    assert by_value["boss"]["implemented"] is True
+    assert by_value["boss"]["label"] == "BOSS直聘"
+
+    # 未实现平台：仍然列出（前端可置灰并说明），但明确标记为不可用
+    assert by_value["zhaopin"]["implemented"] is False
+    assert by_value["zhaopin"]["label"] == "智联招聘"
+
+    # 已实现的排在前面 —— 前端可直接按顺序渲染
+    assert data["platforms"][0]["value"] == "boss"
+
+    # 城市为全量收录清单，而不是前端那 11 个
     assert "长沙" in data["cities"]
-    # 前端硬编码但后端未实现的平台不应出现在可选列表里
-    assert "zhaopin" not in data["platforms"]
+    assert len(data["cities"]) >= 20
+
+
+@pytest.mark.asyncio
+async def test_兼容层的可选项接口与原生接口结构一致(client, db_session):
+    """两个入口必须返回同一形状 —— 否则前端要为同一个概念写两套解析。"""
+    from tests.helpers import admin_token, auth_headers
+
+    token = await admin_token(client, db_session, "admin_crawlopt2")
+    headers = auth_headers(token)
+
+    native = (await client.get("/api/crawler/options", headers=headers)).json()["data"]
+    compat = (await client.get("/api/crawl/options", headers=headers)).json()["data"]
+
+    assert native == compat
 
 
 @pytest.mark.asyncio
@@ -222,3 +253,117 @@ async def test_启动接口回传失败原因(client, db_session):
     assert data["status"] == "FAILED"
     assert "南昌" in data["message"]
     assert data["task_id"] is not None
+
+
+class TestPlatformNormalization:
+    """平台标识归一化。
+
+    同一个概念（平台）此前在 compat 层与原生层各有一份归一化实现，属于
+    「两处实现同一规则」的典型隐患。现在收敛到 crawler_service 一处。
+    """
+
+    def test_中文名与常见拼写都能归一化(self):
+        from app.services.crawler_service import normalize_platform
+
+        for raw, expected in [
+            ("boss", "boss"),
+            ("BOSS", "boss"),
+            ("BOSS直聘", "boss"),
+            ("直聘", "boss"),
+            ("zhipin", "boss"),
+            ("zhaopin", "zhaopin"),
+            ("智联招聘", "zhaopin"),
+            ("智联", "zhaopin"),
+            ("51job", "51job"),
+            ("前程无忧", "51job"),
+            ("猎聘", "liepin"),
+        ]:
+            assert normalize_platform(raw) == expected, raw
+
+    def test_空值与None回退到已实现的平台(self):
+        from app.services.crawler_service import normalize_platform
+
+        assert normalize_platform("") == "boss"
+        assert normalize_platform(None) == "boss"
+        assert normalize_platform("   ") == "boss"
+
+    def test_未知平台原样返回而不是回退到已实现平台(self):
+        """回退会让「选智联」静默变成「爬 BOSS」，数据记错平台名 —— 必须原样返回，
+        交给前置校验拦截并给出明确原因。"""
+        from app.services.crawler_service import normalize_platform
+
+        assert normalize_platform("somejob") == "somejob"
+        assert normalize_platform("未知招聘网") == "未知招聘网"
+
+    def test_平台选项覆盖全部已实现平台且优先展示(self):
+        from app.services.crawler_service import platform_options
+
+        options = platform_options()
+        values = [o["value"] for o in options]
+
+        # 已实现的平台一个都不能漏，否则前端渲染不出可选项
+        assert SUPPORTED_PLATFORMS <= set(values)
+        # 已实现的排在未实现的之前
+        implemented_flags = [o["implemented"] for o in options]
+        assert implemented_flags == sorted(implemented_flags, reverse=True)
+        # 每项都有可直接展示的中文名
+        assert all(o["label"] for o in options)
+
+
+class TestPlatformNormalizationAtServiceLayer:
+    """平台归一化必须在**服务层入口**生效，而不是只挂在 HTTP 兼容层上。
+
+    此前归一化只写在 compat 层的 ``_normalize_platform`` 里，于是同一个输入会得到
+    两种结果：走兼容接口传「BOSS直聘」能正确识别，走原生接口或直接调 service 却会
+    被判成「平台未实现」而任务失败。同一规则在不同入口生效范围不同，是这类缺陷的
+    典型成因 —— 也因此每个入口都必须能独立正确。
+    """
+
+    def test_批量归一化_去重并保持顺序(self):
+        from app.services.crawler_service import normalize_platforms
+
+        assert normalize_platforms(["BOSS直聘"]) == ["boss"]
+        assert normalize_platforms(["boss", "boss"]) == ["boss"]
+        assert normalize_platforms(["智联招聘", "BOSS"]) == ["zhaopin", "boss"]
+
+    def test_批量归一化_空值被跳过而不是变成none平台(self):
+        """str(None) 会得到 "None"，再 lower 成 "none" —— 一个空的平台项会变成
+        一个叫 none 的平台，最后以「平台未实现：none」这种莫名其妙的理由失败。"""
+        from app.services.crawler_service import normalize_platforms
+
+        assert normalize_platforms(["", None, " "]) == []
+        assert normalize_platforms([None]) == []
+        assert normalize_platforms([]) == []
+        assert normalize_platforms(None) == []
+        assert normalize_platforms(["boss", None, "智联招聘"]) == ["boss", "zhaopin"]
+
+    @pytest.mark.asyncio
+    async def test_创建任务时即归一化后入库(self, db_session):
+        """任务列表展示、下架判定、日志排查都读 source_site，存入未归一化的值
+        会让同一个平台在不同任务里长得不一样（boss / BOSS直聘 混着出现）。"""
+        task = await crawler_service.create_pending_task(
+            db_session, "Java", "长沙", ["BOSS直聘", "boss"]
+        )
+        assert task.source_site == "boss"
+
+    @pytest.mark.asyncio
+    async def test_执行层不依赖调用方是否归一化(self, db_session):
+        """run_crawl 是执行层的唯一入口（定时任务、后台重跑、直接调用都会经过），
+        不能假设调用方已经处理过平台标识。"""
+        task = await crawler_service.start_crawl_task(
+            db_session, "Java", "长沙", ["智联招聘"]
+        )
+        # 中文名被识别成未实现的 zhaopin —— 而不是一个叫「智联招聘」的未知平台。
+        # 后者虽然也会失败，但原因描述会变成「平台未实现：智联招聘」，
+        # 与已实现清单里的标识对不上，排查时容易误以为前端传错了值。
+        assert task.status == "FAILED"
+        assert "zhaopin" in (task.message or "")
+
+    @pytest.mark.asyncio
+    async def test_平台中文名可用于展示(self, db_session):
+        from app.services.crawler_service import platform_label
+
+        assert platform_label("boss") == "BOSS直聘"
+        assert platform_label("boss,zhaopin") == "BOSS直聘、智联招聘"
+        # 未知标识原样返回，便于发现未登记的平台
+        assert platform_label("unknown") == "unknown"

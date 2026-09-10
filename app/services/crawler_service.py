@@ -30,9 +30,113 @@ logger = logging.getLogger(__name__)
 # 岗位被判定下架前允许的「未再出现」宽限期（秒）。
 OFFLINE_GRACE_SECONDS = 6 * 3600
 
-# 已实现的抓取平台。未实现的平台会被跳过并告警，且不参与下架判定 ——
-# 否则「一次传多个平台」时，未实现平台的存量岗位会被整批误判为下架。
+# 已实现的抓取平台。未实现的平台会被请求前置校验拦下并给出明确原因。
 SUPPORTED_PLATFORMS = {"boss"}
+
+# ---- 平台元数据（标识 → 中文名 / 是否已实现）----
+#
+# 这份映射放在**后端**而不是前端，因为它是业务知识：哪个平台叫什么名字、
+# 是否真的有采集实现。前端各存一份必然漂移 —— 事实上此前前端硬编码了 4 个
+# 平台而后端只实现了 1 个，用户选中「智联招聘」后会得到一个必然失败的任务，
+# 且失败原因界面不展示，只看到一个红色「失败」。
+#
+# 对外暴露见 ``platform_options()``，前端据此渲染下拉框。
+PLATFORM_META = {
+    "boss": {"label": "BOSS直聘"},
+    "zhaopin": {"label": "智联招聘"},
+    "51job": {"label": "前程无忧"},
+    "liepin": {"label": "猎聘"},
+}
+
+# 平台标识别名：容错归一化用（含中文名，便于直接调接口的调用方）。
+PLATFORM_ALIASES = {
+    "boss": "boss",
+    "zhipin": "boss",
+    "boss直聘": "boss",
+    "直聘": "boss",
+    "zhaopin": "zhaopin",
+    "智联": "zhaopin",
+    "智联招聘": "zhaopin",
+    "51job": "51job",
+    "前程无忧": "51job",
+    "liepin": "liepin",
+    "猎聘": "liepin",
+}
+
+
+def normalize_platform(raw) -> str:
+    """把外部传入的平台标识归一化到内部标识。
+
+    未知值**原样返回**，交给请求前置校验拦截并给出明确原因；
+    绝不回退到某个已实现平台 —— 回退会让「选智联招聘」静默变成「爬 BOSS」，
+    数据被记在错误的平台名下，比直接报错难排查得多（与城市编码同一类问题）。
+    """
+    value = str(raw or "").strip().lower()
+    if not value:
+        return "boss"
+    return PLATFORM_ALIASES.get(value, value)
+
+
+def normalize_platforms(platforms) -> list:
+    """批量归一化平台标识并去重（保持输入顺序）。
+
+    归一化必须发生在**服务层入口**，而不是只挂在 HTTP 兼容层上。此前它只写在
+    compat 层的 ``_normalize_platform`` 里，于是同一个输入会得到两种结果：
+    走兼容接口传「BOSS直聘」能正确识别，走原生接口或直接调 service 却会被判成
+    「平台未实现」而任务失败 —— 同一规则两处生效范围不同，是这类缺陷的典型成因。
+    """
+    result: list = []
+    for raw in platforms or []:
+        # 必须先排除 None：str(None) 会得到 "None"，进一步 lower 成 "none"，
+        # 一个「空的平台项」就变成了一个叫 "none" 的平台，最后以
+        # 「平台未实现：none」的莫名其妙理由失败。
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if not value:
+            continue
+        key = normalize_platform(value)
+        if key not in result:
+            result.append(key)
+    return result
+
+
+def platform_label(raw) -> str:
+    """平台标识 → 可展示的中文名（未知标识原样返回）。
+
+    支持逗号分隔的多平台（任务可能同时指定多个平台）。中文名由后端提供，
+    前端就不必再维护一份「标识 → 名称」映射 —— 那种映射一旦漂移，
+    界面上就会出现用户看不懂的英文标识。
+    """
+    parts = [p.strip() for p in str(raw or "").split(",") if p.strip()]
+    if not parts:
+        return str(raw or "")
+    labels = []
+    for part in parts:
+        key = normalize_platform(part)
+        meta = PLATFORM_META.get(key)
+        labels.append(meta["label"] if meta else key)
+    return "、".join(labels)
+
+
+def platform_options() -> list:
+    """平台选项列表（供接口暴露，含中文名与是否已实现）。
+
+    已实现的排在前面 —— 前端可据此把未实现的置灰，用户就不会选到
+    注定失败的可选项。
+    """
+    keys = sorted(
+        set(PLATFORM_META) | SUPPORTED_PLATFORMS,
+        key=lambda k: (k not in SUPPORTED_PLATFORMS, k),
+    )
+    return [
+        {
+            "value": key,
+            "label": PLATFORM_META.get(key, {}).get("label", key),
+            "implemented": key in SUPPORTED_PLATFORMS,
+        }
+        for key in keys
+    ]
 
 
 def _utc_now():
@@ -146,7 +250,11 @@ async def create_pending_task(db: AsyncSession, keyword: str, city: str, platfor
 
     供「先建任务、后台异步执行」的调用方使用 —— 真实爬取要翻多页、
     每页间隔 12~18 秒，同步执行必然撑爆 HTTP 超时。
+
+    平台标识在这里就归一化后入库：任务列表展示、下架判定、日志排查都读这个字段，
+    存入未归一化的值（如「BOSS直聘」）会让同一平台在不同任务里长得不一样。
     """
+    platforms = normalize_platforms(platforms)
     task = CrawlTask(
         source_site=",".join(platforms),
         keyword=keyword,
@@ -177,7 +285,9 @@ async def run_crawl(
     # ---- 前置校验：把「必然失败」的请求拦在爬取之前 ----
     # 这些失败重试不会变好，却要白等 4 次指数退避（2+4+8 秒），
     # 并且原实现会把任务标成 COMPLETED / 0 条且不带任何说明，无从排查。
-    requested = [str(p).strip() for p in (platforms or []) if str(p).strip()]
+    # 同样归一化：run_crawl 是执行层的唯一入口，不能假设调用方已经处理过
+    # （定时任务、后台重跑、直接调用都会经过这里）
+    requested = normalize_platforms(platforms)
     runnable = [p for p in requested if p in SUPPORTED_PLATFORMS]
     skipped = [p for p in requested if p not in SUPPORTED_PLATFORMS]
     skipped_notes: list = []

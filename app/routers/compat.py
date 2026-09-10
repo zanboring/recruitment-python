@@ -71,11 +71,12 @@ def _escape_like(s: str) -> str:
 
 
 def _normalize_platform(raw) -> str:
-    """把前端的 sourceSite 归一化到内部平台标识。"""
-    value = str(raw or "").strip().lower()
-    if not value or "boss" in value or "直聘" in value:
-        return "boss"
-    return value
+    """把前端的 sourceSite 归一化到内部平台标识。
+
+    实现已收敛到 ``crawler_service.normalize_platform`` —— 同一概念在两处各写
+    一份时，最容易出现的缺陷就是「两个入口对同一个输入得出不同平台」。
+    """
+    return crawler_service.normalize_platform(raw)
 
 
 def _split_cities(raw) -> List[str]:
@@ -89,10 +90,15 @@ def _task_to_frontend(task: CrawlTask) -> dict:
     return {
         "id": task.id,
         "sourceSite": task.source_site,
+        # 中文名由后端给出：前端不必再维护一份「标识 → 名称」映射，
+        # 否则界面上会出现 boss / zhaopin 这类用户看不懂的英文标识
+        "sourceSiteLabel": crawler_service.platform_label(task.source_site),
         "keyword": task.keyword,
         "city": task.city,
         "status": _TASK_STATUS_TO_FRONTEND.get(task.status, task.status),
         "jobCount": task.job_count or 0,
+        # message 是失败/跳过原因的唯一载体（例如「请求的平台均未实现」），
+        # 前端必须展示它，否则用户只看到一个红色「失败」标签，无从判断原因
         "message": task.message,
         "createdAt": task.created_at.isoformat() if task.created_at else None,
         "finishedAt": task.updated_at.isoformat() if finished and task.updated_at else None,
@@ -136,6 +142,25 @@ async def _run_crawl_in_background(
 
 
 # ============================================================ 爬取（/api/crawl/*）
+
+
+@router.get("/api/crawl/options", deprecated=True)
+async def compat_crawl_options(user: User = Depends(require_admin)):
+    """爬取可选项：实际支持的平台与实际收录的城市。
+
+    前端此前把平台和城市**硬编码**在组件里（4 个平台 / 11 个城市），而后端只
+    实现了 1 个平台、收录 20 个城市。后果是双向的：用户能选到必然失败的可选项，
+    同时又用不到一半的可用城市。改为从后端拉取后，支持范围变化时前端零改动。
+
+    ``platforms`` 含中文名与 ``implemented`` 标记，前端可据此把未实现的置灰
+    并说明原因，而不是等任务失败后才让用户猜。
+    """
+    from app.crawlers.city_map import supported_cities
+
+    return Result.success({
+        "platforms": crawler_service.platform_options(),
+        "cities": supported_cities(),
+    })
 
 
 @router.post("/api/crawl/task", deprecated=True)

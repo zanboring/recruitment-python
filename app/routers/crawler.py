@@ -8,7 +8,8 @@ from app.exceptions import AppException
 from app.models.user import User
 from app.models.crawl_task import CrawlTask
 from app.services.crawler_service import (
-    SUPPORTED_PLATFORMS,
+    platform_label,
+    platform_options,
     start_crawl_task,
     get_tasks,
     get_task,
@@ -29,6 +30,8 @@ def _task_to_dict(task: CrawlTask) -> dict:
     return {
         "id": task.id,
         "source_site": task.source_site,
+        # 中文名由后端给出，与兼容层保持同一口径
+        "source_site_label": platform_label(task.source_site),
         "keyword": task.keyword,
         "city": task.city,
         "status": task.status,
@@ -63,16 +66,20 @@ async def start_crawler(
 
 @router.get("/options")
 async def get_crawl_options(user: User = Depends(require_admin)):
-    """暴露实际支持的平台与城市。
+    """暴露实际支持的平台与实际收录的城市。
 
-    前端目前硬编码了 4 个平台（boss / zhaopin / 51job / liepin），而后端只实现了
-    boss —— 选了未实现的平台会得到一个「已完成、0 条」的任务。与其让调用方猜，
-    不如把真实支持范围直接暴露出来，前端可据此渲染可选项或给出提示。
+    前端此前硬编码了 4 个平台（boss / zhaopin / 51job / liepin），而后端只实现了
+    boss —— 选了未实现的平台会得到一个「已完成、0 条」的任务；城市同理（前端
+    11 个、后端 20 个）。把真实支持范围暴露出来，调用方才能渲染出正确的可选项。
+
+    ``platforms`` 为结构化列表（``value`` / ``label`` / ``implemented``），
+    与兼容层 ``GET /api/crawl/options`` 保持同一形状 —— 两个入口返回不同结构时，
+    前端要为同一个概念写两套解析。
     """
     from app.crawlers.city_map import supported_cities
 
     return Result.success({
-        "platforms": sorted(SUPPORTED_PLATFORMS),
+        "platforms": platform_options(),
         "cities": supported_cities(),
     })
 

@@ -103,7 +103,7 @@ recruitment-python/
 │   ├── eval_rag.py          # RAG 检索效果评估入口
 │   └── bench_local_models.py# 本地模型能力对比基准（决定模型分工）
 ├── reports/                 # 评估报告输出（rag_evaluation.md、local_model_benchmark.md）
-├── tests/                   # 355 个单元测试
+├── tests/                   # 385 个单元测试
 ├── _archive/                # 开发过程文档（审计报告 / 提示词，不进仓库逻辑）
 └── requirements.txt
 ```
@@ -168,7 +168,14 @@ recruitment-python/
   按 token 计费的云端成本不可控，本地模型（实测 12 tok/s）一次回答足以让用户等上
   几分钟。现在按场景分级设限：工具识别 128（只需一行 JSON）/ 对话 1024 /
   分析报告 2048，配置见 `AI_MAX_OUTPUT_TOKENS` 等三项。
-- **SSE 流式输出**：httpx 流式响应 + `EventSourceResponse`，前端打字机效果
+- **SSE 流式输出**：httpx 流式响应 + `EventSourceResponse`，前端打字机效果。
+  除正文分片外还发两个**具名事件**（对正文是纯增量，不认识它们的客户端会自动忽略）：
+  - `event: sources` —— 本轮命中的知识库条目（id / 问题 / 来源 / 质量分），
+    在正文之前发出。回答「怎么防止模型胡说」：不是让模型承诺不说谎，而是让**依据可核查**；
+  - `event: meta` —— 本轮实际用的 provider / model / 降级层级 / token / 耗时，
+    在流结束后发出。前端据此显示「本次由规则引擎回答」，用户才知道自己看到的是降级结果。
+
+  正文仍保持原有的裸 `data:` 分片格式，避免已上线的客户端出现乱码。
 - **Function Calling（工具调用）**：用户问「长沙有多少 Java 岗位」时，模型判断需要查库并输出结构化工具调用，代码执行 `query_jobs` 查询真实岗位数据，再把结果回填给模型组织自然语言回答。采用「prompt 引导 + JSON 解析」实现，不依赖具体模型的 native tool calling（见 `app/services/tool_service.py`）
 - **会话管理**：支持会话取消、最大会话数 1000、单会话保留最近 20 条历史
 - **模型管理**：7 个接口（含 `GET /api/model/usage` 用量成本统计），支持模型配置的增删改查与启用切换
@@ -190,11 +197,20 @@ recruitment-python/
   「必然失败」的请求拦在网络请求之前 ——
   - **未收录城市**：曾对未收录城市回退到北京的城市编码，于是搜「南昌」实际爬的是
     北京岗位，数据看着正常但城市是错的，且不报错不留痕。现在直接失败并列出已收录城市；
-  - **未实现平台**：前端可选 4 个平台而当前只实现 `boss`，原先会静默跳过并把任务标成
+  - **未实现平台**：前端原先硬编码 4 个平台而当前只实现 `boss`，会静默跳过并把任务标成
     「已完成 / 0 条」。现在全部未实现则任务 FAILED 并写明原因，部分未实现则在
     `message` 中列出被跳过的平台。
 
-  实际支持范围通过 `GET /api/crawler/options` 暴露，前端可据此渲染可选项或给出提示。
+  支持范围通过 `GET /api/crawler/options`（兼容层同路径 `GET /api/crawl/options`，
+  两者返回结构完全一致）暴露为**结构化**列表：`platforms` 每项含 `value` / `label`
+  （中文名）/ `implemented`，已实现的排在前面，另附全量收录城市清单。**前端已改为
+  从这个接口动态渲染**平台与城市下拉框：此前它硬编码了 4 个平台 / 11 个城市，能选到
+  必然失败的可选项、同时又用不到一半的可用城市；现在支持范围变化时前端零改动。
+  **平台归一化（含中文名、`BOSS` 变体）发生在服务层入口** —— 只挂在 HTTP 兼容层时，
+  同一个输入走不同入口会得到两种结果。
+- **失败原因必须可达用户**：任务的 `message` 字段承载失败/跳过原因，接口返回
+  `sourceSiteLabel` 提供平台中文名。此前前端类型里声明了 `message` 却从不渲染，
+  用户只看到一个红色「失败」标签，只能去翻后端日志。
 - **后台任务持有强引用**：`asyncio.create_task` 的返回值若不保存，事件循环只持弱引用，
   任务可能在执行途中被 GC 回收且不留任何日志。统一经 `_spawn_background` 启动并持有引用。
 
@@ -368,7 +384,7 @@ python -m pytest tests/ -q
 ## 七、测试
 
 ```bash
-python -m pytest tests/ -v        # 全量 355 项
+python -m pytest tests/ -v        # 全量 385 项
 python -m pytest tests/test_auth_api.py -v   # 单个模块
 ```
 
@@ -379,30 +395,32 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 |---|---|---|
 | `test_auth_api.py` | 18 | 注册 / 登录 / 非法与过期 Token / 改密 / 连错 5 次锁定 / 401 统一语义 |
 | `test_jobs_api.py` | 30 | 岗位 CRUD 与权限、分页、关键词与城市过滤、LIKE 转义、7 类统计、推荐打分、薪资预测 |
-| `test_rate_limit.py` | 26 | 滑动窗口算法、窗口滑过期恢复、规则表、身份识别（JWT/代理头/IP）、429 中间件集成 |
+| `test_rate_limit.py` | 27 | 滑动窗口算法、窗口滑过期恢复、规则表、身份识别（JWT/代理头/IP）、429 中间件集成 |
 | `test_crawler.py` | 13 | 指数退避重试、重试次数受控、任务状态流转、去重、下架宽限期不误伤、异常薪资过滤 |
+| `test_crawler_validation.py` | 24 | 未收录城市/未实现平台前置拦截、后台任务强引用、平台归一化（中文名与空值） |
 | `test_ai_session.py` | 15 | 会话按用户隔离、20 条截断、TTL 淘汰、容量淘汰、取消标记隔离 |
-| `test_ai_router.py` | 9 | AI 接口鉴权、SSE 输出、超长消息校验、多用户同 session_id 不串历史 |
-| `test_model_service.py` | 17 | 三级降级链、偏好切换、超时与异常回退规则引擎 |
+| `test_ai_router.py` | 12 | AI 接口鉴权、SSE 正文格式兼容、sources/meta 具名事件顺序、多用户同 session_id 不串历史 |
+| `test_model_service.py` | 23 | 三级降级链、偏好切换（含指定模型名）、超时与异常回退规则引擎 |
 | `test_model_router.py` | 13 | `/api/model/*` 鉴权、状态与清单、偏好切换校验、Ollama 失败降级 |
+| `test_ollama_router.py` | 21 | 本地模型角色路由、安装校验、流式 NDJSON 解析、偏好切换 |
 | `test_jaccard.py` | 12 | 技能归一化、别名映射、Jaccard 计算、边界情况 |
 | `test_tool_service.py` | 11 | 工具调用 JSON 提取、嵌套括号、参数解析、未知工具处理 |
-| `test_embedding_service.py` | 10 | 余弦计算、结果排序、向量缓存、分块批量、无 Key 降级 |
+| `test_tool_prefilter.py` | 19 | 工具识别前置过滤：数据类问题不漏判、短消息跳过、开关可回退 |
+| `test_embedding_service.py` | 10 | 余弦计算、向量缓存、无 Key 行为、测试内禁止真实网络出口 |
+| `test_rag_evaluation.py` | 15 | 评估指标边界、黄金集自洽性、数据集区分度、混合检索降级 |
+| `test_rag_citation.py` | 10 | 引用编号与来源严格对应、禁用条目不可见、无命中不编造依据、usage_count 累加 |
 | `test_route_order.py` | 4 | 静态路由不被动态路径参数吞掉（batch / all / stats 回归） |
 | `test_log_action.py` | 7 | 操作日志落库、失败留痕、uri/ip 采集、密码脱敏 |
 | `test_compat_api.py` | 20 | Java 版前端兼容层：爬取 / 用户 / 数据 / 字段命名 / 生产环境禁 auto-login |
-| `test_rag_evaluation.py` | 15 | 评估指标边界、黄金集自洽性、数据集区分度、混合检索降级 |
 | `test_llm_client.py` | 13 | OpenAI 兼容请求构造、流式解析、思考内容过滤、多供应商优先级 |
-| `test_ollama_router.py` | 21 | 本地模型角色路由、安装校验、流式 NDJSON 解析、偏好切换 |
-| `test_tool_prefilter.py` | 19 | 工具识别前置过滤：数据类问题不漏判、短消息跳过、开关可回退 |
 | `test_usage.py` | 18 | 费用折算、失败留痕、聚合维度、降级事件、两条入口口径一致、异常不抛出 |
 | `test_knowledge_learn.py` | 8 | 自动入库质量门槛、真实来源标注、自学习回路开关 |
-| `test_crawler_validation.py` | 14 | 未收录城市/未实现平台的前置拦截、后台任务强引用 |
 | `test_password_hashing.py` | 12 | 长密码不截断、历史哈希兼容、异常输入不抛异常 |
 | `test_stat_consistency.py` | 10 | 六个图表与 AI 分析共用同一岗位口径（只算在架） |
-| `test_output_limits.py` | 7 | 云端 max_tokens / 本地 num_predict 上限、配置接线 |
+| `test_output_limits.py` | 7 | 云端 `max_tokens` / 本地 `num_predict` 上限、配置接线 |
 | `test_login_lockout.py` | 6 | 锁定期结束后恢复完整重试次数、剩余分钟数向上取整 |
-| **合计** | **355** | |
+| `test_analysis_report.py` | 7 | AI 分析报告生成与降级、空库处理 |
+| **合计** | **385** | |
 
 ### 稳定性与安全加固（P1 修复记录）
 
