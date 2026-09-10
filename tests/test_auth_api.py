@@ -172,3 +172,31 @@ class TestChangePassword:
             json={"old_password": "Pass@1234", "new_password": "NewPass@1234"},
         )
         assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_登录响应平铺为前端UserVO契约(client, db_session):
+    """登录响应必须是平铺的 {id, username, role, email, token}。
+
+    嵌套结构 {token, user: {...}} 会让前端把整个对象存进 user store，
+    role getter 读到 undefined —— 路由守卫把管理员当普通用户，
+    **所有 /admin/* 页面被静默重定向回首页**（无报错、无提示，极难发现）。
+    同项目的 /auth/auto-login 返回的就是平铺结构，两个入口必须一致。
+    """
+    from tests.helpers import register
+
+    await register(client, "flat_user")
+    resp = await client.post(
+        "/api/auth/login",
+        json={"username": "flat_user", "password": "Pass@1234"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    data = resp.json()["data"]
+    # 前端 UserVO 契约的五个字段全部在顶层
+    for key in ("id", "username", "role", "token"):
+        assert key in data, f"缺少契约字段 {key}"
+    assert data["role"] == "USER"
+    assert data["username"] == "flat_user"
+    # 不能再出现嵌套的 user 字段
+    assert "user" not in data

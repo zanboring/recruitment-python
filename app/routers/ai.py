@@ -9,7 +9,7 @@ from app.services.ai_service import (
     call_ollama_stream, call_chat_stream, update_conversation_history,
     request_cancel, is_cancelled, clear_cancel, clear_session,
 )
-from app.services.model_service import ModelService
+from app.services.model_service import ModelService, compat_aliases
 from app.schemas.common import Result
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -125,8 +125,14 @@ async def chat_stream(request: ChatRequest, db: AsyncSession = Depends(get_db), 
 
 @router.get("/status")
 async def ai_status(current_user: User = Depends(get_current_user)):
-    """返回 AI 模块状态：GLM-4 配置情况、Ollama 可用性、当前模型偏好。"""
+    """返回 AI 模块状态：云端主模型配置情况、Ollama 可用性、当前模型偏好。
+
+    除原生结构（primary / local / fallback）外，还补出 Java 版前端期望的
+    ``ollama`` / ``zhipu`` 两个结构 —— 前端 ``store/model.ts`` 读的是
+    ``data.ollama.available``，缺了它们模型可用性会恒为 false 且不报错。
+    """
     status = await ModelService.get_status()
+    status.update(compat_aliases(status))
     return Result.success(status)
 
 

@@ -159,6 +159,39 @@ async def _collect(gen) -> str:
     return "".join(parts)
 
 
+def compat_aliases(status: dict) -> dict:
+    """补出 Java 版前端期望的 ``ollama`` / ``zhipu`` 两个结构。
+
+    Java 版后端的模型状态是 ``{ollama: {...}, zhipu: {...}}``，前端
+    ``store/model.ts`` 直接读 ``data.ollama.available`` / ``data.zhipu.available``。
+    而 Python 版的结构是 ``{primary, local}`` —— 两个字段都对不上，于是前端的
+    ``if (data.ollama)`` 恒为假，模型可用性**永远显示 false**：
+    接口不报错、页面不崩溃、控制台也没有异常，只是状态一直是"不可用"。
+
+    这里同时给出两种结构，前端无需改动，Python 原生结构也保持完整。
+
+    命名说明：``zhipu`` 是前端契约里的字段名，实际含义是「云端主模型是否可用」
+    （当前主模型是 DeepSeek，智谱降为备选）。字段名不能改，否则老前端失效。
+    """
+    primary = status.get("primary", {}) or {}
+    local = status.get("local", {}) or {}
+    return {
+        "zhipu": {
+            "name": primary.get("name"),
+            "model": primary.get("name"),
+            "available": bool(primary.get("available")),
+            "description": primary.get("description"),
+        },
+        "ollama": {
+            "name": local.get("name"),
+            "model": local.get("chat_model") or local.get("name"),
+            "available": bool(local.get("available")),
+            "status": "READY" if local.get("available") else "UNAVAILABLE",
+            "description": local.get("description"),
+        },
+    }
+
+
 def local_candidates() -> list:
     """按优先级返回本次请求可尝试的本地模型名（去重）。
 

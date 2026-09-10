@@ -6,7 +6,7 @@ from app.database import get_db
 from app.dependencies import get_current_user, require_admin
 from app.models.user import User
 from app.schemas.common import Result
-from app.services.model_service import ModelService
+from app.services.model_service import ModelService, compat_aliases
 from app.utils.log_decorator import log_action
 
 router = APIRouter(prefix="/api/model", tags=["模型管理"])
@@ -71,6 +71,9 @@ async def get_model_status(user: User = Depends(get_current_user)):
     else:
         # 偏好被设置为某个具体模型名
         current_model = preference
+
+    # 与 /api/ai/status 共用同一份别名实现（同一规则不在两处各写一遍）
+    status.update(compat_aliases(status))
 
     status.update({
         "currentModel": current_model,

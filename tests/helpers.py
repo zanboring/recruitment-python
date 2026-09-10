@@ -23,12 +23,17 @@ async def login(client, username: str, password: str = "Pass@1234"):
 
 
 async def register_and_login(client, username: str, password: str = "Pass@1234"):
-    """注册 + 登录，返回 (token, user_info)。"""
+    """注册 + 登录，返回 (token, user_info)。
+
+    登录响应是**平铺**的 UserVO 结构（{id, username, role, email, token}）——
+    与前端契约一致；token 与用户字段在同一层。
+    """
     await register(client, username, password)
     resp = await login(client, username, password)
     assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
-    return data["token"], data["user"]
+    assert "user" not in data, "登录响应必须平铺，嵌套的 user 字段会让前端 role 丢失"
+    return data["token"], data
 
 
 async def promote_to_admin(db_session, user_id: int):

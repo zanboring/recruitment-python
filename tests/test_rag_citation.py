@@ -222,3 +222,27 @@ async def _fake_stream(*args, **kwargs):
     """固定内容的流式桩：让「来源透出」的验证不依赖真实模型调用。"""
     for piece in ("薪资", "水平", "如何"):
         yield piece
+
+
+@pytest.mark.asyncio
+async def test_模型状态接口带前端期望的ollama_zhipu结构(client, db_session):
+    """前端 store/model.ts 读的是 data.ollama.available / data.zhipu.available，
+    而 Python 原生结构是 {primary, local} —— 缺了别名时前端的 `if (data.ollama)`
+    恒为假，模型可用性永远显示 false，且接口不报错、页面不崩、控制台无异常。
+    """
+    from tests.helpers import admin_token, auth_headers
+
+    token = await admin_token(client, db_session, "admin_modelstatus")
+    resp = await client.get("/api/ai/status", headers=auth_headers(token))
+    assert resp.status_code == 200, resp.text
+
+    data = resp.json()["data"]
+    # 前端契约字段必须存在且结构完整
+    assert "ollama" in data and "zhipu" in data
+    assert isinstance(data["ollama"]["available"], bool)
+    assert isinstance(data["zhipu"]["available"], bool)
+    assert "description" in data["zhipu"]
+    # 原生结构不能被破坏
+    assert "primary" in data and "local" in data
+    # zhipu 实际含义是「云端主模型可用」—— 与 primary.available 一致
+    assert data["zhipu"]["available"] == data["primary"]["available"]
