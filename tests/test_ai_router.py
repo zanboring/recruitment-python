@@ -12,13 +12,25 @@ from tests.helpers import register_and_login, auth_headers
 
 @pytest.fixture
 def stub_stream(app, monkeypatch):
-    """把三个流式入口替换成可控桩，并记录调用参数。"""
+    """把三个流式入口替换成可控桩，并记录调用参数。
+
+    桩统一用 ``**kwargs`` 收尾：流式入口的参数会随功能演进增加
+    （已加过 on_usage / max_tokens / on_sources / on_meta），
+    固定签名会让每次扩展都连带打挂一批无关测试。
+    """
     recorded = []
 
-    async def fake_chunks(message, session_id="", db=None, user_id=None):
+    async def fake_chunks(message, session_id="", db=None, user_id=None, **kwargs):
         recorded.append({"message": message, "session_id": session_id, "user_id": user_id})
+        # 模拟「检索命中了知识库」：回调来源，验证 SSE 会透出它
+        on_sources = kwargs.get("on_sources")
+        if on_sources:
+            on_sources([{"index": 1, "id": 7, "question": "薪资水平如何"}])
         for ch in ["你", "好"]:
             yield ch
+        on_meta = kwargs.get("on_meta")
+        if on_meta:
+            on_meta({"provider": "deepseek", "model": "deepseek-flash", "tier": "cloud"})
 
     # ai.py 只暴露两个流式入口：/chat-local 走 Ollama，/chat-stream 走统一调度
     # （云端具体走 DeepSeek 还是智谱由 llm_client 按配置决定，不在路由层出现）
@@ -121,3 +133,65 @@ class TestAiIsolation:
         assert resp.status_code == 200
         assert ai_service.conversation_history.get(ai_service._session_key("s1", user_a["id"])) is None
         assert len(ai_service.conversation_history[ai_service._session_key("s1", other_id)]) == 2
+
+
+@pytest.mark.asyncio
+class TestSseStructuredEvents:
+    """SSE 结构化事件：来源引用与模型元信息。
+
+    这两个事件是**纯增量**的 —— 具名事件不被 EventSource.onmessage 接收，
+    不认识它们的客户端会直接忽略，正文（裸 data: 分片）照常渲染。
+    """
+
+    async def test_正文之前先给出引用来源(self, client, stub_stream):
+        token, _ = await register_and_login(client, "sse_src")
+        resp = await client.post(
+            "/api/ai/chat-stream",
+            json={"message": "薪资水平如何", "session_id": "s1"},
+            headers=auth_headers(token),
+        )
+        body = resp.text
+
+        assert "event: sources" in body
+        # 来源必须出现在正文之前 —— 用户是先看到依据、再看答案
+        assert body.index("event: sources") < body.index("data: 你")
+        # 来源内容应可解析
+        import json
+
+        payload = json.loads(
+            body.split("event: sources\ndata: ", 1)[1].split("\n\n", 1)[0]
+        )
+        assert payload[0]["id"] == 7
+        assert payload[0]["question"] == "薪资水平如何"
+
+    async def test_流结束后给出模型元信息(self, client, stub_stream):
+        token, _ = await register_and_login(client, "sse_meta")
+        resp = await client.post(
+            "/api/ai/chat-stream",
+            json={"message": "hi", "session_id": "s2"},
+            headers=auth_headers(token),
+        )
+        body = resp.text
+
+        assert "event: meta" in body
+        # 元信息在正文之后
+        assert body.index("event: meta") > body.index("data: 好")
+
+        import json
+
+        payload = json.loads(
+            body.split("event: meta\ndata: ", 1)[1].split("\n\n", 1)[0]
+        )
+        assert payload["provider"] == "deepseek"
+        assert payload["tier"] == "cloud"
+
+    async def test_正文分片仍是裸data格式以兼容老客户端(self, client, stub_stream):
+        """新增具名事件不能改变正文的编码方式，否则老客户端会看到乱码。"""
+        token, _ = await register_and_login(client, "sse_compat")
+        resp = await client.post(
+            "/api/ai/chat-stream",
+            json={"message": "hi", "session_id": "s3"},
+            headers=auth_headers(token),
+        )
+        assert "data: 你" in resp.text
+        assert "data: 好" in resp.text

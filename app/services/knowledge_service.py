@@ -143,7 +143,17 @@ class KnowledgeService:
         return kb
 
     @staticmethod
-    async def get_context_for_ai(db: AsyncSession, keyword: str) -> str:
+    async def get_context_with_sources(db: AsyncSession, keyword: str) -> tuple:
+        """检索知识库并返回 ``(注入用的上下文, 引用来源列表)``。
+
+        **为什么要单独返回 sources**：把资料塞进 prompt 里再说一句「请参考回答」，
+        对使用者是完全不透明的 —— 他不知道模型是查到了资料还是凭空作答，
+        也无从判断答案可不可信。返回来源后，前端可以把「依据」展示出来，
+        这正是「防幻觉」最实际的一步：不是让模型承诺不说谎，而是让**依据可核查**。
+
+        上下文里的编号 ``[1] [2]`` 与 ``sources`` 的顺序一一对应，
+        prompt 中要求模型标注引用，用户就能逐条对照。
+        """
         matches = await KnowledgeService._retrieve(db, keyword)
 
         for m in matches:
@@ -155,10 +165,37 @@ class KnowledgeService:
         await db.commit()
 
         if not matches:
-            return ""
-        context = "以下是相关知识库内容，请参考回答：\n\n"
-        for m in matches:
-            context += f"问：{m.question}\n答：{m.answer}\n\n"
+            return "", []
+
+        # sources 与上下文中的编号严格对应，供前端展示「依据」
+        sources = [
+            {
+                "index": i + 1,
+                "id": m.id,
+                "question": m.question,
+                "answer": (m.answer or "")[:200],
+                "source": m.source,
+                "quality_score": m.quality_score,
+            }
+            for i, m in enumerate(matches)
+        ]
+
+        context = (
+            "以下是从知识库检索到的资料，请优先依据这些内容回答，"
+            "并在引用处标注对应编号（如 [1]）：\n\n"
+        )
+        for item, m in zip(sources, matches):
+            context += f"[{item['index']}] 问：{m.question}\n答：{m.answer}\n\n"
+
+        return context, sources
+
+    async def get_context_for_ai(db: AsyncSession, keyword: str) -> str:
+        """检索知识库并返回注入用的上下文文本（不含来源）。
+
+        保留这个入口是给「只需要上下文、不关心引用」的调用方用的
+        （如知识库预览接口）；对话链路请用 ``get_context_with_sources``。
+        """
+        context, _sources = await KnowledgeService.get_context_with_sources(db, keyword)
         return context
 
     @staticmethod

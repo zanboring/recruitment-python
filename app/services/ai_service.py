@@ -109,6 +109,43 @@ async def _update_conversation_history(session_id: str, user_message: str, ai_re
             conversation_history[key] = conversation_history[key][-MAX_HISTORY_TURNS:]
 
 
+def _emit_meta(on_meta, **payload) -> None:
+    """通过 ``on_meta`` 回调透出「这一轮用了谁、花了多少、耗了多久」。
+
+    回调失败一律吞掉：把观测量抛给调用方，就绝不该反过来影响被观测的请求。
+    """
+    if not on_meta:
+        return
+    try:
+        on_meta(payload)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("模型元信息回调失败（已忽略）：%s", e)
+
+
+async def _build_context(db, message: str, on_sources=None) -> str:
+    """检索知识库并返回注入用上下文；有命中时通过 ``on_sources`` 回调透出引用来源。
+
+    把「检索 + 来源回调」收敛到一处，避免云端 / 本地 / 规则引擎三条路径各写一遍
+    （三处都做同一件事时，最容易出现的行为不一致就是有人忘了回调来源）。
+    """
+    if not db:
+        return ""
+    try:
+        from app.services.knowledge_service import KnowledgeService
+
+        context, sources = await KnowledgeService.get_context_with_sources(db, message)
+    except Exception as e:
+        logger.warning("知识库检索失败，本次不带 RAG 上下文：%s", e)
+        return ""
+
+    if sources and on_sources:
+        try:
+            on_sources(sources)
+        except Exception as e:  # noqa: BLE001 - 回调失败不影响对话
+            logger.warning("引用来源回调失败（已忽略）：%s", e)
+    return context
+
+
 def _usage_sink() -> tuple:
     """构造用量收集器：(容器, 回调)。
 
@@ -162,6 +199,7 @@ async def call_cloud_stream(
     user_id=None,
     on_usage=None,
     max_tokens: int = None,
+    on_sources=None,
 ) -> AsyncGenerator[str, None]:
     """调用指定云端服务商的流式对话（OpenAI 兼容协议，DeepSeek / 智谱通用）。
 
@@ -169,10 +207,7 @@ async def call_cloud_stream(
     """
     history = await _get_conversation_history(session_id, user_id)
 
-    context = ""
-    if db:
-        from app.services.knowledge_service import KnowledgeService
-        context = await KnowledgeService.get_context_for_ai(db, message)
+    context = await _build_context(db, message, on_sources)
 
     full_message = context + message if context else message
     messages = history + [{"role": "user", "content": full_message}]
@@ -253,6 +288,7 @@ async def call_ollama_stream(
     model: str = None,
     on_usage=None,
     max_tokens: int = None,
+    on_sources=None,
 ) -> AsyncGenerator[str, None]:
     """本地模型流式对话。
 
@@ -263,10 +299,7 @@ async def call_ollama_stream(
 
     history = await _get_conversation_history(session_id, user_id)
 
-    context = ""
-    if db:
-        from app.services.knowledge_service import KnowledgeService
-        context = await KnowledgeService.get_context_for_ai(db, message)
+    context = await _build_context(db, message, on_sources)
 
     full_message = context + message if context else message
     messages = history + [{"role": "user", "content": full_message}]
@@ -281,7 +314,14 @@ async def call_ollama_stream(
         yield chunk
 
 
-async def call_chat_stream(message: str, session_id: str = "", db=None, user_id=None) -> AsyncGenerator[str, None]:
+async def call_chat_stream(
+    message: str,
+    session_id: str = "",
+    db=None,
+    user_id=None,
+    on_sources=None,
+    on_meta=None,
+) -> AsyncGenerator[str, None]:
     """对话主入口，按降级链依次尝试各后端。
 
     降级链：**云端（DeepSeek 优先 → 智谱备选）→ 本地 Ollama → 规则引擎**。
@@ -312,14 +352,23 @@ async def call_chat_stream(message: str, session_id: str = "", db=None, user_id=
                 box, sink = _usage_sink()
                 started = time.time()
                 async for chunk in call_cloud_stream(
-                    primary, augmented, session_id, db, user_id, on_usage=sink
+                    primary, augmented, session_id, db, user_id,
+                    on_usage=sink, on_sources=on_sources,
                 ):
                     response_content += chunk
                     yield chunk
+                latency = int((time.time() - started) * 1000)
                 await _record_usage(
                     "chat", provider=getattr(primary, "provider", ""),
                     model=getattr(primary, "model", ""), tier="cloud", usage=box,
-                    latency_ms=int((time.time() - started) * 1000), user_id=user_id,
+                    latency_ms=latency, user_id=user_id,
+                )
+                _emit_meta(
+                    on_meta, provider=getattr(primary, "provider", ""),
+                    model=getattr(primary, "model", ""), tier="cloud",
+                    prompt_tokens=box.get("prompt_tokens", 0),
+                    completion_tokens=box.get("completion_tokens", 0),
+                    latency_ms=latency, tool_called=True,
                 )
                 if response_content:
                     from app.services.knowledge_service import KnowledgeService
@@ -337,14 +386,23 @@ async def call_chat_stream(message: str, session_id: str = "", db=None, user_id=
         started = time.time()
         try:
             async for chunk in call_cloud_stream(
-                provider, message, session_id, db, user_id, on_usage=sink
+                provider, message, session_id, db, user_id,
+                on_usage=sink, on_sources=on_sources,
             ):
                 response_content += chunk
                 yield chunk
+            latency = int((time.time() - started) * 1000)
             await _record_usage(
                 "chat", provider=getattr(provider, "provider", ""),
                 model=getattr(provider, "model", ""), tier="cloud", usage=box,
-                latency_ms=int((time.time() - started) * 1000), user_id=user_id,
+                latency_ms=latency, user_id=user_id,
+            )
+            _emit_meta(
+                on_meta, provider=getattr(provider, "provider", ""),
+                model=getattr(provider, "model", ""), tier="cloud",
+                prompt_tokens=box.get("prompt_tokens", 0),
+                completion_tokens=box.get("completion_tokens", 0),
+                latency_ms=latency, tool_called=False,
             )
             if db and response_content:
                 from app.services.knowledge_service import KnowledgeService
@@ -409,13 +467,21 @@ async def call_chat_stream(message: str, session_id: str = "", db=None, user_id=
             started = time.time()
             try:
                 async for chunk in call_ollama_stream(
-                    message, session_id, db, user_id, model=model, on_usage=sink
+                    message, session_id, db, user_id, model=model,
+                    on_usage=sink, on_sources=on_sources,
                 ):
                     response_content += chunk
                     yield chunk
+                latency = int((time.time() - started) * 1000)
                 await _record_usage(
                     "chat", provider="ollama", model=model, tier="local", usage=box,
-                    latency_ms=int((time.time() - started) * 1000), user_id=user_id,
+                    latency_ms=latency, user_id=user_id,
+                )
+                _emit_meta(
+                    on_meta, provider="ollama", model=model, tier="local",
+                    prompt_tokens=box.get("prompt_tokens", 0),
+                    completion_tokens=box.get("completion_tokens", 0),
+                    latency_ms=latency, tool_called=False,
                 )
                 return
             except Exception as e:
@@ -434,20 +500,22 @@ async def call_chat_stream(message: str, session_id: str = "", db=None, user_id=
 
     from app.services.local_model_service import LocalModelService
     # 规则引擎兜底也接入知识库 RAG，保证降级时核心检索能力不失效
-    rag_context = ""
-    if db:
-        try:
-            from app.services.knowledge_service import KnowledgeService
-            rag_context = await KnowledgeService.get_context_for_ai(db, message)
-        except Exception as e:
-            logger.warning(f"规则引擎兜底时知识库检索失败: {e}")
+    rag_context = await _build_context(db, message, on_sources)
     started = time.time()
     response = await LocalModelService.chat(message, db, rag_context)
     # 规则引擎不消耗 token，但这条记录本身就是「降级事件」，用于统计
     # 「有多少请求最终没走到任何模型」——只统计 token 的话这类事件会完全消失。
+    fallback_latency = int((time.time() - started) * 1000)
     await _record_usage(
         "chat", provider="local_fallback", model="规则引擎", tier="fallback",
-        latency_ms=int((time.time() - started) * 1000), user_id=user_id,
+        latency_ms=fallback_latency, user_id=user_id,
+    )
+    # 兜底也要透出 meta：前端据此显示「本次由规则引擎回答」，
+    # 用户才知道自己看到的是降级结果而非模型输出。
+    _emit_meta(
+        on_meta, provider="local_fallback", model="规则引擎", tier="fallback",
+        prompt_tokens=0, completion_tokens=0, latency_ms=fallback_latency,
+        tool_called=False,
     )
     yield response
 
