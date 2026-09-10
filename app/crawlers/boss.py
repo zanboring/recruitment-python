@@ -1,13 +1,11 @@
 import asyncio
-import hashlib
 import logging
-import re
 from typing import List, Dict
 
 from bs4 import BeautifulSoup
 
 from app.crawlers.base import BaseCrawler
-from app.crawlers.city_map import get_city_code
+from app.crawlers.city_map import require_city_code
 from app.crawlers.cleaner import clean_job_data, generate_job_key
 from app.config import settings
 
@@ -134,7 +132,10 @@ class BossCrawler(BaseCrawler):
 
     async def crawl(self, keyword: str, city: str = "") -> List[Dict]:
         results = []
-        city_code = get_city_code(city)
+        # 未收录城市直接抛错。此前用「查不到就回退北京编码」，会把北京的岗位
+        # 当成目标城市的数据入库，且不报错、不留痕（详见 city_map 模块文档）。
+        # 在这里抛出还能避免无意义的 4 次指数退避重试 —— 这类失败重试不会变好。
+        city_code = require_city_code(city)
         page_num = 1
 
         try:
@@ -213,9 +214,6 @@ class BossCrawler(BaseCrawler):
                         else:
                             skills.append(tag_text)
 
-                job_id_match = re.search(r'jobId=(\d+)', str(card))
-                job_id = job_id_match.group(1) if job_id_match else hashlib.md5((title + company_name).encode()).hexdigest()[:16]
-
                 jobs.append({
                     "title": title,
                     "salary": salary,
@@ -225,7 +223,10 @@ class BossCrawler(BaseCrawler):
                     "education": education,
                     "skills": ",".join(skills),
                     "source_site": self.source_site,
-                    "job_key": generate_job_key(self.source_site, job_id),
+                    # job_key 统一走「平台 + 标题 + 公司 + 城市」四要素指纹。
+                    # 原先用 BOSS 的 jobId，与管理端新增岗位的口径不同，
+                    # 同一岗位经两个入口会算出不同的键而重复入库。
+                    "job_key": generate_job_key(self.source_site, title, company_name, city),
                     "description": title + " " + ",".join(skills),
                 })
             except Exception as e:

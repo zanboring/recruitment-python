@@ -6,6 +6,7 @@ from sqlalchemy import select, or_, func, update
 from app.config import settings
 from app.models.knowledge_base import KnowledgeBase
 from app.schemas.knowledge import KnowledgeBaseCreate, KnowledgeBaseUpdate
+from app.services.embedding_service import invalidate_embedding_cache
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,17 @@ KEYWORDS = {
 
 _cache = {"data": None, "timestamp": 0}
 CACHE_TTL = 600
+
+
+def _invalidate_caches() -> None:
+    """知识库内容变更后统一失效两类缓存。
+
+    - `_cache`：启用条目的列表缓存。不清的话新条目 600 秒内进不了检索池；
+    - embedding 向量缓存：不清的话旧条目的向量最长 1 小时内仍参与相似度
+      计算，表现为「知识改了却检索不到新内容」。
+    """
+    _cache["data"] = None
+    invalidate_embedding_cache()
 
 
 def _escape_like(s: str) -> str:
@@ -81,7 +93,7 @@ class KnowledgeService:
         )
         db.add(kb)
         await db.commit()
-        _cache["data"] = None
+        _invalidate_caches()
         return kb
 
     @staticmethod
@@ -98,7 +110,7 @@ class KnowledgeService:
         if request.quality_score is not None:
             kb.quality_score = request.quality_score
         await db.commit()
-        _cache["data"] = None
+        _invalidate_caches()
         return kb
 
     @staticmethod
@@ -108,7 +120,7 @@ class KnowledgeService:
             raise ValueError("知识条目不存在")
         await db.delete(kb)
         await db.commit()
-        _cache["data"] = None
+        _invalidate_caches()
 
     @staticmethod
     async def toggle_status(db: AsyncSession, knowledge_id: int):
@@ -117,7 +129,7 @@ class KnowledgeService:
             raise ValueError("知识条目不存在")
         kb.status = 1 if kb.status == 0 else 0
         await db.commit()
-        _cache["data"] = None
+        _invalidate_caches()
         return kb
 
     @staticmethod
@@ -127,7 +139,7 @@ class KnowledgeService:
             raise ValueError("知识条目不存在")
         kb.quality_score = score
         await db.commit()
-        _cache["data"] = None
+        _invalidate_caches()
         return kb
 
     @staticmethod
@@ -151,12 +163,31 @@ class KnowledgeService:
 
     @staticmethod
     async def _retrieve(db: AsyncSession, keyword: str) -> list:
-        """知识库检索：语义向量检索优先，失败或无命中时降级为关键词匹配。
+        """知识库检索入口：按配置策略执行，任一环节失败都降级为关键词检索。
+
+        策略（RAG_RETRIEVAL_STRATEGY）：
+        - auto      语义优先，无命中或异常时降级关键词（默认，保持服务不中断）
+        - semantic  仅语义向量检索
+        - keyword   仅关键词检索（无需任何密钥，可离线运行）
+        - hybrid    向量 + 关键词的 RRF 融合
 
         语义检索能把「工资多少」和「薪资水平」这类表述不同但语义相近的问题
-        关联起来；向量化不可用（无 key / 网络失败 / 接口报错）时自动回退，
-        保证服务不中断。
+        关联起来，这是关键词匹配做不到的 —— 具体提升幅度见
+        `scripts/eval_rag.py` 的对比评估结果。
         """
+        strategy = (settings.rag_retrieval_strategy or "auto").strip().lower()
+
+        if strategy == "keyword":
+            return await KnowledgeService._keyword_search(db, keyword)
+
+        if strategy == "hybrid":
+            try:
+                return await KnowledgeService._hybrid_search(db, keyword, top_k=5)
+            except Exception as e:
+                logger.warning(f"混合检索失败，降级关键词检索: {e}")
+                return await KnowledgeService._keyword_search(db, keyword)
+
+        # auto / semantic：优先向量检索
         if settings.embedding_enabled:
             try:
                 semantic = await KnowledgeService._semantic_search(db, keyword, top_k=5)
@@ -220,7 +251,66 @@ class KnowledgeService:
         return matches
 
     @staticmethod
-    async def learn_from_response(db: AsyncSession, question: str, answer: str, tags: str = ""):
+    async def _hybrid_search(db: AsyncSession, query: str, top_k: int = 5) -> list:
+        """向量检索 + 关键词检索的 RRF 融合。
+
+        **为什么用 RRF（Reciprocal Rank Fusion）而不是加权求和**：
+        余弦相似度的取值范围是 [-1, 1]，而关键词匹配没有可比的分数量纲，
+        直接把两者加权相加需要人为调参且不稳定。RRF 只看**排名**不看分数：
+
+            score(条目) = Σ 1 / (K + rank_第r路检索(条目))      K 取 60
+
+        因而两路检索的分数尺度差异被彻底消除，且实现无需调参。
+        K=60 是论文中的经验值，作用是压低头部排名的差异、避免某一路
+        的单一结果独占权重。
+
+        代价：RRF 至少需要两路都能返回结果才有融合效果；当向量化不可用时，
+        本方法自动退化为纯关键词结果（由 _semantic_search 抛异常后返回空列表实现）。
+        """
+        rrf_k = 60
+        try:
+            semantic = await KnowledgeService._semantic_search(db, query, top_k=top_k * 2)
+        except Exception as e:
+            logger.warning(f"混合检索的向量分支失败，退化为关键词检索: {e}")
+            semantic = []
+
+        keyword = await KnowledgeService._keyword_search(db, query)
+
+        if not semantic:
+            return keyword[:top_k]
+        if not keyword:
+            return semantic[:top_k]
+
+        fused: dict = {}
+        for rank, item in enumerate(semantic, start=1):
+            fused[item.id] = fused.get(item.id, 0.0) + 1.0 / (rrf_k + rank)
+        for rank, item in enumerate(keyword, start=1):
+            fused[item.id] = fused.get(item.id, 0.0) + 1.0 / (rrf_k + rank)
+
+        by_id = {item.id: item for item in list(semantic) + list(keyword)}
+        ranked = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
+        return [by_id[item_id] for item_id, _ in ranked[:top_k] if item_id in by_id]
+
+    @staticmethod
+    async def learn_from_response(
+        db: AsyncSession, question: str, answer: str, tags: str = "", source: str = "auto"
+    ):
+        """把一次问答沉淀进知识库。
+
+        **注意这是一条自我强化回路**：AI 自己生成的回答会被下一轮的语义检索
+        当成「知识」召回并再次喂给模型。若模型某次答错，错误内容会被固化下来
+        并不断复现。因此：
+        - ``AI_AUTO_LEARN_ENABLED=false`` 可整体关闭自动入库；
+        - 自动入库条目的 ``source`` 记录真实来源（模型名），便于与人工条目区分；
+        - 检索时若需要只信人工内容，可按 ``source`` 过滤。
+
+        ``source`` 原先被写死为 "zhipu"，在模型切换到 DeepSeek / 本地之后
+        该标注已失真，且会让「自动入库量」的统计口径错位。
+        """
+        from app.config import settings
+
+        if not getattr(settings, "ai_auto_learn_enabled", True):
+            return
         # 质量门槛：答案过短视为低质量回答，不自动入库，避免污染知识库
         if not answer or len(answer.strip()) < 20:
             return
@@ -237,17 +327,23 @@ class KnowledgeService:
             question=question,
             answer=answer,
             tags=tags,
-            source="zhipu",
+            source=source or "auto",
             quality_score=1
         )
         db.add(kb)
         await db.commit()
-        _cache["data"] = None
+        _invalidate_caches()
 
     @staticmethod
     async def get_stats(db: AsyncSession):
         total = await db.scalar(select(func.count()).select_from(KnowledgeBase))
         enabled = await db.scalar(select(func.count()).where(KnowledgeBase.status == 1))
         manual = await db.scalar(select(func.count()).where(KnowledgeBase.source == "manual"))
-        auto = await db.scalar(select(func.count()).where(KnowledgeBase.source == "zhipu"))
+        # 自动入库 = 非人工录入。原先按 source == "zhipu" 统计，模型换成
+        # DeepSeek / 本地之后这个口径就失效了（自动入库量恒为 0）。
+        auto = await db.scalar(
+            select(func.count()).where(
+                (KnowledgeBase.source != "manual") | (KnowledgeBase.source.is_(None))
+            )
+        )
         return {"total": total, "enabled": enabled, "manual": manual, "auto": auto}

@@ -1,9 +1,30 @@
-from pydantic import BaseModel, field_serializer
+from pydantic import BaseModel, Field, field_serializer, model_validator
 from typing import Optional
 from datetime import datetime
 
+# Java 版前端发送的 camelCase 查询参数 → 本服务原生 snake_case 字段名
+_CAMEL_TO_SNAKE = {
+    "companyName": "company_name",
+    "sourceSite": "source_site",
+    "minSalary": "min_salary",
+    "maxSalary": "max_salary",
+    "pageNum": "page_num",
+    "pageSize": "page_size",
+}
+
 
 class JobQueryDTO(BaseModel):
+    """岗位查询条件。
+
+    除原生 snake_case 外，还接受 Java 版前端发送的 camelCase
+    （companyName / pageSize …），由下方 before-validator 统一归一化。
+
+    为什么不用 `Field(alias=...)`：这些字段是 Optional，而 Optional 会被展开成
+    Union —— Pydantic 对 Union 成员上的 alias / validation_alias 会发
+    UnsupportedFieldAttributeWarning（实测功能仍生效，但会产生大量告警噪音）。
+    用 model_validator 做键名映射既兼容两种命名，又不产生任何告警。
+    """
+
     keyword: Optional[str] = None
     city: Optional[str] = None
     company_name: Optional[str] = None
@@ -11,8 +32,20 @@ class JobQueryDTO(BaseModel):
     min_salary: Optional[float] = None
     max_salary: Optional[float] = None
     status: Optional[str] = None
-    page_num: int = 1
-    page_size: int = 20
+    page_num: int = Field(1, ge=1)
+    page_size: int = Field(20, ge=1, le=200)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_camel_case(cls, data):
+        """把 camelCase 入参补成 snake_case；已经是 snake_case 的不覆盖。"""
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        for camel, snake in _CAMEL_TO_SNAKE.items():
+            if camel in normalized and snake not in normalized:
+                normalized[snake] = normalized[camel]
+        return normalized
 
 
 class JobCreateRequest(BaseModel):

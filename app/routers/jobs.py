@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, Query, UploadFile, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.database import get_db
-from app.dependencies import require_admin
+from app.dependencies import get_current_user, require_admin
 from app.exceptions import AppException
 from app.models.user import User
 from app.services.job_service import JobService
@@ -13,6 +13,7 @@ from app.recommender.salary_predictor import predict_salary
 from app.recommender.analyzer import recommend_jobs, get_experience_years
 from app.schemas.common import Result
 from app.schemas.job import JobQueryDTO, JobCreateRequest, JobUpdateRequest, JobResponse
+from app.utils.log_decorator import log_action
 
 
 class IntelligentRecommendRequest(BaseModel):
@@ -20,12 +21,13 @@ class IntelligentRecommendRequest(BaseModel):
     education: str = ""
     experienceYears: int = 0
     city: str = ""
-    limit: int = 10
+    limit: int = Field(10, ge=1, le=100)
 
 router = APIRouter(prefix="/api/jobs", tags=["岗位"])
 
 
 @router.post("/")
+@log_action("新增岗位")
 async def create_job(
     request: JobCreateRequest,
     db: AsyncSession = Depends(get_db),
@@ -39,6 +41,7 @@ async def create_job(
 
 
 @router.put("/{job_id}")
+@log_action("更新岗位")
 async def update_job(
     job_id: int,
     request: JobUpdateRequest,
@@ -52,7 +55,23 @@ async def update_job(
         raise AppException(str(e), 400)
 
 
+# 注意注册顺序：静态路径 /batch 必须排在动态路径 /{job_id} 之前。
+# FastAPI 按注册顺序匹配路由，若 /{job_id} 在前，请求 DELETE /api/jobs/batch
+# 会命中 /{job_id} 并把 "batch" 当作 int 解析，直接返回 422 int_parsing，
+# 导致批量删除接口完全不可用。
+@router.delete("/batch")
+@log_action("批量删除岗位")
+async def batch_delete_jobs(
+    job_ids: List[int] = Body(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin)
+):
+    await JobService.batch_delete_jobs(db, job_ids)
+    return Result.success()
+
+
 @router.delete("/{job_id}")
+@log_action("删除岗位")
 async def delete_job(
     job_id: int,
     db: AsyncSession = Depends(get_db),
@@ -63,16 +82,6 @@ async def delete_job(
         return Result.success()
     except ValueError as e:
         raise AppException(str(e), 400)
-
-
-@router.delete("/batch")
-async def batch_delete_jobs(
-    job_ids: List[int] = Body(...),
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_admin)
-):
-    await JobService.batch_delete_jobs(db, job_ids)
-    return Result.success()
 
 
 @router.post("/page")
@@ -136,7 +145,15 @@ async def analysis_summary(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/analysis/report")
-async def analysis_report(db: AsyncSession = Depends(get_db)):
+async def analysis_report(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    """LLM 增强分析报告。
+
+    该接口会真实调用 GLM-4 / Ollama 生成报告，属于有成本的操作，
+    因此要求登录（原先完全匿名可调，存在被刷爆 Token 的成本攻击面）。
+    """
     from app.services.ai_service import generate_analysis_report
     stats = await JobService.collect_analysis_stats(db)
 
@@ -206,14 +223,14 @@ async def intelligent_recommend(
 
 @router.get("/{job_id}")
 async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):
-    try:
-        result = await JobService.get_job(db, job_id)
-        return Result.success(result)
-    except ValueError as e:
-        raise AppException(str(e), 400)
+    if not await JobService.exists(db, job_id):
+        raise AppException("岗位不存在", 404)
+    result = await JobService.get_job(db, job_id)
+    return Result.success(result)
 
 
 @router.post("/export")
+@log_action("导出岗位")
 async def export_jobs(
     request: JobQueryDTO,
     db: AsyncSession = Depends(get_db),
@@ -223,6 +240,7 @@ async def export_jobs(
 
 
 @router.post("/import")
+@log_action("导入岗位")
 async def import_jobs(
     file: UploadFile,
     db: AsyncSession = Depends(get_db),

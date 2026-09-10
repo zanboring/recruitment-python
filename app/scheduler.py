@@ -1,86 +1,52 @@
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+"""定时任务调度：每天凌晨按「关键词 × 城市」批量爬取岗位。
 
-from app.config import settings
+**为什么只保留一个入口**：
+定时爬取直接复用 services.crawler_service.start_crawl，与手动触发的
+POST /api/crawler/start 走完全相同的链路（重试包装、清洗过滤、去重、
+下架判定、任务状态落库）。
 
-scheduler = AsyncIOScheduler(
-    timezone="Asia/Shanghai",
-    job_defaults={"coalesce": True, "max_instances": 1}
-)
-
+历史问题：本文件曾自己维护一套入库逻辑，缺少清洗过滤与下架判定、
+也不刷新 last_seen_at，导致同一份数据经不同入口入库结果不一致。
+"""
 import logging
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logger = logging.getLogger("scheduler")
 
+scheduler = AsyncIOScheduler(
+    timezone="Asia/Shanghai",
+    job_defaults={"coalesce": True, "max_instances": 1},
+)
 
-def start_scheduler():
-    from sqlalchemy import select as sa_select
-    from app.crawlers.boss import BossCrawler
-    from app.crawlers.cleaner import deduplicate_jobs, clean_job_data
+# 定时爬取目标：3 个关键词 × 6 个城市 = 18 组任务
+SCHEDULED_KEYWORDS = ["Java", "Python", "前端"]
+SCHEDULED_CITIES = ["北京", "上海", "广州", "深圳", "杭州", "成都"]
+SCHEDULED_PLATFORMS = ["boss"]
+
+
+async def scheduled_crawl() -> None:
+    """执行一轮定时爬取。单组失败只记录日志，不影响其余组合。"""
+    # 延迟导入：避免应用启动阶段（导入 scheduler 时）就拉起数据库与爬虫依赖
     from app.database import async_session
-    from app.models.job import Job
-    from app.models.crawl_task import CrawlTask
+    from app.services.crawler_service import start_crawl
 
-    async def scheduled_crawl():
-        keywords = ["Java", "Python", "前端"]
-        cities = ["北京", "上海", "广州", "深圳", "杭州", "成都"]
+    async with async_session() as db:
+        for keyword in SCHEDULED_KEYWORDS:
+            for city in SCHEDULED_CITIES:
+                try:
+                    count = await start_crawl(db, keyword, city, SCHEDULED_PLATFORMS)
+                    logger.info("定时爬取完成：%s / %s，新增 %s 条", keyword, city, count)
+                except Exception as e:  # noqa: BLE001
+                    # start_crawl 内部已把该任务置为 FAILED，这里记录后继续下一组
+                    logger.error(
+                        "定时爬取失败：%s / %s：%s", keyword, city, e, exc_info=True
+                    )
 
-        async with async_session() as db:
-            for keyword in keywords:
-                for city in cities:
-                    task = None
-                    try:
-                        task = CrawlTask(
-                            source_site="boss",
-                            keyword=keyword,
-                            city=city,
-                            status="RUNNING"
-                        )
-                        db.add(task)
-                        await db.commit()
-                        await db.refresh(task)
 
-                        crawler = BossCrawler()
-                        jobs = await crawler.crawl(keyword, city)
-                        jobs = deduplicate_jobs(jobs)
-
-                        count = 0
-                        for job_data in jobs:
-                            cleaned = clean_job_data(job_data)
-                            existing = await db.execute(
-                                sa_select(Job).where(Job.job_key == cleaned["job_key"])
-                            )
-                            if not existing.scalar_one_or_none():
-                                job = Job(
-                                    title=cleaned["title"],
-                                    company_name=cleaned["company_name"],
-                                    source_site=cleaned["source_site"],
-                                    job_key=cleaned["job_key"],
-                                    job_status="ACTIVE",
-                                    city=cleaned["city"],
-                                    experience=cleaned["experience"],
-                                    education=cleaned["education"],
-                                    min_salary=cleaned["min_salary"],
-                                    max_salary=cleaned["max_salary"],
-                                    skills=cleaned["skills"],
-                                    job_desc=cleaned["description"],
-                                )
-                                db.add(job)
-                                count += 1
-                                if count % 50 == 0:
-                                    await db.commit()
-
-                        await db.commit()
-
-                        task.status = "COMPLETED"
-                        task.job_count = count
-                        await db.commit()
-                    except Exception as e:
-                        if task:
-                            task.status = "FAILED"
-                            task.message = str(e)
-                            await db.commit()
-                        logger.error(f"Scheduled crawl failed for {keyword} in {city}: {e}", exc_info=True)
-
+def start_scheduler() -> None:
+    """注册定时任务并启动调度器（幂等，可安全重复调用）。"""
     if not scheduler.get_job("scheduled_crawl"):
         scheduler.add_job(scheduled_crawl, "cron", hour=2, minute=0, id="scheduled_crawl")
-    scheduler.start()
+    if not scheduler.running:
+        scheduler.start()

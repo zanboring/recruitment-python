@@ -8,11 +8,13 @@ from app.models.user import User
 from app.services.auth_service import AuthService
 from app.schemas.common import Result
 from app.schemas.user import UserUpdateRequest, UserResponse
+from app.utils.log_decorator import log_action
 
 router = APIRouter(prefix="/api/user", tags=["用户"])
 
 
 @router.put("/me")
+@log_action("更新个人资料")
 async def update_profile(
     request: UserUpdateRequest,
     db: AsyncSession = Depends(get_db),
@@ -55,6 +57,7 @@ async def list_users(
 
 
 @router.delete("/{user_id}")
+@log_action("删除用户")
 async def delete_user(
     user_id: int,
     db: AsyncSession = Depends(get_db),

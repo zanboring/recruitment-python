@@ -12,6 +12,7 @@ class UserUpdateRequest(BaseModel):
 
 class UserResponse(UserInfoResponse):
     login_fail_count: int
+    enabled: bool = True
     created_at: datetime
 
     @field_serializer("created_at")

@@ -1,6 +1,9 @@
-from datetime import datetime, timedelta, timezone
+import math
+from datetime import timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+
+from app.utils.timeutil import utc_now
 
 from app.models.user import User
 from app.utils.security import hash_password, verify_password, create_token
@@ -18,16 +21,32 @@ class AuthService:
         if not user:
             raise ValueError("用户名或密码错误")
 
-        if user.locked_until and user.locked_until > datetime.now(timezone.utc):
-            remaining = (user.locked_until - datetime.now(timezone.utc)).total_seconds() // 60
-            raise ValueError(f"账号已锁定，请{int(remaining)}分钟后再试")
+        now = utc_now()
+        if user.locked_until and user.locked_until > now:
+            # 向上取整：否则剩余不足 1 分钟时会提示「请0分钟后再试」
+            remaining = max(1, math.ceil((user.locked_until - now).total_seconds() / 60))
+            raise ValueError(f"账号已锁定，请{remaining}分钟后再试")
+
+        # 锁定期已过 → 重置失败计数，让用户重新获得完整尝试次数。
+        #
+        # 原先只在「登录成功」时清零计数，导致计数长期停在阈值上：锁定期一结束，
+        # 用户只要再输错**一次**就立刻被再次锁定 30 分钟。实测下来等价于
+        # 「每 30 分钟只能试一次」，正常用户打错一个字母就会被反复锁死。
+        if user.locked_until and user.locked_until <= now:
+            user.login_fail_count = 0
+            user.locked_until = None
+            await db.commit()
 
         if not verify_password(request.password, user.password):
             user.login_fail_count = (user.login_fail_count or 0) + 1
             if user.login_fail_count >= 5:
-                user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=30)
+                user.locked_until = utc_now() + timedelta(minutes=30)
             await db.commit()
             raise ValueError("用户名或密码错误")
+
+        # 密码正确后再检查启用状态：顺序反了会把「账号是否存在」泄露给未认证者
+        if getattr(user, "enabled", True) is False:
+            raise ValueError("账号已被禁用，请联系管理员")
 
         user.login_fail_count = 0
         user.locked_until = None

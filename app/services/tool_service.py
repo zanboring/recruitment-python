@@ -21,6 +21,7 @@ from app.services.job_service import JobService
 logger = logging.getLogger(__name__)
 
 # 工具定义（JSON Schema，对齐 OpenAI function calling 风格）
+# 当前仅实现 query_jobs 一个工具；TOOLS 列表架构支持横向扩展，新增工具只需追加定义 + 在 execute_tool 分发。
 TOOLS: list[dict] = [
     {
         "type": "function",
@@ -58,6 +59,80 @@ def build_tool_detection_prompt() -> str:
         "2. 其他情况（闲聊、知识问答、自我介绍等），只输出一个词：NONE\n"
         "只输出上述两种结果之一，不要输出其他任何内容。"
     )
+
+
+# ---------------- 工具识别的廉价前置过滤 ----------------
+#
+# 为什么需要它：朴素实现会对**每一条**用户消息都发起一次「是否需要查库」的
+# LLM 调用。实测本机每次约 2.9s，云端则是一次额外的 token 消耗；而真实对话里
+# 大量消息根本不涉及数据库（打招呼、概念问答、自我介绍…），这笔开销纯属浪费。
+#
+# 过滤原则：**宁可多判，不可漏判**。
+#   漏判代价 —— 本该查库的问题被当成闲聊，模型凭空编数字，属于硬伤；
+#   多判代价 —— 白花一次调用，答案依然正确。
+# 因此规则刻意保守：只有「消息很短 **且** 不含任何领域信号」时才跳过。
+_DOMAIN_SIGNALS = (
+    # 岗位与求职
+    "岗位", "职位", "招聘", "招人", "求职", "找工作", "工作机会", "内推", "hc",
+    # 薪资待遇
+    "薪资", "工资", "薪水", "薪酬", "月薪", "年薪", "待遇", "多少钱",
+    # 组织主体
+    "公司", "企业", "单位", "雇主", "大厂",
+    # 数量与统计口径
+    "多少", "几个", "几家", "几条", "数量", "统计", "占比", "分布", "排名",
+    # 分析意图
+    "分析", "对比", "趋势", "平均", "最高", "最低",
+)
+
+_CITY_SIGNALS = (
+    "北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "南京", "西安", "苏州",
+    "天津", "重庆", "长沙", "郑州", "青岛", "合肥", "福州", "厦门", "济南", "大连",
+    "宁波", "无锡", "佛山", "东莞", "昆明", "南昌", "贵阳", "南宁", "太原", "石家庄",
+    "沈阳", "哈尔滨", "长春", "兰州", "银川", "西宁", "乌鲁木齐", "呼和浩特",
+    "海口", "三亚", "珠海", "中山", "惠州",
+)
+
+
+def _looks_like_data_query(message: str) -> bool:
+    """消息里是否出现了「可能涉及数据库」的信号词。"""
+    return any(sig in message for sig in _DOMAIN_SIGNALS) or any(
+        city in message for city in _CITY_SIGNALS
+    )
+
+
+def should_detect_tool(message: str) -> bool:
+    """判断是否值得为这条消息发起一次「工具识别」LLM 调用。
+
+    过滤逻辑（保守优先，见上方说明）：
+
+    ==============================  ==========
+    条件                            结果
+    ==============================  ==========
+    含领域信号或城市名               发起识别
+    不含信号，且长度 > 上限          发起识别（保守起见不跳过）
+    不含信号，且长度 <= 上限         跳过，按普通对话处理
+    空消息                           跳过
+    ==============================  ==========
+
+    可通过 ``AI_TOOL_PREFILTER_ENABLED=false`` 整体关闭该过滤，
+    一旦发现漏判可立即回退，无需改代码。
+    """
+    from app.config import settings
+
+    if not getattr(settings, "ai_tool_prefilter_enabled", True):
+        return True
+
+    text = (message or "").strip()
+    if not text:
+        return False
+    if _looks_like_data_query(text):
+        return True
+
+    limit = int(getattr(settings, "ai_tool_prefilter_max_chars", 24))
+    if len(text) <= limit:
+        logger.debug("跳过工具识别（短消息且无领域信号）：%s", text[:30])
+        return False
+    return True
 
 
 def build_tool_result_context(tool_result_json: str) -> str:

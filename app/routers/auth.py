@@ -8,20 +8,23 @@ from app.models.user import User
 from app.services.auth_service import AuthService
 from app.schemas.common import Result
 from app.schemas.auth import LoginRequest, RegisterRequest, ChangePasswordRequest, LoginResponse, UserInfoResponse
+from app.utils.log_decorator import log_action
 
 router = APIRouter(prefix="/api/auth", tags=["认证"])
 
 
 @router.post("/login")
+@log_action("用户登录")
 async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
     try:
         result = await AuthService.login(db, request)
         return Result.success(result)
     except ValueError as e:
-        raise AppException(str(e), 400)
+        raise AppException(str(e), 401)
 
 
 @router.post("/register")
+@log_action("用户注册")
 async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db)):
     try:
         result = await AuthService.register(db, request)
@@ -31,6 +34,7 @@ async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db))
 
 
 @router.post("/change-password")
+@log_action("修改密码")
 async def change_password(
     request: ChangePasswordRequest,
     db: AsyncSession = Depends(get_db),

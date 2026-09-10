@@ -53,7 +53,7 @@ def cosine(a: list, b: list) -> float:
     return dot / (norm_a * norm_b)
 
 
-async def _embed_batch(texts: list) -> list:
+async def _embed_batch_zhipu(texts: list) -> list:
     """调用智谱 embedding API 批量向量化（一次请求，不超过 _CHUNK_SIZE 条）。"""
     headers = {
         "Content-Type": "application/json",
@@ -68,9 +68,82 @@ async def _embed_batch(texts: list) -> list:
         resp = await client.post(settings.embedding_api_url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
+    await _record_embedding_usage(
+        "zhipu", settings.embedding_model, len(texts), data.get("usage")
+    )
     # 按 index 排序，保证返回顺序与输入顺序一致
     items = sorted(data.get("data", []), key=lambda x: x.get("index", 0))
     return [item["embedding"] for item in items]
+
+
+async def _embed_batch_ollama(texts: list) -> list:
+    """用本地 Ollama 生成向量。
+
+    **为什么提供本地后端**：
+    - 完全离线、零成本，不消耗任何云端额度；
+    - 数据不出内网，适合对数据合规有要求的企业部署场景；
+    - 与对话模型共用一套 Ollama 服务，无需额外基础设施。
+
+    前置条件：`ollama pull <向量模型>`，且服务端需启用 embeddings
+    （部分版本报 "This server does not support embeddings" 时需重启服务）。
+    """
+    model = settings.ollama_embedding_model
+    url = f"{settings.ollama_base_url}/api/embed"
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(url, json={"model": model, "input": texts})
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"Ollama 未启用向量化接口。请先执行 `ollama pull {model}`，"
+                "并确认服务端已支持 embeddings。"
+            )
+        resp.raise_for_status()
+        data = resp.json()
+
+    embeddings = data.get("embeddings")
+    if not embeddings:
+        raise RuntimeError(f"Ollama 未返回向量数据：{str(data)[:200]}")
+    # Ollama 用 prompt_eval_count 表示输入 token 数，归一化成与云端一致的形状
+    prompt_tokens = int(data.get("prompt_eval_count") or 0)
+    await _record_embedding_usage(
+        "ollama", model, len(texts),
+        {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens},
+    )
+    return embeddings
+
+
+async def _record_embedding_usage(provider: str, model: str, count: int, usage) -> None:
+    """记录一次向量化调用的用量。
+
+    向量化的 token 消耗容易被忽略，但在知识库初始化/重建时它往往是成本大头 ——
+    整库几十上百条文本会一次性全部送去向量化，因此必须单独统计。
+
+    服务端未返回 usage 时不臆造 token 数（记 0），但这一次调用本身仍会被计入 ——
+    「被调用了多少次」是可确证的事实，而「用了多少 token」在拿不到时就不该编。
+    """
+    from app.services import usage_service
+
+    payload = usage or {}
+    prompt_tokens = int(payload.get("prompt_tokens") or 0)
+    await usage_service.record(
+        scene=usage_service.SCENE_EMBEDDING,
+        provider=provider,
+        model=model,
+        tier=(
+            usage_service.TIER_LOCAL if provider == "ollama"
+            else usage_service.TIER_CLOUD
+        ),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=0,
+    )
+
+
+async def _embed_batch(texts: list) -> list:
+    """按配置的向量化后端分发（auto 已在 settings 中解析成具体后端）。"""
+    backend = settings.resolved_embedding_backend
+    logger.debug("向量化后端：%s（%d 条文本）", backend, len(texts))
+    if backend == "ollama":
+        return await _embed_batch_ollama(texts)
+    return await _embed_batch_zhipu(texts)
 
 
 async def embed_texts(texts: list) -> list:
@@ -82,8 +155,12 @@ async def embed_texts(texts: list) -> list:
     """
     if not texts:
         return []
-    if not settings.zhipuai_api_key:
-        raise RuntimeError("未配置 ZHIPUAI_API_KEY，无法进行语义向量化")
+    backend = settings.resolved_embedding_backend
+    if backend == "zhipu" and not settings.zhipuai_api_key:
+        raise RuntimeError(
+            "未配置 ZHIPUAI_API_KEY，无法使用云端向量化"
+            "（可设 EMBEDDING_BACKEND=ollama 改用本地模型）"
+        )
 
     now = time.time()
     results: list = [None] * len(texts)

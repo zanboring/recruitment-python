@@ -1,22 +1,51 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, case, delete
 from collections import Counter
-import hashlib
+from datetime import datetime, timedelta, timezone
 
 from app.models.job import Job
 from app.schemas.job import JobQueryDTO, JobCreateRequest, JobUpdateRequest, JobResponse
+from app.utils.job_key import generate_job_key
 
 HOT_CITIES = ["北京", "上海", "深圳", "杭州", "广州"]
 
+# ---- 可视化统计的岗位口径 ----
+#
+# **只统计在架岗位（ACTIVE）**，且所有统计函数必须共用这一个口径。
+#
+# 原先只有 local_model_service 的技能分析过滤了 ACTIVE，而 city / company /
+# skill / salary / education / experience 六个图表接口完全没过滤，把已下架岗位
+# 也算了进去。后果是同一个仪表盘上两个数字互相矛盾：
+#   - 「岗位城市分布」里会出现用户在工作列表里根本看不到的城市；
+#   - AI 说「技能需求 TOP：Java」，技能图表里却还有只存在于下架岗位里的技能。
+# 数字互相矛盾比数字不准更糟 —— 使用者会直接不信任整个看板。
+#
+# 唯一的例外是 stat_by_status：它的职责就是展示各状态分布，必须不带过滤。
+VISIBLE_STATUS = "ACTIVE"
+
 
 def _escape_like(s: str) -> str:
-    return s.replace("%", "\\%").replace("_", "\\_")
+    """转义 LIKE 通配符。
+
+    两个必须同时满足的前提，否则转义形同虚设：
+    1) 反斜杠自身要**最先**替换，否则后插入的转义符会被二次转义；
+    2) 调用 .like() 时必须显式传 escape="\\\\"。不指定转义字符时，
+       SQLite 把反斜杠当普通字符，"%" 仍按通配符匹配（退化成全表扫描），
+       而 MySQL 的反斜杠恰好默认就是转义符 —— 同一份代码在两个库上
+       表现不一致，是这个 bug 长期没被发现的原因。
+    """
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class JobService:
     @staticmethod
     async def create_job(db: AsyncSession, request: JobCreateRequest) -> JobResponse:
-        job_key = JobService._generate_job_key(request.source_site, request.title, request.company_name or "")
+        job_key = JobService._generate_job_key(
+            request.source_site,
+            request.title,
+            request.company_name or "",
+            request.city or "",
+        )
 
         stmt = select(Job).where(Job.job_key == job_key)
         result = await db.execute(stmt)
@@ -103,6 +132,10 @@ class JobService:
         await db.commit()
 
     @staticmethod
+    async def exists(db: AsyncSession, job_id: int) -> bool:
+        return await db.get(Job, job_id) is not None
+
+    @staticmethod
     async def get_job(db: AsyncSession, job_id: int) -> JobResponse:
         job = await db.get(Job, job_id)
         if not job:
@@ -117,16 +150,18 @@ class JobService:
             like = f"%{_escape_like(dto.keyword)}%"
             conditions.append(
                 or_(
-                    Job.title.like(like),
-                    Job.company_name.like(like),
-                    Job.skills.like(like),
-                    Job.job_desc.like(like)
+                    Job.title.like(like, escape="\\"),
+                    Job.company_name.like(like, escape="\\"),
+                    Job.skills.like(like, escape="\\"),
+                    Job.job_desc.like(like, escape="\\")
                 )
             )
         if dto.city:
             conditions.append(Job.city == dto.city)
         if dto.company_name:
-            conditions.append(Job.company_name.like(f"%{_escape_like(dto.company_name)}%"))
+            conditions.append(
+                Job.company_name.like(f"%{_escape_like(dto.company_name)}%", escape="\\")
+            )
         if dto.source_site:
             conditions.append(Job.source_site == dto.source_site)
         if dto.min_salary is not None:
@@ -169,6 +204,7 @@ class JobService:
     @staticmethod
     async def stat_by_city(db: AsyncSession) -> list[dict]:
         stmt = select(Job.city, func.count(Job.id).label("count")).where(
+            Job.job_status == VISIBLE_STATUS,
             Job.city.isnot(None)
         ).group_by(Job.city).order_by(func.count(Job.id).desc())
         result = await db.execute(stmt)
@@ -178,6 +214,7 @@ class JobService:
     @staticmethod
     async def stat_by_company(db: AsyncSession) -> list[dict]:
         stmt = select(Job.company_name, func.count(Job.id).label("count")).where(
+            Job.job_status == VISIBLE_STATUS,
             Job.company_name.isnot(None)
         ).group_by(Job.company_name).order_by(func.count(Job.id).desc()).limit(20)
         result = await db.execute(stmt)
@@ -186,7 +223,11 @@ class JobService:
 
     @staticmethod
     async def stat_by_skill(db: AsyncSession) -> list[dict]:
-        result = await db.execute(select(Job.skills).where(Job.skills.isnot(None)))
+        result = await db.execute(
+            select(Job.skills).where(
+                Job.job_status == VISIBLE_STATUS, Job.skills.isnot(None)
+            )
+        )
         rows = result.scalars().all()
 
         skill_count = Counter()
@@ -214,7 +255,7 @@ class JobService:
 
         result = await db.execute(
             select(Job.min_salary, Job.max_salary).where(
-                Job.min_salary.isnot(None)
+                Job.job_status == VISIBLE_STATUS, Job.min_salary.isnot(None)
             )
         )
         rows = result.all()
@@ -232,6 +273,7 @@ class JobService:
     @staticmethod
     async def stat_by_education(db: AsyncSession) -> list[dict]:
         stmt = select(Job.education, func.count(Job.id).label("count")).where(
+            Job.job_status == VISIBLE_STATUS,
             Job.education.isnot(None)
         ).group_by(Job.education).order_by(func.count(Job.id).desc())
         result = await db.execute(stmt)
@@ -241,6 +283,7 @@ class JobService:
     @staticmethod
     async def stat_by_experience(db: AsyncSession) -> list[dict]:
         stmt = select(Job.experience, func.count(Job.id).label("count")).where(
+            Job.job_status == VISIBLE_STATUS,
             Job.experience.isnot(None)
         ).group_by(Job.experience).order_by(func.count(Job.id).desc())
         result = await db.execute(stmt)
@@ -258,26 +301,46 @@ class JobService:
 
     @staticmethod
     async def stat_summary(db: AsyncSession) -> dict:
+        """数据概览。
+
+        三个字段的口径必须说清楚，否则「总数 / 在架数 / 平均薪资」会各自成立
+        却互相对不上：
+        - ``total``      累计采集量（含已下架，代表"爬了多少"）
+        - ``active``     当前在架量（与图表口径一致）
+        - ``avg_salary`` **只统计在架岗位**：原先不带状态过滤，把已下架岗位的
+          薪资也平均了进去，导致「在架 2 个岗位」与「平均薪资取自 3 个岗位」
+          同时出现在一个响应里。
+        """
         total = await db.execute(select(func.count(Job.id)))
-        active = await db.execute(select(func.count(Job.id)).where(Job.job_status == "ACTIVE"))
+        active = await db.execute(
+            select(func.count(Job.id)).where(Job.job_status == VISIBLE_STATUS)
+        )
         avg_sal = await db.execute(
             select(func.avg((Job.min_salary + Job.max_salary) / 2)).where(
-                Job.min_salary.isnot(None)
+                Job.job_status == VISIBLE_STATUS, Job.min_salary.isnot(None)
             )
         )
 
-        from datetime import datetime, timezone
+        # 展示用的日期按北京时间输出。
+        # 原来用 datetime.now(timezone.utc) 取日期，在东八区会导致每天 00:00–08:00
+        # 之间显示的"更新日期"是昨天 —— 存储统一用 naive UTC 没问题，但**展示**
+        # 必须换算到用户所在时区。国内不使用夏令时，固定 +8 偏移即可，无需 tzdata。
+        beijing = datetime.now(timezone(timedelta(hours=8)))
         return {
             "total": total.scalar() or 0,
             "active": active.scalar() or 0,
             "avg_salary": round(avg_sal.scalar() or 0, 2),
-            "update_time": datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            "update_time": beijing.strftime("%Y-%m-%d")
         }
 
     @staticmethod
-    def _generate_job_key(platform: str, title: str, company: str) -> str:
-        raw = f"{platform}{title}{company}"
-        return f"{platform}_{hashlib.sha256(raw.encode()).hexdigest()}"
+    def _generate_job_key(platform: str, title: str, company: str, city: str = "") -> str:
+        """生成岗位指纹。
+
+        口径与爬虫入库、Excel 导入完全一致（统一实现在 app.utils.job_key），
+        否则同一岗位经不同入口会算出不同的键而重复入库。
+        """
+        return generate_job_key(platform, title, company, city)
 
 
     @staticmethod

@@ -45,6 +45,11 @@ def get_experience_years(experience: str) -> int:
 
 
 def years_to_experience_string(years: int) -> str:
+    """把年限映射成岗位经验区间的**展示文案**。
+
+    注意：仅用于展示。计算匹配度请用 experience_match_by_years —— 因为
+    「3 年 → "3-5年" → 解析回 4 年」的往返不幂等，用它做计算会高估用户年限。
+    """
     if years >= 10:
         return "10年以上"
     elif years >= 5:
@@ -80,6 +85,27 @@ def experience_match(user_exp: str, job_exp: str) -> float:
         return user_years / job_years if job_years > 0 else 0.0
 
 
+def experience_match_by_years(user_years: int, job_exp: str) -> float:
+    """用「用户实际年限」与岗位经验要求计算匹配度。
+
+    刻意不经过 years_to_experience_string：
+    该函数把 3 年映射为区间字符串 "3-5年"，再用 get_experience_years 解析回来
+    得到 4 年，int → str → int 往返不幂等，用户年限被系统性高估
+    （3 年多算 1 年、5 年多算 2 年），经验匹配分随之虚高。
+
+    参数：
+        user_years 用户实际工作年限
+        job_exp    岗位经验要求原文，如 "3-5年"、"经验不限"
+    """
+    job_years = get_experience_years(job_exp)
+    if job_years <= 0:
+        # 岗位不限经验（含 "不限"、"应届" 与空值）
+        return 1.0
+    if user_years >= job_years:
+        return 1.0
+    return user_years / job_years
+
+
 async def recommend_jobs(
     db: AsyncSession,
     skills: str = "",
@@ -113,10 +139,8 @@ async def recommend_jobs(
     for job in jobs:
         skill_sim = skill_similarity(skills, job.skills or "")
 
-        exp_str = years_to_experience_string(experience_years)
-
         edu_match = education_match(education, job.education or "")
-        exp_match = experience_match(exp_str, job.experience or "")
+        exp_match = experience_match_by_years(experience_years, job.experience or "")
 
         score = skill_sim * 0.7 + edu_match * 0.2 + exp_match * 0.1
 

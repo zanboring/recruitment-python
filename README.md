@@ -1,5 +1,7 @@
 # AI 招聘数据可视化系统（Python 重构版）
 
+> 求职作品定位、运行约束与下一步开发请先阅读 [AI_APPLICATION_HANDOFF.md](AI_APPLICATION_HANDOFF.md)。生产部署必须设置 `APP_ENV=production` 和强随机 `JWT_SECRET`。
+
 > 毕业设计《AI 招聘数据可视化系统的开发与设计》的 Python / FastAPI 重构实现。
 > Java 原版见：`github.com/zanboring/Recruitment`
 
@@ -9,7 +11,7 @@
 
 本仓库是毕设的 **Python 重构版**：用 FastAPI + SQLAlchemy 2.0 异步 ORM 重写后端，保留全部业务能力，并强化了 AI 服务、知识库检索与推荐模块。
 
-**规模**：8 个路由模块 / 56 个 REST 接口 / 10 个业务服务 / 6 张数据表
+**规模**：9 个路由模块 / 79 个 REST 接口（含 21 个 Java 版前端兼容接口）/ 12 个业务服务 / 7 张数据表
 
 ## 二、技术栈
 
@@ -21,8 +23,8 @@
 | 认证 | JWT（python-jose）+ passlib/bcrypt |
 | 定时任务 | APScheduler 3.10 |
 | 爬虫 | httpx + BeautifulSoup4 + lxml + Playwright |
-| AI 接入 | httpx 流式调用（云端 GLM-4-Flash / 本地 Ollama） |
-| 向量化 | 智谱 embedding-3 |
+| AI 接入 | OpenAI 兼容协议：DeepSeek / 智谱可配置切换（多供应商容灾）+ 本地 Ollama 双模型分工 |
+| 向量化 | 云端 embedding-3 / 本地 Ollama 可切换（auto 自动选择） |
 
 ## 三、系统架构
 
@@ -43,8 +45,8 @@ graph LR
 
     subgraph AI 服务
         A1[对话入口] --> A2{模型可用?}
-        A2 -->|是| A3[GLM-4-Flash 云端]
-        A2 -->|否| A4[Ollama qwen2:7b 本地]
+        A2 -->|是| A3[云端模型<br/>DeepSeek 优先 / 智谱备选]
+        A2 -->|否| A4[本地模型<br/>语言类对话 / 代码类工具识别]
         A2 -->|都不可用| A5[规则引擎兜底]
         A1 --> A6[Function Calling<br/>query_jobs 工具]
         A6 --> S1
@@ -69,30 +71,39 @@ recruitment-python/
 │   ├── database.py          # 异步引擎与会话工厂
 │   ├── scheduler.py         # APScheduler 定时爬取
 │   ├── init_data.py         # 建表 + 初始化数据
-│   ├── routers/             # 8 个路由模块（56 个接口）
+│   ├── routers/             # 9 个路由模块（79 个接口，含 compat.py 兼容层）
 │   │   ├── auth.py          #   4  认证
 │   │   ├── jobs.py          #   20 岗位 / 统计 / 导出
 │   │   ├── ai.py            #   5  AI 对话
 │   │   ├── model.py         #   6  模型配置管理
-│   │   ├── knowledge.py     #   10 知识库
+│   │   ├── knowledge.py     #   12 知识库
 │   │   ├── crawler.py       #   3  爬取任务
 │   │   ├── user.py          #   5  用户管理
-│   │   └── log.py           #   3  系统日志
-│   ├── services/            # 10 个业务服务
+│   │   ├── log.py           #   3  系统日志
+│   │   └── compat.py        #   21 Java 版前端兼容层（别名路由）
+│   ├── services/            # 12 个业务服务
 │   │   ├── ai_service.py           # 三级降级 + SSE + 工具调用调度
+│   │   ├── llm_client.py           # 云端统一调用层（OpenAI 兼容 + 多供应商容灾）
+│   │   ├── ollama_client.py        # 本地统一调用层（按角色路由两个本地模型）
 │   │   ├── tool_service.py         # Function Calling 工具定义与执行
 │   │   ├── embedding_service.py    # 向量化与余弦相似度
 │   │   ├── knowledge_service.py    # 语义检索 + 关键词降级
 │   │   ├── local_model_service.py  # 规则引擎兜底
+│   │   ├── usage_service.py        # Token 用量与成本统计
 │   │   └── ...                     # auth / crawler / export / job / model
-│   ├── models/              # 6 个 SQLAlchemy 模型
+│   ├── models/              # 7 个 SQLAlchemy 模型（含 ai_usage 用量表）
 │   ├── schemas/             # 6 组 Pydantic Schema
 │   ├── crawlers/            # BaseCrawler 抽象类 + BossCrawler + 清洗器
 │   ├── recommender/         # Jaccard 相似度 + 薪资预测 + 多因子分析
-│   └── utils/               # 日志装饰器、安全工具
+│   ├── evaluation/          # RAG 检索效果评估（黄金集 + 指标 + 多策略对比）
+│   ├── middleware/          # 滑动窗口限流、请求上下文、camelCase 字段兼容
+│   └── utils/               # 日志装饰器、job_key 指纹、安全与时间工具
 ├── scripts/
-│   └── init_db.py           # 建表 + 初始化管理员
-├── tests/                   # 33 个单元测试（49 条断言）
+│   ├── init_db.py           # 建表 + 初始化管理员
+│   ├── eval_rag.py          # RAG 检索效果评估入口
+│   └── bench_local_models.py# 本地模型能力对比基准（决定模型分工）
+├── reports/                 # 评估报告输出（rag_evaluation.md、local_model_benchmark.md）
+├── tests/                   # 355 个单元测试
 ├── _archive/                # 开发过程文档（审计报告 / 提示词，不进仓库逻辑）
 └── requirements.txt
 ```
@@ -101,7 +112,62 @@ recruitment-python/
 
 ### 1. AI 服务（ai.py 5 个 + model.py 6 个接口）
 
-- **三级降级链**：云端 GLM-4-Flash → 本地 Ollama（qwen2:7b）→ 规则引擎兜底，任一后端不可用时自动降级，保证服务不中断
+- **三级降级链**：云端模型（DeepSeek 优先 → 智谱备选）→ 本地模型（按角色分工，见下）→ 规则引擎兜底，
+  任一后端不可用时自动降级，保证服务不中断
+- **多供应商容灾**：云端候选是一个**有序列表**（由 `AI_PROVIDER` 决定优先级），
+  任一服务商密钥过期或额度用尽都会自动尝试下一个；接入任意 OpenAI 兼容厂商
+  （Moonshot、通义、SiliconFlow…）只需加一行配置，调用方代码零改动
+  （统一实现在 `app/services/llm_client.py`）
+- **本地模型按角色分工**（`app/services/ollama_client.py`）：本地不是「一个备胎」，
+  而是把两个能力互补的模型各放到它更擅长的那一环 ——
+
+  | 角色 | 模型 | 配置项 | 实测依据 |
+  |---|---|---|---|
+  | 对话生成 | `qwen2.5:14b`（语言类 14.8B） | `OLLAMA_MODEL` | 知识问答 3/3 通过 |
+  | 工具识别 / JSON 抽取 | `qwen2.5-coder:7b`（代码类 7.6B） | `OLLAMA_CODE_MODEL` | 准确率同为 100%，耗时更低（5.4s vs 7.4s）|
+
+  分工结论不是靠感觉，而是用 `scripts/bench_local_models.py` 实测得出（报告见
+  `reports/local_model_benchmark.md`）：两个模型做**工具识别**准确率完全相同（6/6），
+  但小的那个明显更快；做**知识问答**时大的那个更可靠。因此机械的抽取环节交给小模型、
+  需要表达与事实准确性的环交给大模型。本地链路耗时拆解：工具识别 6.1s + 查库 0.01s +
+  生成 22.2s ≈ 28.4s，瓶颈在生成而非路由。
+- **本地 Function Calling**：降级到本地后「查库」能力不失效 —— 本地路径同样执行
+  「工具识别 → 查库 → 结果回填」，与云端共用同一套提示词与解析器
+  （`ollama_client.detect_tool_call` 复用 `tool_service`），区别只在由哪个模型来读。
+- **不盲信配置**：健康探测除了查服务可达，还会核对配置的模型是否真的 `pull` 过。
+  这是本项目真实踩过的坑 —— 配置写 `qwen2:7b` 而本机装的是 `qwen2.5:14b`，
+  旧逻辑只要 `/api/tags` 返回 200 就报「已就绪」，直到调用时 404 并被静默降级。
+  现在会在状态页如实标注缺失的模型并给出 `ollama pull` 提示。
+- **可切换为选项**：`POST /api/model/switch` 支持 `auto` / `primary` / `local` /
+  `local_code`，也可直接指定任意**已安装**的模型名（未安装会被拒绝并提示现有清单）。
+  偏好是全局的，`/api/ai/chat-stream` 与 `/api/model/chat` 两条入口都生效。
+- **工具识别有廉价前置过滤**：朴素实现对**每条**消息都发起一次「是否需要查库」的
+  LLM 调用（实测本机约 2.9s，云端则多一批 token），而大量消息本就不涉及数据库。
+  过滤规则刻意保守 —— **只在「消息很短且不含任何领域信号」时跳过**，因为漏判的
+  代价是「模型凭空编数字」（硬伤），多判的代价只是白花一次调用。可用
+  `AI_TOOL_PREFILTER_ENABLED=false` 一键回退。
+- **Token 用量与成本可观测**（`app/services/usage_service.py` + `GET /api/model/usage`）：
+  每次 LLM / 向量化调用都记录 token、耗时、降级层级与失败原因，落 `ai_usage` 表，
+  按场景 / 模型 / 服务商 / 降级层级 / 日期聚合，并按单价折算费用。这回答了三个问题：
+
+  | 问题 | 看哪个字段 |
+  |---|---|
+  | 花了多少 | `totals.cost` / `totals.total_tokens` |
+  | 贵在哪 | `by_scene`（对话 / 工具识别 / 分析报告 / 向量化）与 `by_model` |
+  | 降级生效了吗 | `by_tier` 里 local / fallback 的占比；失败调用也留痕 |
+
+  两条设计取舍：**写入失败绝不影响业务**（异常一律吞掉只记日志）；**费用在写入时
+  算好并落库**（单价会变，历史记录应按当时价计价）。本地模型计 0 元，同时折算
+  出「省下多少云端调用」（`totals.saved_cost_estimate`）。
+- **知识库自动入库是可关的**：每次问答都会把回答沉淀进知识库，形成
+  「AI 生成内容 → 被当作知识召回 → 再次喂给 AI」的闭环，答错时错误会被固化并
+  反复出现。因此自动入库条目记录**真实来源**（模型名，便于与人工内容区分），
+  并提供 `AI_AUTO_LEARN_ENABLED=false` 总开关。
+- **输出长度有硬上限**：原实现不给云端请求传 `max_tokens`，本地对话也不传
+  `num_predict`（Ollama 默认 `-1` = 不限），单次回答长度没有任何上界 ——
+  按 token 计费的云端成本不可控，本地模型（实测 12 tok/s）一次回答足以让用户等上
+  几分钟。现在按场景分级设限：工具识别 128（只需一行 JSON）/ 对话 1024 /
+  分析报告 2048，配置见 `AI_MAX_OUTPUT_TOKENS` 等三项。
 - **SSE 流式输出**：httpx 流式响应 + `EventSourceResponse`，前端打字机效果
 - **Function Calling（工具调用）**：用户问「长沙有多少 Java 岗位」时，模型判断需要查库并输出结构化工具调用，代码执行 `query_jobs` 查询真实岗位数据，再把结果回填给模型组织自然语言回答。采用「prompt 引导 + JSON 解析」实现，不依赖具体模型的 native tool calling（见 `app/services/tool_service.py`）
 - **会话管理**：支持会话取消、最大会话数 1000、单会话保留最近 20 条历史
@@ -109,7 +175,7 @@ recruitment-python/
 
 ### 2. 知识库（knowledge.py 10 个接口）
 
-- **语义向量检索（RAG）**：用智谱 `embedding-3` 把查询与知识条目向量化，按余弦相似度取 Top-5 注入 AI 上下文，能把「工资多少」和「薪资水平」这类语义相近但字面不同的问题关联起来（见 `app/services/embedding_service.py`）
+- **语义向量检索（RAG）**：用云端 `embedding-3`（或本地 Ollama 向量模型）把查询与知识条目向量化，按余弦相似度取 Top-5 注入 AI 上下文，能把「工资多少」和「薪资水平」这类语义相近但字面不同的问题关联起来（见 `app/services/embedding_service.py`）
 - **关键词降级**：向量化不可用（无 API Key / 网络失败 / 接口报错）时自动回退到关键词检索（43 个关键词打标签 + 精确匹配 Top-3 / 模糊匹配 Top-5），保证服务不中断
 - **缓存**：检索结果缓存 600 秒、单条文本向量缓存 1 小时，降低重复调用成本
 - **质量门槛**：`learn_from_response` 对回答做质量校验，长度 < 20 字不入库，避免脏数据回流
@@ -120,22 +186,139 @@ recruitment-python/
 - **反爬策略**：10 个 User-Agent 轮换、请求间隔 12–18 秒随机延时、失败后 4 次指数退避重试
 - **清洗规则**：9 个高级词 / 10 个无效词过滤规则，68 项技能词典抽取
 - **去重**：SHA-256 对岗位指纹去重，避免重复入库
+- **前置校验（宁可明确失败，不给错数据）**：爬取前先校验平台与城市，把两类
+  「必然失败」的请求拦在网络请求之前 ——
+  - **未收录城市**：曾对未收录城市回退到北京的城市编码，于是搜「南昌」实际爬的是
+    北京岗位，数据看着正常但城市是错的，且不报错不留痕。现在直接失败并列出已收录城市；
+  - **未实现平台**：前端可选 4 个平台而当前只实现 `boss`，原先会静默跳过并把任务标成
+    「已完成 / 0 条」。现在全部未实现则任务 FAILED 并写明原因，部分未实现则在
+    `message` 中列出被跳过的平台。
+
+  实际支持范围通过 `GET /api/crawler/options` 暴露，前端可据此渲染可选项或给出提示。
+- **后台任务持有强引用**：`asyncio.create_task` 的返回值若不保存，事件循环只持弱引用，
+  任务可能在执行途中被 GC 回收且不留任何日志。统一经 `_spawn_background` 启动并持有引用。
 
 ### 4. 智能推荐
 
 - **Jaccard 相似度**：岗位技能集合与候选人技能集合求交并比；**技能归一化**：把「Java开发」「Spring Boot」「Vue.js」等变体统一为规范名，提升字面不同但语义相同的技能匹配率（见 `app/recommender/jaccard.py`）
-- **规则薪资预测**：9 档城市 × 6 档经验 × 4 档学历 交叉系数 + 技能溢价（≤15%），独立于推荐打分
+- **规则薪资预测**：三因子加权（城市系数 0.4 + 经验系数 0.35 + 学历系数 0.25）+ 技能溢价（≤15%），9 档城市 / 6 档经验 / 4 档学历独立系数，独立于推荐打分
 - **多因子加权**：技能相似度 0.7 + 学历匹配 0.2 + 经验匹配 0.1，候选池上限 500
 
 ### 5. 认证与权限
 
 - JWT Token，有效期 24 小时
-- 角色区分 ADMIN / USER，登录失败次数锁定
+- 角色区分 ADMIN / USER，登录失败 5 次锁定 30 分钟
+  （**锁定期结束后重置失败计数**：原先计数只在登录成功时清零，导致过锁后
+  再输错一次就立刻又被锁 30 分钟，实测等价于「每 30 分钟只能试一次」，
+  正常用户打错一个字母就会被反复锁死）
+- 未登录 / Token 非法 / Token 过期统一返回 **401**（不是 FastAPI 默认的 403）
+- 滑动窗口限流：登录 10 次/分、注册 5 次/分、AI 对话 20 次/分，优先按用户 ID 计数，未登录按来源 IP
 
-### 6. 数据可视化
+### 6. AI 会话隔离
 
+- 会话历史键为 `u{user_id}:{session_id}`，不同用户即使传入相同 session_id 也互不可见
+- 单会话保留最近 20 条，会话空闲 1 小时自动淘汰，容量上限 1000（LRU）
+- 取消请求同样按用户隔离，A 用户取消不了 B 用户的流式输出
+
+### 7. 数据可视化
+
+- **统计口径统一（只算在架岗位）**：6 个图表接口原先都不带状态过滤，把已下架岗位
+  也算了进去，而 AI 技能分析只算在架岗位 —— 于是同一个仪表盘上「岗位城市分布」里
+  会出现用户在工作列表里根本看不到的城市，AI 说「Java 需求 2 个」而技能图表里
+  还多一个只存在于下架岗位的技能。数字互相矛盾比数字不准更糟，现在统一到
+  `VISIBLE_STATUS` 口径；唯一例外是「岗位状态分布」图表，它的职责就是展示各状态。
 - 后端提供 7 个维度的统计聚合接口
 - 前端（Vue3 + ECharts，在 Java 版仓库）：饼图 3 个 / 柱状图 10+ 个 / 折线图 1 个 / 雷达图 1 个
+
+### 8. 操作日志与审计
+
+- **装饰器埋点**：`@log_action("动作名")` 挂在 19 个写操作上，统一记录「谁、做了什么、成不成功」
+- **请求来源采集**：各 endpoint 普遍把请求体参数命名为 `request`，装饰器因此拿不到 Starlette Request，
+  故新增 `RequestContextMiddleware`，用 **contextvars** 把 method / path / client_ip 注入上下文，
+  业务代码零改动即可取到真实来源（`app/middleware/request_context.py`）
+- **安全处理**：参数白名单序列化（`AsyncSession`、`Request`、Pydantic 模型只留类型名）；
+  password / token 等字段一律脱敏为 `***`；日志写入失败只记 warning，绝不影响业务主流程
+- **查询与清理**：`GET /api/logs/list` 分页查询；`DELETE /api/logs/clean?days=N` 保留最近 N 天，
+  `days < 1` 直接拒绝，避免 `days=0` 误清空全表
+
+### 9. Java 版前端兼容层（app/routers/compat.py）
+
+配套前端 `recruitment-system-frontend` 是按 **Java 版后端** 写的，Python 重构后
+路径前缀与字段命名都变了 —— 直接对接会有 **30 处调用失败**，其中爬取管理、
+数据管理、用户管理三个模块整体不可用。兼容层解决这个问题，**前端零改动即可跑通**。
+
+| 前端调用（Java 契约） | 映射实现 |
+|---|---|
+| `POST/GET/DELETE /api/crawl/task*` | `crawler_service`，状态 `COMPLETED` → `FINISHED` |
+| `GET/PUT/PATCH/DELETE /api/users*` | 用户 CRUD + 启用/禁用（分页结构 `{list,total,pageNum,pageSize}`） |
+| `POST /api/data/import`／`GET /api/data/export`／`POST /api/data/cleanup` | `export_service` |
+| `GET /api/jobs/analysis/top-titles`、`POST /api/jobs/ai-analysis`、`GET /api/jobs/{id}/detail-html` | `JobService` 统计聚合 |
+| `GET /api/logs/export` | `sys_log` 导出 xlsx |
+| `GET /api/knowledge/preview`、`PUT /api/knowledge/{id}/status`／`score` | `knowledge_service` |
+| `POST /api/auth/auto-login`、`GET /api/auth/default-username` | 仅非生产环境可用 |
+
+配套的 **`CamelCaseCompatMiddleware`**（`app/middleware/camel_case.py`）解决字段命名：
+前端按 `companyName` / `qualityScore` / `pageNum` 消费，本服务按 PEP8 返回 snake_case，
+中间件为 JSON 响应**追加** camelCase 别名（保留原字段不动），
+使前端列表页不会大面积显示 `undefined`；SSE 与 xlsx 等非 JSON 响应自动跳过。
+
+请求侧的 camelCase（`pageNum`、`companyName`、`modelName`）由 DTO 的 before-validator
+与 Query 别名兼容，两套命名都能用。
+
+**三条设计约束**：
+1. **注册顺序**：兼容层必须在原生路由之前 include —— 否则 `/api/knowledge/preview`
+   会被原生 `/{knowledge_id}` 抢先匹配，`"preview"` 当 int 解析直接 422。
+2. **爬取必须异步**：真实爬取要翻多页、每页间隔 12~18 秒，同步执行远超前端 30 秒超时。
+   创建任务后交由 `asyncio` 后台执行，前端轮询 `/api/crawl/tasks` 看状态。
+3. **安全边界**：`/api/auth/auto-login` 在 `APP_ENV=production` 时直接 403，
+   不会留下「无需凭证即得管理员 Token」的后门。
+
+### 10. RAG 检索效果评估（app/evaluation/）
+
+**为什么需要它**：检索"能跑通"不等于"有效果"。没有量化，就无法回答
+「语义检索相比关键词匹配到底提升了多少」，也无从判断一次改动是优化还是退化。
+
+| 组件 | 作用 |
+|---|---|
+| `golden_set.py` | 黄金测试集：20 条仿真知识条目 + 28 条人工标注查询（标注标准答案） |
+| `metrics.py` | Hit@K / MRR / Precision@K / Recall@K 纯函数实现（零依赖、可逐行解释） |
+| `runner.py` | 在隔离的内存库中对多种检索策略执行对比评估 |
+
+**查询分两类（关键设计）**：
+- **字面型**：与知识条目用词重合，关键词子串匹配即可命中；
+- **语义型**：口语化改写，字面几乎不重合（如用户问「工资」而条目写的是「薪资」）。
+
+分类统计的意义在于：只看总分会掩盖「语义检索在改写查询上的提升」这一核心结论。
+
+**实测结果（关键词基线，离线可复现）**：
+
+| 检索策略 | 字面型 Hit@5 | 语义型 Hit@5 |
+|---|---|---|
+| 关键词检索 | 75.0% | **0.0%** |
+
+关键词检索在语义型查询上完全失效，而这恰恰是真实用户的提问方式 ——
+这就是引入向量检索的**量化依据**，而不是"感觉向量检索更先进"。
+
+**四种可选检索策略**（`RAG_RETRIEVAL_STRATEGY`）：
+`auto`（语义优先、失败降级关键词，默认）／`semantic`／`keyword`／`hybrid`（RRF 融合）。
+
+混合检索采用 **RRF（Reciprocal Rank Fusion）**：余弦相似度与关键词匹配的分数量纲
+不可比，直接加权需要人工调参且不稳定；RRF 只按各自排名融合
+（`score = Σ 1/(60 + rank)`），彻底消除尺度差异且无需调参。
+
+**向量化后端可切换**（`EMBEDDING_BACKEND`）：`zhipu` 云端 embedding-3，
+或 `ollama` 本地模型 —— 后者完全离线、零成本、数据不出内网。
+
+```bash
+# 离线跑关键词基线（无需任何密钥）
+python scripts/eval_rag.py --strategies keyword
+
+# 完整三策略对比并输出 Markdown 报告
+python scripts/eval_rag.py --output reports/rag_evaluation.md
+```
+
+> 评估全程在内存库中进行，不触碰项目数据；缺少向量化后端时**跳过并说明原因**，
+> 而不是把环境问题呈现为"语义检索命中率 0%"。
 
 ## 六、快速开始
 
@@ -158,17 +341,99 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 #    http://localhost:8000/docs
 ```
 
+## 快速演示启动（5 步走）
+
+```bash
+# 1. 安装依赖
+pip install -r requirements.txt
+playwright install chromium   # 爬虫功能需要，不装也能启动服务
+
+# 2. 配置环境变量（已预置 SQLite 开发配置，开箱即用）
+#    .env 默认 DB_URL=sqlite+aiosqlite:///./recruitment.db，无需 MySQL
+#    JWT_SECRET 有开发默认值，生产部署必须覆盖
+#    ZHIPUAI_API_KEY 留空时自动降级到 Ollama 或规则引擎
+
+# 3. 初始化数据库（建表 + 播种 admin/admin123）
+python scripts/init_db.py
+
+# 4. 启动服务
+python -m app.main
+# 访问 http://localhost:8080
+
+# 5. 跑测试（可选，克隆即全绿）
+pip install aiosqlite pytest-asyncio
+python -m pytest tests/ -q
+```
+
 ## 七、测试
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ -v        # 全量 355 项
+python -m pytest tests/test_auth_api.py -v   # 单个模块
 ```
+
+测试跑在 **SQLite 内存库**上（`tests/conftest.py` 里替换了 `get_db` 依赖），
+不依赖本地 MySQL，也不需要 `ZHIPUAI_API_KEY`，克隆下来即可全绿。
 
 | 文件 | 用例数 | 覆盖内容 |
 |---|---|---|
-| `test_embedding_service.py` | 10 | 余弦计算、结果排序、向量缓存、分块批量、无 Key 降级 |
+| `test_auth_api.py` | 18 | 注册 / 登录 / 非法与过期 Token / 改密 / 连错 5 次锁定 / 401 统一语义 |
+| `test_jobs_api.py` | 30 | 岗位 CRUD 与权限、分页、关键词与城市过滤、LIKE 转义、7 类统计、推荐打分、薪资预测 |
+| `test_rate_limit.py` | 26 | 滑动窗口算法、窗口滑过期恢复、规则表、身份识别（JWT/代理头/IP）、429 中间件集成 |
+| `test_crawler.py` | 13 | 指数退避重试、重试次数受控、任务状态流转、去重、下架宽限期不误伤、异常薪资过滤 |
+| `test_ai_session.py` | 15 | 会话按用户隔离、20 条截断、TTL 淘汰、容量淘汰、取消标记隔离 |
+| `test_ai_router.py` | 9 | AI 接口鉴权、SSE 输出、超长消息校验、多用户同 session_id 不串历史 |
+| `test_model_service.py` | 17 | 三级降级链、偏好切换、超时与异常回退规则引擎 |
+| `test_model_router.py` | 13 | `/api/model/*` 鉴权、状态与清单、偏好切换校验、Ollama 失败降级 |
 | `test_jaccard.py` | 12 | 技能归一化、别名映射、Jaccard 计算、边界情况 |
 | `test_tool_service.py` | 11 | 工具调用 JSON 提取、嵌套括号、参数解析、未知工具处理 |
+| `test_embedding_service.py` | 10 | 余弦计算、结果排序、向量缓存、分块批量、无 Key 降级 |
+| `test_route_order.py` | 4 | 静态路由不被动态路径参数吞掉（batch / all / stats 回归） |
+| `test_log_action.py` | 7 | 操作日志落库、失败留痕、uri/ip 采集、密码脱敏 |
+| `test_compat_api.py` | 20 | Java 版前端兼容层：爬取 / 用户 / 数据 / 字段命名 / 生产环境禁 auto-login |
+| `test_rag_evaluation.py` | 15 | 评估指标边界、黄金集自洽性、数据集区分度、混合检索降级 |
+| `test_llm_client.py` | 13 | OpenAI 兼容请求构造、流式解析、思考内容过滤、多供应商优先级 |
+| `test_ollama_router.py` | 21 | 本地模型角色路由、安装校验、流式 NDJSON 解析、偏好切换 |
+| `test_tool_prefilter.py` | 19 | 工具识别前置过滤：数据类问题不漏判、短消息跳过、开关可回退 |
+| `test_usage.py` | 18 | 费用折算、失败留痕、聚合维度、降级事件、两条入口口径一致、异常不抛出 |
+| `test_knowledge_learn.py` | 8 | 自动入库质量门槛、真实来源标注、自学习回路开关 |
+| `test_crawler_validation.py` | 14 | 未收录城市/未实现平台的前置拦截、后台任务强引用 |
+| `test_password_hashing.py` | 12 | 长密码不截断、历史哈希兼容、异常输入不抛异常 |
+| `test_stat_consistency.py` | 10 | 六个图表与 AI 分析共用同一岗位口径（只算在架） |
+| `test_output_limits.py` | 7 | 云端 max_tokens / 本地 num_predict 上限、配置接线 |
+| `test_login_lockout.py` | 6 | 锁定期结束后恢复完整重试次数、剩余分钟数向上取整 |
+| **合计** | **355** | |
+
+### 稳定性与安全加固（P1 修复记录）
+
+| 问题 | 修复 |
+|---|---|
+| AI 会话历史是进程内全局 dict，**不同用户用同一 session_id 会串历史** | 会话键改为 `u{user_id}:{session_id}`，取消标记同步隔离；新增 `DELETE /api/ai/session` |
+| AI / 登录 / 注册接口**无限流**，可被刷 Token 或暴力破解 | 新增滑动窗口限流中间件（`app/middleware/rate_limit.py`），登录 10 次/分、注册 5 次/分、AI 20 次/分、其余 120 次/分，可配置 |
+| `BaseCrawler.crawl_with_retry` 写好了但**从未被调用**，单次抖动就整个任务失败 | `start_crawl` 改为调用 retry 包装，退避 2^(n+1) 秒 + 0~1s 抖动抗重试风暴 |
+| 关键路径（认证 / 岗位 / 推荐）**零测试** | 新增 111 项用例，覆盖 DAO 之外的完整 HTTP 链路 |
+| 账号登录锁定链路 naive/aware 时间混用，用户被锁后再登录直接 500（新增 `app/utils/timeutil.py` 统一 UTC 语义） | 全局收敛为 naive UTC |
+| 换关键词爬取会把同平台其它岗位的 `job_status` 误改为 `OFFLINE` | 下架判定加 6 小时宽限期，只处理确实长期未再出现的岗位 |
+| 分析报告与 `/api/model/chat` 会话污染用户上下文 | 一次性任务使用临时会话键，任务结束即释放 |
+
+### 第二轮加固（P0 / P1 / P2 修复记录）
+
+| 问题 | 修复 |
+|---|---|
+| **【P0】路由注册顺序错误**：`DELETE /api/jobs/batch`、`GET /api/knowledge/all`、`GET /api/knowledge/stats` 排在动态路径 `/{job_id}`、`/{knowledge_id}` 之后，"batch"/"all"/"stats" 被当作 int 解析 → **422，三个接口完全不可用** | 静态路径路由一律先于动态路径注册；新增 `test_route_order.py` 用真实 HTTP 请求冻结行为 |
+| **日志模块形同虚设**：`@log_action` 只有定义、**全项目零调用**，`sys_log` 表没有任何写入点，"系统管理 / 操作日志"只能查空表 | 重写装饰器（参数白名单化、敏感字段脱敏、写入失败不影响业务），并接到登录/注册/改密、岗位增删改导、爬虫、知识库、用户、模型共 19 处写操作 |
+| **定时爬取与服务层两套实现**：scheduler 那套缺清洗过滤、缺下架判定、不刷新 `last_seen_at`、不走重试包装 | 统一收敛到 `crawler_service.start_crawl`，scheduler 只负责按计划调用 |
+| **`/api/jobs/analysis/report` 匿名即可调用 LLM**：路径不匹配 `/api/ai/` 前缀，落在 120 次/分的宽松限流上，可被刷爆 Token | 改为要求登录；爬虫任务查询、知识库管理/检索、模型状态探测一并补鉴权（共 10 个接口） |
+| **限流可被伪造头绕过**：`_client_identity` 无条件信任 `X-Forwarded-For`，伪造该头即可让登录防爆破失效 | 默认不采信代理头，新增 `RATE_LIMIT_TRUST_FORWARDED_FOR` 开关（仅可信代理后开启） |
+| **job_key 两套口径**：管理端 `sha256(标题+公司)`、爬虫 `sha256(jobId)`，同一岗位会重复入库 | 统一到 `app/utils/job_key.py`（平台+标题+公司+城市），爬虫 / 管理端 / Excel 导入共用 |
+| **LIKE 转义形同虚设**：转义了 `%` 却没传 `escape="\\"`，SQLite 下反斜杠只是普通字符 → 关键词含 `%` 时退化（MySQL 恰好默认转义，所以一直没暴露） | 补上 `escape="\\"` 与反斜杠自身转义，两个库行为一致 |
+| **经验匹配虚高**：`3年 → "3-5年" → 解析回 4年`，int→str→int 往返不幂等，用户年限被系统性高估 | 新增 `experience_match_by_years` 直接按 int 比较，推荐打分不再经过字符串 |
+| **知识库变更不失效向量缓存**：`invalidate_embedding_cache` 定义了但从未被调用，改完知识最长 1 小时内检索不到 | 所有写操作统一调用（收敛为 `_invalidate_caches()`） |
+| **日志清理时区与危险参数**：用 aware 时间比较库内 naive 时间（MySQL 东八区下有 8 小时偏移）；`days=0` 等价于清空全表 | 统一用 `utc_now()`；`days < 1` 直接拒绝 |
+| **Excel 二次导入整体失败**：job_key 含行号与整行内容，重复导入撞唯一约束 → 整个事务回滚，一条都进不去 | 改用统一指纹 + 「已存在则跳过」，返回 `{success, skip, fail}`；导出改用 `model_copy` 不再污染入参，并加体量上限 |
+| **11 项测试失败被文档掩盖** | 模型路由补鉴权后测试未同步带 token，已修复；另为上述修复新增 11 项回归用例 |
+
+**已知取舍（P2）**：限流是单进程内存实现，多副本部署需换成 Redis 分布式计数器。
 
 ## 八、与 Java 版的对比
 
@@ -189,5 +454,77 @@ python -m pytest tests/ -v
 ## 九、说明
 
 - 数据库建表与初始化数据见 `app/init_data.py`
-- 前端代码在 Java 版仓库 `Recruitment/recruitment-system-frontend`，本仓库只提供后端接口
+- 前端代码在 Java 版仓库 `Recruitment/recruitment-system-frontend`，本仓库只提供后端接口；
+  该前端按 Java 版契约编写，由 `app/routers/compat.py` 兼容层承接（见第 5 节第 9 小节）
 - `_archive/` 目录下是开发过程文档（代码审计报告、提示词记录），不参与项目运行
+
+### 表结构变更（升级须知）
+
+`user` 表新增 `enabled` 字段（账号启用/禁用，前端用户管理页依赖它）。
+全新部署执行 `python scripts/init_db.py` 会自动带上；**已有旧库**需手动补列：
+
+```sql
+-- MySQL
+ALTER TABLE `user` ADD COLUMN `enabled` TINYINT(1) NOT NULL DEFAULT 1;
+
+-- SQLite
+ALTER TABLE user ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT 1;
+```
+
+未补列时用户相关接口会因缺列报错。
+
+**密码哈希方案已升级**（`sha256$` 前缀的「SHA-256 预哈希 + bcrypt」）：
+原实现直接 `pwd.encode()[:72]` 截断，而 schema 允许 128 字符，导致「100 个 A」
+与「72 个 A」的密码完全等价 —— 用户以为设了长密码，实际后半段从未参与校验。
+**老哈希无需迁移**：校验时会识别前缀，无前缀的按原路径校验，因此老账号仍可登录；
+用户下次改密时会自动写入新格式。
+
+新增 `ai_usage` 表（AI 用量与成本统计）。全新部署执行 `python scripts/init_db.py`
+会自动建表；**已有旧库**需手动建表：
+
+```sql
+-- MySQL
+CREATE TABLE `ai_usage` (
+  `id`                INT AUTO_INCREMENT PRIMARY KEY,
+  `user_id`           INT NULL,
+  `scene`             VARCHAR(32)  NOT NULL DEFAULT 'chat',
+  `provider`          VARCHAR(32)  NULL,
+  `model`             VARCHAR(64)  NULL,
+  `tier`              VARCHAR(16)  NULL,
+  `prompt_tokens`     INT DEFAULT 0,
+  `completion_tokens` INT DEFAULT 0,
+  `total_tokens`      INT DEFAULT 0,
+  `latency_ms`        INT DEFAULT 0,
+  `success`           INT DEFAULT 1,
+  `error_msg`         VARCHAR(255) NULL,
+  `cost`              DOUBLE DEFAULT 0,
+  `created_at`        DATETIME DEFAULT CURRENT_TIMESTAMP,
+  INDEX `ix_ai_usage_created_at` (`created_at`),
+  INDEX `ix_ai_usage_scene_created` (`scene`, `created_at`),
+  INDEX `ix_ai_usage_provider_model` (`provider`, `model`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+未建表时**不影响业务** —— 用量记录写入失败只记日志（见 `usage_service.record`），
+`GET /api/model/usage` 会返回空汇总。
+
+另外为三张高频查询表补了索引（`sys_log` / `knowledge_base` 此前完全没有索引，
+实测日志分页与**每一次 AI 对话的知识库检索**都是全表扫描）。旧库需手动补：
+
+```sql
+-- MySQL
+ALTER TABLE `sys_log`         ADD INDEX `ix_sys_log_created_at` (`created_at`);
+ALTER TABLE `sys_log`         ADD INDEX `ix_sys_log_username_created` (`username`, `created_at`);
+ALTER TABLE `knowledge_base`  ADD INDEX `ix_knowledge_status` (`status`);
+ALTER TABLE `knowledge_base`  ADD INDEX `ix_knowledge_source` (`source`);
+ALTER TABLE `crawl_task`      ADD INDEX `ix_crawl_task_created_at` (`created_at`);
+ALTER TABLE `crawl_task`      ADD INDEX `ix_crawl_task_status` (`status`);
+
+-- SQLite（语法相同，去掉反引号）
+CREATE INDEX ix_sys_log_created_at ON sys_log(created_at);
+CREATE INDEX ix_sys_log_username_created ON sys_log(username, created_at);
+CREATE INDEX ix_knowledge_status ON knowledge_base(status);
+CREATE INDEX ix_knowledge_source ON knowledge_base(source);
+CREATE INDEX ix_crawl_task_created_at ON crawl_task(created_at);
+CREATE INDEX ix_crawl_task_status ON crawl_task(status);
+```

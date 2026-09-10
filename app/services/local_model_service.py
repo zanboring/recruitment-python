@@ -1,3 +1,5 @@
+from collections import Counter
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
@@ -7,7 +9,7 @@ FAQ = {
     "项目介绍": "这是一个智能招聘数据分析平台，包含数据爬取、存储、分析、AI问答全流程。后端基于FastAPI + SQLAlchemy，前端使用Vue3 + Tailwind CSS，AI模块对接智谱GLM-4和Ollama本地模型。",
     "技术选型": "后端：FastAPI + SQLAlchemy + MySQL；前端：Vue3 + Tailwind CSS；AI：GLM-4-Flash + Ollama；爬虫：Playwright；部署：Docker + Uvicorn。",
     "核心功能": "岗位管理（CRUD）、数据可视化分析、AI智能问答、岗位推荐（Jaccard相似度）、薪资预测、BOSS直聘爬虫采集。",
-    "架构设计": "前后端分离，RESTful API，JWT认证，三级AI降级（Ollama→GLM-4→规则引擎），异步数据库操作，定时任务调度。",
+    "架构设计": "前后端分离，RESTful API，JWT认证，三级AI降级（GLM-4→Ollama→规则引擎），异步数据库操作，定时任务调度。",
     "推荐算法": "基于Jaccard相似度的多因子加权推荐，技能匹配权重70%，教育匹配20%，经验匹配10%，最大候选集500条。",
     "爬虫模块": "基于Playwright爬取BOSS直聘，支持反爬策略、数据清洗、技能提取、高级岗位过滤、无效岗位过滤、岗位下架自动标记。",
     "AI模块": "对接智谱GLM-4 API，支持SSE流式输出，Ollama本地模型备选，规则引擎兜底；知识库语义检索（embedding-3 向量化 + 余弦相似度，失败降级关键词）。",
@@ -17,12 +19,10 @@ FAQ = {
 
 class LocalModelService:
     @staticmethod
-    async def chat(message: str, db: AsyncSession = None) -> str:
-        message_lower = message.lower()
-
+    async def chat(message: str, db: AsyncSession = None, context: str = "") -> str:
         for key, answer in FAQ.items():
             if key in message:
-                return answer
+                return (context + "\r\n" + answer) if context else answer
 
         if "薪资" in message and ("分析" in message or "统计" in message):
             return await LocalModelService._salary_analysis(db)
@@ -74,17 +74,33 @@ class LocalModelService:
 
     @staticmethod
     async def _skill_analysis(db: AsyncSession) -> str:
+        """技能需求 TOP10。
+
+        统计口径与 /api/jobs/stat/skill 保持一致：把 skills 字段按逗号拆成
+        单个技能后再计数。原先直接 `group_by(Job.skills)` 统计的是「技能组合串」，
+        于是 "Java,MySQL" 与 "Java" 被当成两个不同的类目，
+        导致 AI 回答的技能排行与可视化图表的技能排行对不上。
+        """
         if not db:
             return "暂无数据，请连接数据库后重试。"
         result = await db.execute(
-            select(Job.skills, func.count()).where(Job.job_status == "ACTIVE", Job.skills.isnot(None), Job.skills != "")
-            .group_by(Job.skills).order_by(func.count().desc()).limit(10)
+            select(Job.skills).where(
+                Job.job_status == "ACTIVE",
+                Job.skills.isnot(None),
+                Job.skills != "",
+            )
         )
-        rows = result.all()
-        if not rows:
+        counter: Counter = Counter()
+        for skills_str in result.scalars().all():
+            for skill in (skills_str or "").split(","):
+                skill = skill.strip()
+                if skill:
+                    counter[skill] += 1
+
+        if not counter:
             return "当前没有技能标签数据。"
-        skills_str = "; ".join([f"{row[0].split(',')[0] if ',' in row[0] else row[0]}({row[1]})" for row in rows])
-        return f"技能需求TOP10：{skills_str}。"
+        top = "; ".join(f"{name}({count})" for name, count in counter.most_common(10))
+        return f"技能需求TOP10：{top}。"
 
     @staticmethod
     async def _city_analysis(db: AsyncSession) -> str:

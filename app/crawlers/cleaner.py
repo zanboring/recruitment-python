@@ -71,11 +71,15 @@ def extract_skills(title: str, description: str) -> str:
     return ",".join(found)
 
 
-import hashlib
+def generate_job_key(source_site: str, title: str, company_name: str = "", city: str = "") -> str:
+    """岗位指纹生成（薄封装）。
 
+    实现已统一到 app.utils.job_key，保证爬虫入库与管理端新增用同一套口径，
+    否则同一岗位会因两个入口算出不同的键而重复入库。
+    """
+    from app.utils.job_key import generate_job_key as _generate
 
-def generate_job_key(source_site: str, job_id: str) -> str:
-    return f"{source_site}_{hashlib.sha256(job_id.encode()).hexdigest()}"
+    return _generate(source_site, title, company_name, city)
 
 
 def deduplicate_jobs(jobs: List[Dict]) -> List[Dict]:
