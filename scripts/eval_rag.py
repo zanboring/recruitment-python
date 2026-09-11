@@ -27,7 +27,7 @@ from app.evaluation.runner import ALL_STRATEGIES, run_evaluation  # noqa: E402
 
 STRATEGY_LABELS = {
     "keyword": "关键词检索（LIKE 子串匹配）",
-    "semantic": "语义向量检索（embedding-3 + 余弦相似度）",
+    "semantic": "语义向量检索（embedding 余弦相似度）",
     "hybrid": "混合检索（向量 + 关键词 RRF 融合）",
 }
 
