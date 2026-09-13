@@ -123,6 +123,54 @@ async def chat_stream(request: ChatRequest, db: AsyncSession = Depends(get_db), 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
+@router.post("/agent-stream")
+async def agent_stream(request: ChatRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """ReAct 多步推理 Agent 入口。
+
+    与 ``/chat-stream`` 的区别：前者是单步 Function Calling，这里让模型在
+    Thought → Action → Observation 循环中多步推理，直到给出 Final Answer。
+    适合「先查总量 → 再看分布 → 再要推荐」这类复合问题。
+
+    事件序列（具名事件，前端 ``addEventListener`` 订阅）：::
+
+        event: agent_step         # 每步的 thought / action / args
+        event: agent_observation  # 工具返回的观察结果
+        data: 最终回答            # 正文（裸 data 格式，onmessage 可收）
+        event: meta               # 实际用的 provider / model / tier
+    """
+    from app.services.react_agent import run_agent_stream
+
+    user_id = current_user.id
+
+    async def generate():
+        full_answer = ""
+        async for event in run_agent_stream(request.message, db, user_id):
+            etype = event.get("type")
+            if etype == "step":
+                yield _sse_event("agent_step", {
+                    "step": event.get("step"),
+                    "thought": event.get("thought"),
+                    "action": event.get("action"),
+                    "args": event.get("args"),
+                })
+            elif etype == "observation":
+                yield _sse_event("agent_observation", {
+                    "step": event.get("step"),
+                    "content": event.get("content"),
+                })
+            elif etype == "answer":
+                full_answer = event.get("content", "")
+                yield f"data: {full_answer}\n\n"
+            elif etype == "meta":
+                yield _sse_event("meta", event)
+        if request.session_id:
+            await update_conversation_history(
+                request.session_id, request.message, full_answer, user_id
+            )
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
 @router.get("/status")
 async def ai_status(current_user: User = Depends(get_current_user)):
     """返回 AI 模块状态：云端主模型配置情况、Ollama 可用性、当前模型偏好。

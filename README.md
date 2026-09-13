@@ -81,8 +81,9 @@ recruitment-python/
 │   │   ├── user.py          #   5  用户管理
 │   │   ├── log.py           #   3  系统日志
 │   │   └── compat.py        #   21 Java 版前端兼容层（别名路由）
-│   ├── services/            # 13 个业务服务
+│   ├── services/            # 14 个业务服务
 │   │   ├── ai_service.py           # 三级降级 + SSE + 工具调用调度
+│   │   ├── react_agent.py          # ReAct 多步推理 Agent（Thought→Action→Observation 循环）
 │   │   ├── llm_client.py           # 云端统一调用层（OpenAI 兼容 + 多供应商容灾）
 │   │   ├── ollama_client.py        # 本地统一调用层（按角色路由两个本地模型）
 │   │   ├── tool_service.py         # Function Calling 工具定义与执行
@@ -182,6 +183,7 @@ recruitment-python/
   触发 3 次，导致 `usage_count` 被虚增 3 倍（该字段参与知识条目质量排序，属数据污染），
   `on_sources` 被回调 3 次（前端展示出 3 条相同的引用来源）。
 - **Function Calling（工具调用）**：用户问「长沙有多少 Java 岗位」时，模型判断需要查库并输出结构化工具调用，代码执行 `query_jobs` 查询真实岗位数据，再把结果回填给模型组织自然语言回答。采用「prompt 引导 + JSON 解析」实现，不依赖具体模型的 native tool calling（见 `app/services/tool_service.py`）
+- **ReAct 多步推理 Agent**（`app/services/react_agent.py` + `POST /api/ai/agent-stream`）：单步 Function Calling 只查一次，而复合问题（「先看长沙 Java 岗位多不多 → 再看薪资分布 → 再要推荐」）需要多回合。ReAct Agent 让模型在 `Thought → Action → Observation` 循环中逐步推理，每步执行一个工具、把观察结果回填、再决定下一步，直到输出 `Final Answer`。三个工具：`query_jobs`（岗位统计）、`recommend_jobs`（Jaccard 相似度推荐）、`get_city_stats`（城市分布）。硬约束：`agent_max_steps` 步数上限 + 无 Final Answer 时强制收尾，绝不无限循环；每步推理过程通过 `agent_step` / `agent_observation` 事件流透出，回答可解释、可核查。降级链与普通对话一致（云端 → 本地 Ollama → 规则引擎）
 - **会话管理**：支持会话取消、最大会话数 1000、单会话保留最近 20 条历史
 - **模型管理**：7 个接口（含 `GET /api/model/usage` 用量成本统计），支持模型配置的增删改查与启用切换
 

@@ -95,6 +95,12 @@ class Settings(BaseSettings):
     ollama_code_model: str = "qwen2.5-coder:7b"
     ollama_tool_model: str = ""
 
+    # ---- ReAct Agent ----
+    # 多步推理 Agent 的最大步数上限。每步都是一次完整 LLM 调用（有成本、有延迟），
+    # 必须给循环一个上界，防止模型反复调用工具造成死循环或成本失控。
+    # 达到上限仍无 Final Answer 时，Agent 会强制基于已有 Observation 收尾。
+    agent_max_steps: int = 5
+
     # ---- Function Calling 的工具识别前置过滤 ----
     # 朴素实现对每条消息都发起一次「是否需要查库」的 LLM 调用（实测约 2.9s/次，
     # 云端则多一次 token 消耗），而大量消息本就不涉及数据库。
