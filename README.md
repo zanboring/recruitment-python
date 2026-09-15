@@ -11,7 +11,7 @@
 
 本仓库是毕设的 **Python 重构版**：用 FastAPI + SQLAlchemy 2.0 异步 ORM 重写后端，保留全部业务能力，并强化了 AI 服务、知识库检索与推荐模块。
 
-**规模**：9 个路由模块 / 82 个 REST 接口（含 21 个 Java 版前端兼容接口）/ 13 个业务服务 / 7 张数据表
+**规模**：9 个路由模块 / 85 个 REST 接口（含 21 个 Java 版前端兼容接口）/ 13 个业务服务 / 7 张数据表
 
 ## 二、技术栈
 
@@ -71,7 +71,7 @@ recruitment-python/
 │   ├── database.py          # 异步引擎与会话工厂
 │   ├── scheduler.py         # APScheduler 定时爬取
 │   ├── init_data.py         # 建表 + 初始化数据
-│   ├── routers/             # 9 个路由模块（82 个接口，含 compat.py 兼容层）
+│   ├── routers/             # 9 个路由模块（85 个接口，含 compat.py 兼容层）
 │   │   ├── auth.py          #   4  认证
 │   │   ├── jobs.py          #   20 岗位 / 统计 / 导出
 │   │   ├── ai.py            #   5  AI 对话
@@ -104,7 +104,7 @@ recruitment-python/
 │   ├── eval_rag.py          # RAG 检索效果评估入口
 │   └── bench_local_models.py# 本地模型能力对比基准（决定模型分工）
 ├── reports/                 # 评估报告输出（rag_evaluation.md、local_model_benchmark.md）
-├── tests/                   # 387 个单元测试
+├── tests/                   # 410 个单元测试
 ├── _archive/                # 开发过程文档（审计报告 / 提示词，不进仓库逻辑）
 └── requirements.txt
 ```
@@ -391,7 +391,7 @@ python -m pytest tests/ -q
 ## 七、测试
 
 ```bash
-python -m pytest tests/ -v        # 全量 387 项
+python -m pytest tests/ -v        # 全量 410 项
 python -m pytest tests/test_auth_api.py -v   # 单个模块
 ```
 
@@ -415,7 +415,7 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 | `test_tool_prefilter.py` | 19 | 工具识别前置过滤：数据类问题不漏判、短消息跳过、开关可回退 |
 | `test_embedding_service.py` | 10 | 余弦计算、向量缓存、无 Key 行为、测试内禁止真实网络出口 |
 | `test_rag_evaluation.py` | 15 | 评估指标边界、黄金集自洽性、数据集区分度、混合检索降级 |
-| `test_rag_citation.py` | 12 | 引用编号与来源严格对应、禁用条目不可见、无命中不编造依据、usage_count 累加 |
+| `test_rag_citation.py` | 13 | 引用编号与来源严格对应、禁用条目不可见、无命中不编造依据、usage_count 累加 |
 | `test_route_order.py` | 4 | 静态路由不被动态路径参数吞掉（batch / all / stats 回归） |
 | `test_log_action.py` | 7 | 操作日志落库、失败留痕、uri/ip 采集、密码脱敏 |
 | `test_compat_api.py` | 20 | Java 版前端兼容层：爬取 / 用户 / 数据 / 字段命名 / 生产环境禁 auto-login |
@@ -427,7 +427,8 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 | `test_output_limits.py` | 7 | 云端 `max_tokens` / 本地 `num_predict` 上限、配置接线 |
 | `test_login_lockout.py` | 6 | 锁定期结束后恢复完整重试次数、剩余分钟数向上取整 |
 | `test_analysis_report.py` | 7 | AI 分析报告生成与降级、空库处理 |
-| **合计** | **387** | |
+| `test_auth_api.py` + `test_react_agent.py` | 40 | 认证接口链路、ReAct 多步 Agent 的工具调用与终止条件 |
+| **合计** | **410** | |
 
 ### 稳定性与安全加固（P1 修复记录）
 
