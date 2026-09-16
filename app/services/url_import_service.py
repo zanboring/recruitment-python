@@ -1,4 +1,4 @@
-"""网页链接导入：粘贴招聘页 URL → 打开页面 → 提取正文 → LLM 结构化 → 入库。
+﻿"""网页链接导入：粘贴招聘页 URL → 打开页面 → 提取正文 → LLM 结构化 → 入库。
 
 **为什么需要它（数据来源多元化）**：爬虫能抓列表、视觉能读截图，但现实中更常见的是
 「我收藏了一个招聘链接」——把 URL 粘进来系统就能入库并保留链接与 HTML 快照，
@@ -51,18 +51,66 @@ def extract_page_text(html: str, max_len: int = 8000) -> str:
     return text[:max_len]
 
 
+_MIN_HTTP_TEXT_LEN = 120  # 低于该长度的正文视为 SPA 空壳，需回退浏览器渲染
+
+
+async def _fetch_page_via_http(url: str) -> tuple:
+    """轻量 HTTP 抓取：返回 (正文文本, 原始 HTML)；失败/无内容返回 (None, None)。
+
+    用于 Playwright 不可用（如打包后的 exe 排除了浏览器）时的降级路径。
+    纯静态或服务端渲染的招聘详情页可直接抓到内容；前端渲染的页面
+    拿到的只是空壳，由 open_page_text 依据内容长度判断后回退渲染。
+    """
+    import httpx
+
+    headers = {
+        "User-Agent": settings_crawler_ua(),
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        timeout = httpx.Timeout(max(settings.crawl_timeout, 10))
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                logger.debug("链接导入 HTTP 抓取状态码 %s，回退渲染", resp.status_code)
+                return None, None
+            html = resp.text or ""
+            text = extract_page_text(html)
+            if not text:
+                return None, None
+            return text, html
+    except Exception as e:
+        logger.warning("链接导入 HTTP 抓取失败（回退渲染）：%s", e)
+        return None, None
+
+
 async def open_page_text(url: str) -> tuple:
-    """用 Playwright 打开 URL，返回 (正文文本, 渲染后完整 HTML)。
+    """打开 URL，返回 (正文文本, 渲染后完整 HTML)。
+
+    策略（保证 exe 内无 Playwright 也能导入静态详情页）：
+      1. 先轻量 HTTP 直抓；正文够长（非 SPA 空壳）直接返回；
+      2. 内容不足或抓取失败 -> 若有 Playwright 则浏览器渲染兜底；
+         没有 Playwright（打包环境）则返回 HTTP 结果，尽力而为；
+         两者都没有则抛 RuntimeError。
 
     返回 HTML 快照用于持久化（核查时可比对“内容变化”）；正文用于 LLM 抽取。
-    打开失败/渲染失败抛 RuntimeError，由路由层转业务错误。
     """
+    http_text, http_html = await _fetch_page_via_http(url)
+
     try:
         from playwright.async_api import async_playwright
     except ImportError:
+        if http_text:
+            logger.info("Playwright 不可用，链接导入走 HTTP 降级（页面可能未完整渲染）")
+            return http_text, http_html
         raise RuntimeError(
             "Playwright 未安装：pip install playwright && playwright install chromium"
         )
+
+    # 有实质内容就不必启动浏览器（省资源、降低被风控概率）
+    if http_text and len(http_text) >= _MIN_HTTP_TEXT_LEN:
+        return http_text, http_html
 
     async with async_playwright() as p:
         launch_kwargs = {"headless": True}
@@ -80,6 +128,9 @@ async def open_page_text(url: str) -> tuple:
             await browser.close()
 
     if not html:
+        # HTTP 有结果时优先保底，避免让用户看到“加载失败”
+        if http_text:
+            return http_text, http_html
         raise RuntimeError("页面加载失败：未获取到内容")
     return extract_page_text(html), html
 

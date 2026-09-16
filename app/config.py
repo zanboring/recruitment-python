@@ -17,6 +17,91 @@ def interpolate_env_vars(content: str) -> str:
     return re.sub(pattern, replace_var, content)
 
 
+
+# ---- 运行时配置持久化（前端设置栏填写 → 写 config.env → 热生效）----
+# 通用版用户换电脑时无需碰代码/config 文件：软件启动后在「设置」页填入
+# API Key 即可，保存即写入 exe 同目录 config.env（配置加载链同一文件，天然生效）；
+# 源码模式写入项目根 config.env。空 key 会回写空值并触发下次加载跳过。
+# 允许通过设置栏修改的键白名单（其余键禁止写入，防止越权篡改）。
+RUNTIME_EDITABLE_KEYS = (
+    "ai_provider",
+    "deepseek_api_key", "deepseek_api_url", "deepseek_model",
+    "zhipuai_api_key", "zhipuai_api_url", "zhipuai_model",
+    "ollama_enabled", "ollama_base_url",
+    "ollama_model", "ollama_code_model", "ollama_tool_model",
+)
+
+
+def runtime_env_file() -> str:
+    """返回设置栏写入的配置文件路径（与加载链最高优先级一致）。"""
+    if getattr(sys, "frozen", False):
+        return str(Path(sys.executable).resolve().parent / "config.env")
+    return str(Path(__file__).resolve().parent.parent / "config.env")
+
+
+def masked(value: str) -> str:
+    """脱敏展示：保留前 4 后 4，中间以 **** 代替；空串返回空。"""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return len(value) * "*"
+    return value[:4] + "****" + value[-4:]
+
+
+def save_runtime_config(pairs: dict) -> dict:
+    """把用户设置持久化到 config.env 并热更新 settings 单例。
+
+    参数 pairs 为 {小写配置键: 值}；仅白名单键允许写入，静默过滤其余。
+    返回 {"written": [键...], "enabled": bool} 便于前端确认生效。
+
+    设计要点：
+    1. 不重写文件里已有的无关键（只增改白名单键），避免破坏其他配置；
+    2. 空值写空串（覆盖旧的 key，等价于清除）；
+    3. 写文件后同步更新 settings，本次进程立即生效（无需重启）。
+    """
+    path = runtime_env_file()
+    existing = {}
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                sline = line.strip()
+                if not sline or sline.startswith("#") or "=" not in sline:
+                    continue
+                k, v = sline.split("=", 1)
+                existing[k.strip()] = v.strip()
+
+    written = []
+    for key, value in pairs.items():
+        if key not in RUNTIME_EDITABLE_KEYS:
+            continue  # 白名单之外静默忽略
+        existing[key] = "" if value is None else str(value)
+        written.append(key)
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        for k, v in existing.items():
+            # 落盘统一大写键名（与 .env / config.template.env 的书写习惯一致）
+            fh.write(f"{k.upper()}={v}\n")
+
+    # 热生效：同步进程环境变量 + 直接赋值 settings 单例（无需重启）
+    for key in written:
+        raw = existing[key]
+        env_key = key.upper()
+        if key == "ollama_enabled":
+            bool_val = raw.lower() in ("1", "true", "yes", "on")
+            os.environ[env_key] = "true" if bool_val else "false"
+            setattr(settings, key, bool_val)
+        else:
+            os.environ[env_key] = raw
+            setattr(settings, key, raw)
+
+    logger = __import__("logging").getLogger(__name__)
+    logger.info("设置栏更新配置文件 %s：%s", path, ",".join(written))
+    return {"written": written, "file": path}
+
 def _candidate_env_files() -> list:
     """按优先级返回候选配置文件路径。
 
@@ -264,12 +349,25 @@ class Settings(BaseSettings):
         return "zhipu" if self.zhipuai_api_key else "ollama"
 
 
-interpolated_env = load_env_with_interpolation()
-# A deployment platform's environment variables must win over values in a
-# checked-out .env file.  The old ``update`` call inverted that precedence and
-# could accidentally replace a production secret with a development value.
-for _key, _value in interpolated_env.items():
+_config_files = _candidate_env_files()
+# 两层来源语义不同：
+#   .env        —— 本地调试默认值，可用 setdefault（平台环境变量优先）
+#   config.env  —— 用户配置层（手动放置或前端设置栏写入），必须强制覆盖
+#                   .env 插值占位，否则设置栏填的 Key 永远不会生效。
+_env_defaults: dict = {}
+_env_overrides: dict = {}
+for _f in _config_files:
+    _vals = load_env_with_interpolation(_f)
+    if str(_f).endswith("config.env"):
+        _env_overrides.update(_vals)
+    else:
+        _env_defaults.update(_vals)
+
+# 平台环境变量必须赢过版本库里的 .env（防止用开发值覆盖生产密钥）
+for _key, _value in _env_defaults.items():
     os.environ.setdefault(_key, _value)
+# 用户配置层强制生效：设置栏保存的 Key 在此处覆盖 .env 插值占位
+os.environ.update(_env_overrides)
 
 settings = Settings()
 
