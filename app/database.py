@@ -26,7 +26,19 @@ else:
     else:
         DATABASE_URL = f"mysql+aiomysql://{settings.db_username}:{encoded_password}@{settings.db_host}:{settings.db_port}/{settings.db_name}?charset=utf8mb4"
 
-engine = create_async_engine(DATABASE_URL, pool_size=20, max_overflow=5)
+def engine_kwargs_for(url: str) -> dict:
+    """按方言裁剪连接池参数。
+
+    SQLite 不支持 pool_size / max_overflow：内存库走 StaticPool、
+    文件库走 SingletonThreadPool，传这两个参数会直接 TypeError：
+        Invalid argument(s) 'pool_size','max_overflow' sent to create_engine()
+    而测试环境与「通用版」绿色软件都以 SQLite 为默认库。
+    SQLite 是本地文件库，本来也不需要 20 连接池。
+    """
+    return {} if url.startswith("sqlite") else {"pool_size": 20, "max_overflow": 5}
+
+
+engine = create_async_engine(DATABASE_URL, **engine_kwargs_for(DATABASE_URL))
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
 
