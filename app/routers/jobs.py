@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query, UploadFile, Body
+from fastapi import APIRouter, Depends, Query, UploadFile, Body, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List
 from pydantic import BaseModel, Field
@@ -282,6 +282,77 @@ async def vision_import(
         return Result.success({"result": job_data, "saved": True, "job_id": created.id})
     except ValueError as e:
         raise AppException(str(e), 400)
+
+
+@router.post("/vision-batch-import")
+@log_action("视觉批量导入岗位")
+async def vision_batch_import(
+    files: list[UploadFile] = File(...),
+    request: VisionImportRequest = Body(default=None),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """多张招聘截图批量视觉识别（预览或直接入库）。
+
+    - 逐张识别，单张失败不影响其余（异常隔离）；
+    - validate=false（默认）：只返回识别结果供预览，不写库；
+    - validate=true：成功识别的逐条入库（job_key 幂等去重），失败条返回错误原因。
+    """
+    from app.services.vision_service import recognize_job_images_batch
+    from app.schemas.job import JobCreateRequest
+
+    if not files:
+        raise AppException("未收到任何图片", 400)
+    if len(files) > 20:
+        raise AppException("单次最多上传 20 张图片", 400)
+
+    # 逐张读取 + 基础校验（空/超限在服务层隔离，不整体中断）
+    images = []
+    for idx, f in enumerate(files):
+        mime = (f.content_type or "image/jpeg")
+        data = await f.read()
+        if data and len(data) > 5 * 1024 * 1024:
+            images.append({"index": idx, "bytes": b"", "mime": mime,
+                           "error": "图片超过 5MB 限制"})
+            continue
+        images.append({"index": idx, "bytes": data, "mime": mime, "error": None})
+
+    # 服务层批量识别（单张异常隔离）
+    results = await recognize_job_images_batch(images)
+
+    # 预览模式：只返回结果
+    if not request or not request.validate:
+        return Result.success({"results": results, "saved": False})
+
+    # 确认入库：成功条逐条入库，返回每条的 saved/job_id
+    out = []
+    for r in results:
+        if not r["ok"]:
+            out.append({"index": r["index"], "ok": False, "error": r["error"],
+                        "saved": False, "job_id": None})
+            continue
+        job_data = r["result"]
+        try:
+            create_req = JobCreateRequest(
+                title=job_data["title"],
+                company_name=job_data["company_name"],
+                source_site="vision",
+                city=job_data["city"],
+                experience=job_data["experience"],
+                education=job_data["education"],
+                min_salary=job_data["min_salary"] or None,
+                max_salary=job_data["max_salary"] or None,
+                skills=job_data["skills"],
+                job_desc=job_data["job_desc"],
+            )
+            created = await JobService.create_job(db, create_req)
+            out.append({"index": r["index"], "ok": True, "saved": True,
+                        "job_id": created.id, "result": job_data})
+        except ValueError as e:
+            out.append({"index": r["index"], "ok": False, "error": str(e),
+                        "saved": False, "job_id": None})
+    await db.commit()
+    return Result.success({"results": out, "saved": True})
 
 
 class UrlImportRequest(BaseModel):
