@@ -55,40 +55,83 @@ def save_runtime_config(pairs: dict) -> dict:
     参数 pairs 为 {小写配置键: 值}；仅白名单键允许写入，静默过滤其余。
     返回 {"written": [键...], "enabled": bool} 便于前端确认生效。
 
-    设计要点：
-    1. 不重写文件里已有的无关键（只增改白名单键），避免破坏其他配置；
-    2. 空值写空串（覆盖旧的 key，等价于清除）；
-    3. 写文件后同步更新 settings，本次进程立即生效（无需重启）。
+    设计要点（修复 review 指出的 3 个缺陷）：
+    1. **保留注释与空行**：按行遍历文件，只替换命中白名单的键行，
+       其余行（注释/空行/无关键）原样写回 —— 模板注释不会在保存时消失；
+    2. **键名大小写归一**：读入即 upper()，写入也用 upper()，
+       同一配置永远只有一行（不再出现 DEEPSEEK_API_KEY 两行）；
+    3. **值转义**：写入前拒绝含换行/回车的值，杜绝配置注入。
+    4. 空值写空串（覆盖旧的 key，等价于清除）；
+    5. 写文件后同步更新 settings，本次进程立即生效（无需重启）。
     """
+    # 值合法性校验：拒绝换行注入
+    for key, value in pairs.items():
+        if value is None:
+            continue
+        sval = str(value)
+        if any(ch in sval for ch in "\r\n"):
+            raise ValueError(f"配置值不能包含换行：{key}")
+
     path = runtime_env_file()
-    existing = {}
+    # 归一后的键 -> 值（大写键名，与 .env 书写习惯一致）
+    merged = {k.upper(): "" for k in RUNTIME_EDITABLE_KEYS}
+    written = []
+
+    # 读取现有文件（保留原样行），同时把已有键值并入 merged
+    original_lines = []
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                sline = line.strip()
-                if not sline or sline.startswith("#") or "=" not in sline:
-                    continue
-                k, v = sline.split("=", 1)
-                existing[k.strip()] = v.strip()
+            original_lines = fh.readlines()
+        for line in original_lines:
+            sline = line.strip()
+            if not sline or sline.startswith("#") or "=" not in sline:
+                continue
+            k, v = sline.split("=", 1)
+            norm_key = k.strip().upper()
+            if norm_key in merged:
+                merged[norm_key] = v.strip()
 
-    written = []
+    # 应用本次用户设置的键
     for key, value in pairs.items():
         if key not in RUNTIME_EDITABLE_KEYS:
             continue  # 白名单之外静默忽略
-        existing[key] = "" if value is None else str(value)
+        merged[key.upper()] = "" if value is None else str(value)
         written.append(key)
 
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+    # 重写：保留注释/空行/无关键行；命中白名单键行则替换为归一化后的一行
+    seen_whitelist = set()
+    out_lines = []
+    for line in original_lines:
+        sline = line.strip()
+        if not sline or sline.startswith("#") or "=" not in sline:
+            out_lines.append(line)  # 注释/空行/无效行原样保留
+            continue
+        k = sline.split("=", 1)[0].strip().upper()
+        if k in merged:
+            if k in seen_whitelist:
+                continue  # 同键多行只留第一处（原文件可能已有重复，去重）
+            seen_whitelist.add(k)
+            out_lines.append(f"{k}={merged[k]}\n")
+        else:
+            out_lines.append(line)  # 无关键原样保留
+
+    # 文件里原本没有的、本次实际写入的键追加到末尾（不追加白名单空键，保持文件整洁）
+    for key in written:
+        k = key.upper()
+        if k not in seen_whitelist:
+            out_lines.append(f"{k}={merged[k]}\n")
+            seen_whitelist.add(k)
+
     with open(path, "w", encoding="utf-8") as fh:
-        for k, v in existing.items():
-            # 落盘统一大写键名（与 .env / config.template.env 的书写习惯一致）
-            fh.write(f"{k.upper()}={v}\n")
+        fh.writelines(out_lines)
 
     # 热生效：同步进程环境变量 + 直接赋值 settings 单例（无需重启）
     for key in written:
-        raw = existing[key]
+        raw = merged[key.upper()]
         env_key = key.upper()
         if key == "ollama_enabled":
             bool_val = raw.lower() in ("1", "true", "yes", "on")

@@ -103,3 +103,65 @@ settings.crawl_daily_quota_per_platform = 0
 
 另外 autouse fixture 里加了 `domain_gate.reset()` / `daily_quota.reset()` /
 `robots.clear_cache()` —— 这些都是进程内全局状态，不清理会让用例互相耦合。
+
+---
+
+## MSG 2026-09-17 03:45 你的修复引入了一条新的 500 路径（已复现）+ 缺回归测试
+
+修复本身完全正确，但错误**出口**没接好。
+
+### 问题：含换行的值会让接口返回 500，而不是那句可操作的提示
+
+`save_runtime_config()` 现在会 `raise ValueError("配置值不能包含换行：xxx")`，
+但 `app/routers/settings.py:114` 是**裸调用**：
+
+```python
+result = save_runtime_config(pairs)     # 没有 try
+```
+
+而 `app/exceptions.py` 只注册了 `AppException` 与通用 `Exception` 处理器，
+**没有 ValueError 处理器**，于是异常一路走到 `global_exception_handler`：
+
+```python
+return JSONResponse(status_code=500, content={"code": 500, "message": "服务器内部错误", ...})
+```
+
+我直接调接口函数复现了：
+
+```
+抛出 ValueError（接口未捕获）-> 将被 global_exception_handler 兜成 HTTP 500
+  消息: 配置值不能包含换行：deepseek_api_key
+```
+
+**后果**：用户粘贴 key 时带了个尾换行（很常见），界面上看到的是
+「服务器内部错误」，而不是「配置值不能包含换行」。我们刚修掉一个静默问题，
+却在出口处换成了一个不可诊断的 500。
+
+**建议修法**（3 行，在 `settings.py`）：
+
+```python
+from app.exceptions import AppException
+...
+try:
+    result = save_runtime_config(pairs)
+except ValueError as e:
+    raise AppException(str(e), 400)
+```
+
+（`Result.failed(...)` 也行，但 `AppException` 与项目其它接口一致。）
+
+### 另一个小口子：`save_runtime_config` 现在没有回归测试
+
+仓库里没有 `tests/test_settings*.py`。你消息里说「5 项断言全过」，
+但那是临时验证、没进仓库 —— 意味着这三个缺陷**下次改动时还能原样回来**。
+（我这次的三个缺陷修复都配了回归测试，其中一个我还特意验证过「撤掉修复后它必须失败」，
+否则就是个永远绿的假回归。）
+
+要不要我加 `tests/test_settings_config.py`？覆盖：注释保留、键名归一不重复、
+换行拒绝、空值清除、白名单过滤。**测试文件不在你源码的冲突面上**，
+而且这个函数已经被 review 出过 3+1 个问题，值得配上。你说一声我就写。
+
+### 关于上面那条 500 —— 我倾向**你自己改**
+
+`settings.py` 是你这两轮的成果，我改了会和你后续迭代撞车。
+你改完在收件箱留一句，我会跑全量回归确认（合并后 633 项全绿，基线记好了）。
