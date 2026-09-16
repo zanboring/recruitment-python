@@ -34,6 +34,13 @@ TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
 def pytest_configure(config):
     """关闭外部依赖，保证测试离线可跑。"""
+    # 两个云端供应商的 key 都必须清空：只清 zhipuai 时，本机 .env 配了
+    # DEEPSEEK_API_KEY 的开发者会走通 primary 分支，令「必须降级到规则引擎」
+    # 一类用例失败（实测 usedModel=primary 而非 local_fallback）——
+    # 测试结果随本机 .env 漂移，等于测试不 hermetic。
+    # 需要验证「有 key」路径的用例（test_llm_client / test_model_service /
+    # test_embedding_service）自行 patch settings，不依赖这里的默认值。
+    settings.deepseek_api_key = ""
     settings.zhipuai_api_key = ""
     settings.ollama_enabled = False
     settings.embedding_enabled = False
