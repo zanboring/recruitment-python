@@ -24,6 +24,21 @@ from app.routers.report import router as report_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_production_settings()
+
+    # 建表必须走在任何查询之前。
+    # 此前「建表」只存在于 scripts/init_db.py：源码模式由 start-generic.bat
+    # 和文档步骤保证先跑它，但**打包后的 exe 没有任何入口建表**（dist/RecSys
+    # 里也没有预置数据库），于是通用版在干净机器上启动时，下面的
+    # init_default_admin 会先查 user 表 → no such table: user
+    # → Application startup failed，绿色软件「拷过去就能用」的前提不成立。
+    # create_all 是幂等的：只创建缺失的表，不改动已存在表的结构
+    #（表结构升级仍按 README「表结构变更（升级须知）」手工处理）。
+    from app.database import Base, engine
+    import app.models  # noqa: F401  导入以把全部表注册进 Base.metadata
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
     from app.scheduler import start_scheduler
     start_scheduler()
 
