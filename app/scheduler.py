@@ -8,7 +8,9 @@ POST /api/crawler/start 走完全相同的链路（重试包装、清洗过滤�
 历史问题：本文件曾自己维护一套入库逻辑，缺少清洗过滤与下架判定、
 也不刷新 last_seen_at，导致同一份数据经不同入口入库结果不一致。
 """
+import asyncio
 import logging
+import random
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.services import report_service
@@ -27,22 +29,39 @@ SCHEDULED_PLATFORMS = ["boss"]
 
 
 async def scheduled_crawl() -> None:
-    """执行一轮定时爬取。单组失败只记录日志，不影响其余组合。"""
-    # 延迟导入：避免应用启动阶段（导入 scheduler 时）就拉起数据库与爬虫依赖
+    """执行一轮定时爬取。单组失败只记录日志，不影响其余组合。
+
+    节奏刻意做成「人类化」的：**打乱组合顺序 + 组间插入随机间隔**。
+
+    原先是 3 关键词 × 6 城市 = 18 组背靠背连跑，一个小时内打完一整套 ——
+    对目标站点来说这是极其规律的流量形状（每天同一时刻、同一批城市、同样的密度），
+    比分散访问更容易被识别为脚本。现在一轮会自然摊开到一两个小时，
+    且每天的访问顺序都不同。
+    """
+    from app.config import settings
     from app.database import async_session
     from app.services.crawler_service import start_crawl
 
+    combos = [(keyword, city) for keyword in SCHEDULED_KEYWORDS for city in SCHEDULED_CITIES]
+    # 固定顺序意味着「每天同一时刻访问同一批城市」，规律性本身就是可识别特征
+    random.shuffle(combos)
+
     async with async_session() as db:
-        for keyword in SCHEDULED_KEYWORDS:
-            for city in SCHEDULED_CITIES:
-                try:
-                    count = await start_crawl(db, keyword, city, SCHEDULED_PLATFORMS)
-                    logger.info("定时爬取完成：%s / %s，新增 %s 条", keyword, city, count)
-                except Exception as e:  # noqa: BLE001
-                    # start_crawl 内部已把该任务置为 FAILED，这里记录后继续下一组
-                    logger.error(
-                        "定时爬取失败：%s / %s：%s", keyword, city, e, exc_info=True
-                    )
+        for index, (keyword, city) in enumerate(combos):
+            if index:
+                gap = random.uniform(
+                    settings.scheduled_crawl_gap_min, settings.scheduled_crawl_gap_max
+                )
+                logger.info("组间间隔 %.0f 秒（第 %s/%s 组）", gap, index + 1, len(combos))
+                await asyncio.sleep(gap)
+            try:
+                count = await start_crawl(db, keyword, city, SCHEDULED_PLATFORMS)
+                logger.info("定时爬取完成：%s / %s，新增 %s 条", keyword, city, count)
+            except Exception as e:  # noqa: BLE001
+                # start_crawl 内部已把该任务置为 FAILED，这里记录后继续下一组
+                logger.error(
+                    "定时爬取失败：%s / %s：%s", keyword, city, e, exc_info=True
+                )
 
 
 async def scheduled_daily_report() -> None:

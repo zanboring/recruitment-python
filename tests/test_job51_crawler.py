@@ -220,8 +220,11 @@ async def test_指定城市时城市以调用方为准():
 
 
 class FakeResponse:
-    def __init__(self, status=200):
+    """模拟 Playwright 的 Response：真实对象一定有 status 与 headers。"""
+
+    def __init__(self, status=200, headers=None):
         self.status = status
+        self.headers = dict(headers or {})
 
 
 class FakePage:
