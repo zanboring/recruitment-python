@@ -152,3 +152,33 @@ async def recognize_job_image(image_bytes: bytes, mime: str = "image/jpeg") -> d
     content = (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
     parsed = _parse_json_reply(content)
     return _normalize_job(parsed)
+
+
+async def recognize_job_images_batch(images: list) -> list:
+    """批量视觉识别：一次传多张图片，逐张识别，异常隔离。
+
+    ``images`` 为 [{index, bytes, mime}]。返回同长度列表，每项:
+        {"index": i, "ok": bool, "result": dict|None, "error": str|None}
+    单张失败不影响其余（识别是独立网络调用，不应一张坏图拖垮整批）；
+    全部图片为空/超限等整体性错误直接抛 RuntimeError 由路由层处理。
+    """
+    if not images:
+        raise RuntimeError("未收到任何图片")
+    results = []
+    for item in images:
+        index = item.get("index", 0)
+        image_bytes = item.get("bytes") or b""
+        mime = item.get("mime") or "image/jpeg"
+        try:
+            if not image_bytes:
+                raise RuntimeError("图片内容为空")
+            job_data = await recognize_job_image(image_bytes, mime=mime)
+            if not job_data.get("title"):
+                raise RuntimeError("未识别到岗位信息，请换更清晰的截图")
+            results.append({"index": index, "ok": True, "result": job_data, "error": None})
+        except RuntimeError as e:
+            results.append({"index": index, "ok": False, "result": None, "error": str(e)})
+        except Exception as e:  # noqa: BLE001 - 单张异常隔离
+            logger.warning("批量识别第 %s 张失败：%s", index, e)
+            results.append({"index": index, "ok": False, "result": None, "error": "图片识别失败，请重试"})
+    return results

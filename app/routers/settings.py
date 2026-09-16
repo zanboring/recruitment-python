@@ -111,7 +111,10 @@ async def update_provider_config(
     if not pairs:
         return Result.failed("没有需要保存的配置")
 
-    result = save_runtime_config(pairs)
+    try:
+        result = save_runtime_config(pairs)
+    except ValueError as e:
+        return Result.failed(str(e))
 
     # 返回脱敏后的最新状态，前端据此刷新展示
     status = ProviderStatus(
