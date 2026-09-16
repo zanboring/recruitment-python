@@ -32,6 +32,7 @@ from app.crawlers.base import BaseCrawler
 from app.crawlers.browser import launch
 from app.crawlers.city_map import UnsupportedCityError
 from app.crawlers.cleaner import clean_job_data, deduplicate_jobs, generate_job_key
+from app.crawlers.throttle import await_domain_slot, parse_retry_after
 
 logger = logging.getLogger("job51_crawler")
 
@@ -301,11 +302,34 @@ class Job51Crawler(BaseCrawler):
 
                 while len(results) < settings.crawl_max_jobs:
                     url = self.build_search_url(keyword, area_code, page_num)
+
+                    # 域名级节流：同一域名串行 + 保底间隔，跨任务生效
+                    # （BaseCrawler 的组内延时管不到「另一个任务此刻也在打同一个域名」）
+                    await await_domain_slot(url, settings.crawl_domain_min_interval)
+
+                    status = 200
+                    headers: Dict[str, str] = {}
                     try:
                         response = await page.goto(url, timeout=settings.crawl_timeout * 1000)
-                        status = response.status if response is not None else 200
+                        if response is not None:
+                            status = response.status
+                            headers = dict(response.headers or {})
                     except Exception as exc:
                         logger.error("51job 第 %s 页请求失败：%s", page_num, exc)
+                        break
+
+                    # 对方明确说了要等多久，就听它的。
+                    # 这里选择「停止本次采集」而不是原地 sleep：Retry-After 可能是几分钟
+                    # 甚至一小时，让后台任务一直挂着不如直接收工，交给下一轮定时任务；
+                    # 反正等待期间我们不会再发任何请求，语义上是尊重的。
+                    retry_after = parse_retry_after(headers.get("retry-after"))
+                    if retry_after is not None and status in (429, 503):
+                        self.mark_blocked()
+                        logger.warning(
+                            "51job 返回 %s，对方要求等待 %.0f 秒；停止本次采集，"
+                            "等待期间不再发起请求（累计风控 %s 次）",
+                            status, retry_after, BaseCrawler._blocked_signals,
+                        )
                         break
 
                     body = await page.evaluate(

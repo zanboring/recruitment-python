@@ -20,6 +20,18 @@ CRAWLER_REGISTRY: Dict[str, Type[BaseCrawler]] = {
     "51job": Job51Crawler,
 }
 
+# 各平台用于「合规探针」与「域名节流」的代表性地址。
+# robots.txt 按域名生效，所以取该平台实际要访问的那个域名上的页面即可。
+PLATFORM_PROBE_URLS: Dict[str, str] = {
+    "boss": "https://www.zhipin.com/web/geek/job",
+    "51job": "https://we.51job.com/pc/search",
+}
+
+
+def probe_url(platform: str) -> str:
+    """取平台的合规探针地址；未登记时返回空串（调用方据此跳过该平台的合规与节流检查）。"""
+    return PLATFORM_PROBE_URLS.get(platform, "")
+
 # 已实现抓取的平台集合（由注册表派生，避免两处维护）
 SUPPORTED_PLATFORMS = frozenset(CRAWLER_REGISTRY)
 

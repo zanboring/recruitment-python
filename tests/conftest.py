@@ -58,6 +58,14 @@ def pytest_configure(config):
     # 自动入库开关默认保持开启（与生产一致），需要验证它的用例自行覆盖
     settings.ai_auto_learn_enabled = True
 
+    # 采集护栏（跨任务层）默认关闭，原因与上面几条同类：
+    # - robots 检查会向目标站点发起**真实网络请求**；
+    # - 域名节流会让每个用到 _crawl_platform 的用例真的睡 20 秒。
+    # 需要验证它们的用例在 tests/test_throttle.py 里显式打开。
+    settings.crawl_robots_check_enabled = False
+    settings.crawl_domain_min_interval = 0
+    settings.crawl_daily_quota_per_platform = 0   # 0 = 不限制
+
 
 @pytest_asyncio.fixture
 async def usage_session_factory(engine):
@@ -83,20 +91,28 @@ async def usage_session_factory(engine):
 
 @pytest.fixture(autouse=True)
 def _reset_in_memory_state():
-    """每个用例前清空进程内的限流计数与 AI 会话历史。
+    """每个用例前清空进程内的限流计数、AI 会话历史、采集节流与日配额。
 
-    这两处都是模块级全局字典，不清理会让用例之间产生诡异的耦合。
+    这几处都是模块级全局状态，不清理会让用例之间产生诡异的耦合
+    （例如上一个用例耗掉的日配额让下一个用例直接失败）。
     """
     from app.middleware.rate_limit import default_limiter
-    from app.services import ai_service
+    from app.crawlers import robots
+    from app.crawlers.throttle import daily_quota, domain_gate
     from app.cache import cache as test_cache
+    from app.services import ai_service
 
-    test_cache.clear_sync()
-    default_limiter.reset()
-    ai_service.reset_runtime_state()
+    def _reset_all():
+        test_cache.clear_sync()
+        default_limiter.reset()
+        ai_service.reset_runtime_state()
+        domain_gate.reset()
+        daily_quota.reset()
+        robots.clear_cache()
+
+    _reset_all()
     yield
-    default_limiter.reset()
-    ai_service.reset_runtime_state()
+    _reset_all()
 
 
 @pytest_asyncio.fixture

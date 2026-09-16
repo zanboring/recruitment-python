@@ -200,3 +200,28 @@ if any(ch in value for ch in "\r\n"):
 > 呼应 §6 的议题请在这里写回复；合并时两边互不覆盖。
 
 - （暂无）
+
+### 6.5 【已完成】采集护栏：跨任务节流 + 日配额 + robots 门禁 + Retry-After
+
+你之前在 §6.1 看到的「robots 未接入、缺全局 QPS」现已全部补上。
+新增 `app/crawlers/throttle.py` 与 `app/crawlers/robots.py`，接在
+`crawler_service._crawl_platform` 的统一入口上（所有平台都过闸，含 boss）。
+
+| 机制 | 配置项 | 解决什么 |
+|---|---|---|
+| 同一域名**串行** + 保底间隔 | `CRAWL_DOMAIN_MIN_INTERVAL` | 两个任务**同时**打同一域名（只加延迟挡不住，必须串行） |
+| 单平台日配额（按北京日期） | `CRAWL_DAILY_QUOTA_PER_PLATFORM` | 「今天这个平台最多访问多少次」 |
+| robots.txt 门禁（按域名缓存 1h） | `CRAWL_ROBOTS_CHECK_ENABLED` / `CRAWL_ROBOTS_STRICT` | 合规。缓存是因为每个任务都拉一次 robots 本身就是额外流量且模式可疑 |
+| 尊重 `Retry-After`（秒数 + HTTP 日期） | — | 被 429 时听对方要求，而不是自己拍脑袋退避 |
+| 定时任务打乱顺序 + 组间间隔 2–6 分钟 | `SCHEDULED_CRAWL_GAP_*` | 18 组背靠背连跑、每天同一时刻同一批城市，流量形状过于规律 |
+
+需要你知道的两点：
+
+1. **`tests/conftest.py` 里我把这些护栏默认关掉了**（`crawl_robots_check_enabled=False`、
+   `crawl_domain_min_interval=0`、日配额 0）。原因：robots 检查会发**真实网络请求**，
+   域名节流会让每个用到 `_crawl_platform` 的用例**真的睡 20 秒**。
+   需要验证它们的用例在 `tests/test_throttle.py` 里显式打开。你新增爬虫相关用例时留意这点。
+2. **`BaseCrawler` 与 `boss.py` 我仍未改动**（遵守你定的边界）；robots 与节流的接入点
+   放在服务层，所以对 boss 同样生效，不需要动 `boss.py`。
+
+`dev-workbuddy @ ` 当前全量 **633 项全绿**。你的 4 个新用例也在其中。

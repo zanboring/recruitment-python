@@ -268,6 +268,27 @@ class Settings(BaseSettings):
     crawl_proxy: str = ""
     crawl_timeout: int = 45
 
+    # ---- 采集节流与合规（跨任务层，补充 BaseCrawler 的「组内」护栏）----
+    # BaseCrawler.random_delay 只管一次爬取内部相邻请求的间隔；下面这些管的是
+    # 「任务之间」：同一域名会不会被并发访问、今天还能请求多少次、robots 允不允许。
+    # 同一域名两次请求之间的最小间隔（秒）。0 = 不限制。
+    crawl_domain_min_interval: float = 20.0
+    # 单个平台每日最大请求次数。0 = 不限制。按北京日期计数，与日报口径一致。
+    crawl_daily_quota_per_platform: int = 2000
+    # 是否检查 robots.txt。
+    crawl_robots_check_enabled: bool = True
+    # 命中 robots.txt 的 Disallow 时是否直接拒绝该平台。
+    # 默认 false（只告警）是刻意取舍：默认阻断会让人撞上「配置全对却跑不起来」
+    # 且分不清是自己配错还是站点不允许。对外交付/有合规要求时设为 true。
+    crawl_robots_strict: bool = False
+
+    # ---- 定时爬取的「人类化」节奏 ----
+    # 18 组任务（3 关键词 × 6 城市）原先背靠背连跑，一个小时内打完一整套，
+    # 比分散在日间更像脚本。这里在组间插入随机间隔，并把顺序打乱。
+    # 组与组之间的随机间隔（秒），默认 2~6 分钟。
+    scheduled_crawl_gap_min: int = 120
+    scheduled_crawl_gap_max: int = 360
+
     # ---- 岗位存活核查（job_checker）----
     # 默认开启：启动后后台慢速核查已存 URL 的岗位是否仍在线
     job_checker_enabled: bool = True

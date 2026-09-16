@@ -14,6 +14,8 @@ from datetime import timedelta
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.crawlers import robots
 from app.crawlers.boss import BossCrawler  # noqa: F401  保留：兼容既有引用与测试的 monkeypatch 目标
 from app.crawlers.cleaner import (
     deduplicate_jobs,
@@ -22,7 +24,8 @@ from app.crawlers.cleaner import (
     is_invalid_job,
     is_senior_job,
 )
-from app.crawlers.registry import SUPPORTED_PLATFORMS, get_crawler
+from app.crawlers.registry import SUPPORTED_PLATFORMS, get_crawler, probe_url
+from app.crawlers.throttle import await_domain_slot, daily_quota
 from app.models.crawl_task import CrawlTask
 from app.models.job import Job
 
@@ -179,8 +182,37 @@ async def _crawl_platform(db: AsyncSession, keyword: str, city: str, platform: s
     """抓取并入库单个平台。
 
     返回 (新增条数, 本次抓到的 job_key 列表)。
+
+    在真正发起请求之前依次过三道「任务之间」的闸：
+    合规（robots）→ 配额（今日还剩多少次）→ 域名节流（同一域名串行且保底间隔）。
+    这三道闸解决的是 ``BaseCrawler`` 覆盖不到的盲区（它只管一次爬取内部的间隔）。
     """
     crawler = get_crawler(platform)
+    probe = probe_url(platform)
+
+    if probe:
+        # 1) 合规：robots.txt。宽松模式下只告警但说明会落到日志/message，不静默通过
+        allowed, note = await robots.gate(platform, probe)
+        if not allowed:
+            raise RuntimeError(note)
+        if note:
+            logger.warning("平台 %s 合规提示：%s", platform, note)
+
+        # 2) 配额：超限时明确失败，而不是继续把额度耗干。
+        #    用 raise 而不是 return 0 —— 「0 条」和「被配额拦下」是两回事，
+        #    后者必须让使用者看见原因。
+        limit = settings.crawl_daily_quota_per_platform
+        if not daily_quota.try_consume(platform, limit):
+            raise RuntimeError(
+                f"平台 {platform} 已达今日采集配额（{limit} 次/日，按北京日期计）。"
+                f"如需调整请修改 CRAWL_DAILY_QUOTA_PER_PLATFORM。"
+            )
+
+        # 3) 域名节流：同一域名的请求串行化 + 最小间隔（跨任务生效）
+        waited = await await_domain_slot(probe, settings.crawl_domain_min_interval)
+        if waited:
+            logger.info("平台 %s 域名节流等待 %.1fs", platform, waited)
+
     # 走带指数退避的 retry 包装，而不是裸调用 crawl()：
     # 否则目标站点一次抖动就会让整个任务 FAILED。
     jobs = await crawler.crawl_with_retry(keyword, city)
