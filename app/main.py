@@ -19,6 +19,8 @@ from app.routers.log import router as log_router
 from app.routers.knowledge import router as knowledge_router
 from app.routers.model import router as model_router
 from app.routers.report import router as report_router
+from app.routers.system import router as system_router
+from app.version import APP_NAME, APP_VERSION
 
 
 @asynccontextmanager
@@ -58,9 +60,10 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="Recruitment System",
+        title=f"{APP_NAME} · 招聘数据与 AI 分析系统",
         description="招聘系统 Python 重构版",
-        version="1.0.0",
+        # 版本号取自 app/version.py 单一来源，避免 OpenAPI 文档与 exe 显示的版本漂移
+        version=APP_VERSION,
         lifespan=lifespan
     )
 
@@ -106,6 +109,7 @@ def create_app() -> FastAPI:
     app.include_router(knowledge_router)
     app.include_router(model_router)
     app.include_router(report_router)
+    app.include_router(system_router)
 
     app.add_exception_handler(AppException, app_exception_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)

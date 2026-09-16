@@ -73,7 +73,7 @@ recruitment-python/
 │   ├── database.py          # 异步引擎与会话工厂
 │   ├── scheduler.py         # APScheduler 定时爬取
 │   ├── init_data.py         # 建表 + 初始化数据
-│   ├── routers/             # 10 个路由模块（93 个 API 端点，含 compat.py 兼容层）
+│   ├── routers/             # 11 个路由模块（95 个 API 端点，含 compat.py 兼容层）
 │   │   ├── auth.py          #   4  认证
 │   │   ├── jobs.py          #   20 岗位 / 统计 / 导出 / 导入
 │   │   ├── ai.py            #   5  AI 对话
@@ -81,10 +81,11 @@ recruitment-python/
 │   │   ├── knowledge.py     #   12 知识库
 │   │   ├── crawler.py       #   3  爬取任务
 │   │   ├── report.py        #   6  自动化日报（生成 / 列表 / 详情 / 下载 / 推送）
+│   │   ├── system.py        #   2  版本自证 + 检查更新
 │   │   ├── user.py          #   5  用户管理
 │   │   ├── log.py           #   3  系统日志
 │   │   └── compat.py        #   21 Java 版前端兼容层（别名路由）
-│   ├── services/            # 20 个业务服务
+│   ├── services/            # 21 个业务服务
 │   │   ├── ai_service.py           # 三级降级 + SSE + 工具调用调度
 │   │   ├── react_agent.py          # ReAct 多步推理 Agent（Thought→Action→Observation 循环）
 │   │   ├── llm_client.py           # 云端统一调用层（OpenAI 兼容 + 多供应商容灾）
@@ -94,6 +95,7 @@ recruitment-python/
 │   │   ├── knowledge_service.py    # 语义检索 + 关键词降级
 │   │   ├── report_service.py       # 日报聚合 / Excel 透视 / 推送编排
 │   │   ├── webhook_service.py      # 企业微信 / 钉钉 / 通用 Webhook 推送
+│   │   ├── update_service.py       # 检查 GitHub Release 是否有新版本
 │   │   ├── local_model_service.py  # 规则引擎兜底
 │   │   ├── usage_service.py        # Token 用量与成本统计
 │   │   └── ...                     # auth / crawler / export / job / model
@@ -217,6 +219,29 @@ recruitment-python/
   - 薪资写法比 BOSS 杂得多（`1-1.5万` / `8千-1.2万` / `15-25万/年` / `1-1.5万·13薪`），
     有独立解析器并统一折算为月薪；日薪、时薪、面议一律留空，不换算假数据
   - 城市编码取自 51job 搜索页 URL 的 `jobArea` 参数，经三个独立公开来源交叉核对一致
+- **采集通道（三种，按抗封能力递增）**：
+
+  | 通道 | 原理 | 抗封 | 适用 |
+  |---|---|---|---|
+  | 无头浏览器（现状） | Playwright 起 chromium，带完整请求头与代理 | 中 | 批量历史采集、演示 |
+  | **真实浏览器自动化** | Playwright 驱动非无头浏览器，保留完整指纹 | 较高 | 需要登录态的数据 |
+  | **浏览器扩展 / 油猴脚本** | 在用户真实浏览器里采集，复用登录态与真实指纹 | 最高 | 按需采集、长期运行 |
+
+  **关于「用前端代码直接爬取」的可行性**：纯页面内 JS（控制台 / 书签脚本）
+  **不可行** —— 同源策略与 CORS 会拦掉跨域 `fetch`，而 `mode: 'no-cors'`
+  虽然能发出请求，拿到的却是 **opaque 响应，读不到任何内容**（JSONP 现代站点早已不提供）。
+  真正可行的是**浏览器扩展 / 油猴脚本**：扩展在 `manifest.json` 里声明
+  `host_permissions`，**不受 CORS 限制**，且天然运行在真实登录态与真实指纹里 ——
+  这是从原理上规避「IP 被封 / 被识别为自动化」的最优解，
+  因为根本不存在「集中 IP 访问」这个特征。
+- **节流与合规现状（如实记录）**：
+  - 已有：随机延时、指数退避 + 抖动、风控信号检测与自适应降速、代理配置、
+    无意义请求前置拦截（未收录城市 / 未实现平台不发请求）；
+  - **尚未接入：`BaseCrawler.check_robots_allowed()` 已实现 robots.txt 解析逻辑，
+    但全项目没有任何调用方** —— 目前等于没有合规检查。接入时建议按平台缓存结果，
+    并把「命中 Disallow」处理为**明确失败**而不是静默跳过；
+  - 尚缺：跨任务全局 QPS 上限、单平台日配额、采集时段打散
+    （18 组任务集中在凌晨 02:00 连跑，比分散在日间更不像人类行为）。
 - **清洗规则**：9 个高级词 / 10 个无效词过滤规则，68 项技能词典抽取
 - **去重**：SHA-256 对岗位指纹去重，避免重复入库
 - **前置校验（宁可明确失败，不给错数据）**：爬取前先校验平台与城市，把两类
@@ -389,6 +414,45 @@ python scripts/eval_rag.py --output reports/rag_evaluation.md
 | `GET /api/reports/{id}/download` | 下载 Excel |
 | `POST /api/reports/{id}/push` | 手动推送到 Webhook（用于「当时没配好、事后补推」；未配置时返回 400 并说明原因） |
 
+### 12. 版本自证与迭代发布
+
+绿色版软件最常见的排障困境是「用户说功能没生效，其实是他在跑三个月前的 exe」。
+这一块专门解决「你现在跑的是哪一版、要不要更新、怎么更新」。
+
+| 组件 | 说明 |
+|---|---|
+| `app/version.py` | **版本号唯一来源**（`APP_VERSION`）。此前只以字面量出现在 `main.py`，打包脚本 / CHANGELOG / 更新检查 / 前端各存一份必然漂移 |
+| `CHANGELOG.md` | 按[语义化版本](https://semver.org/lang/zh-CN/)记录每版变更；`0.x` 条目是按提交历史回溯整理的里程碑，`1.0.0` 起与 tag 一一对应 |
+| `GET /api/system/version` | 返回版本、**发行形态**（`frozen-exe` / `source`）、Python 与系统版本，并给出**差异化升级指引**（绿色版下载压缩包，源码版 `git pull`） |
+| `GET /api/system/update-check` | 比对 GitHub Release 最新 tag 与当前版本 |
+
+设计要点：
+
+- **版本比较按数字而非字典序**：字典序下 `"1.10.0" < "1.9.0"`，会把新版判成旧版。
+  这一条有专门的回归用例；
+- **检查更新永不失败**：网络不可达、被限流、仓库还没发过 Release、响应结构变了，
+  都以 `status` 字段如实返回（`disabled` / `unconfigured` / `no_release` / `error` / `ok`），
+  不会把接口打成 500，也不会让前端弹红色错误；
+- **不做启动时自动联网**：只在接口被调用时才发请求。绿色版可能跑在内网或离网机器上，
+  启动即联网只会带来无谓等待与失败日志；
+- **发版纪律**：GitHub Release 的 tag 必须与 `APP_VERSION` 一致（`v1.0.0`），
+  否则会出现「明明发了新版却提示已是最新」。
+
+迭代流程（发布新版本）：
+
+```bash
+# 1. 改 app/version.py 的 APP_VERSION，并在 CHANGELOG.md 顶部补一条
+# 2. 跑全量测试，确保绿
+python -m pytest -q
+
+# 3. 打包通用版（会读取 APP_VERSION）
+build-exe.bat
+
+# 4. 打 tag 并推送，然后在 GitHub 网页发 Release、上传 dist/RecSys 的压缩包
+git tag v1.0.1 && git push origin v1.0.1
+```
+
+
 > 评估全程在内存库中进行，不触碰项目数据；缺少向量化后端时**跳过并说明原因**，
 > 而不是把环境问题呈现为"语义检索命中率 0%"。
 
@@ -487,7 +551,7 @@ python -m pytest tests/ -q
 ## 七、测试
 
 ```bash
-python -m pytest tests/ -v        # 全量 547 项
+python -m pytest tests/ -v        # 全量 594 项
 python -m pytest tests/test_auth_api.py -v   # 单个模块
 ```
 
@@ -529,7 +593,8 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 | `test_boss_crawler.py` | 5 | 真实 `BossCrawler.crawl()` 端到端（此前用例把 `crawl_with_retry` 整个替换成桩函数，从未执行过 crawl 本体） |
 | `test_db_engine_dialect.py` | 4 | SQLite 不得传 `pool_size` / `max_overflow`，MySQL/PostgreSQL 仍需连接池 |
 | `test_startup_bootstrap.py` | 2 | 空库启动自举（建表 + 建默认管理员）与二次启动幂等 |
-| **合计** | **547**（含日报 32 + 51job 38 + 缓存 6 + 反爬 6 + 技能画像 6 + CSV 3 + 熔断 8 + 视觉 9 + 启动自举 2 + 引擎方言 4） | |
+| `test_version_update.py` | 47 | 版本解析与比较（含 `1.10.0 > 1.9.0` 的字典序陷阱）、仓库标识归一化、检查更新的 9 种状态、版本接口与发行形态 |
+| **合计** | **594**（含日报 32 + 51job 38 + 版本 47 + 缓存 6 + 反爬 6 + 技能画像 6 + CSV 3 + 熔断 8 + 视觉 9 + 启动自举 2 + 引擎方言 4） | |
 
 ### 稳定性与安全加固（P1 修复记录）
 

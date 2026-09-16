@@ -234,6 +234,13 @@ class Settings(BaseSettings):
     # 推送内容里最多列几个城市/技能，避免消息过长被机器人截断
     report_webhook_top_n: int = 5
 
+    # ---- 版本与更新检查 ----
+    # 指向 GitHub 仓库（owner/name，也接受完整 URL）。用于「检查更新」接口。
+    update_repo: str = "zanboring/recruitment-python"
+    # 默认开启，但**只在接口被调用时才发请求**（不做启动时自动联网）：
+    # 绿色版可能跑在内网/离网机器上，启动即联网只会带来无谓等待与失败日志。
+    update_check_enabled: bool = True
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, v):
