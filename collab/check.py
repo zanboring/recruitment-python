@@ -30,10 +30,11 @@ ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT / "collab" / ".state"
 STATE_FILE = STATE_DIR / "seen.json"
 
-INBOXES = {
-    "dev-trae": "inbox-trae.md",          # WorkBuddy 写给 Trae
-    "dev-workbuddy": "inbox-workbuddy.md",  # Trae 写给 WorkBuddy
-}
+# 收件箱：(文件名, 谁写, 谁读)。一个文件只有一个写者 → 结构上不可能冲突。
+INBOXES = (
+    ("inbox-trae.md", "WorkBuddy", "Trae"),
+    ("inbox-workbuddy.md", "Trae", "WorkBuddy"),
+)
 SIDES = {"dev-workbuddy": "WorkBuddy", "dev-trae": "Trae"}
 
 
@@ -128,23 +129,22 @@ def save_state(state: dict) -> None:
         pass  # 状态写不了不该影响检查本身
 
 
-def check_inbox(state: dict) -> None:
+def check_inbox(state: dict, me: str) -> None:
     """检查收件箱。自动判断「上次查看后是否有改动」，无需手工标记已读。"""
+    import hashlib
+
     seen = state.setdefault("inbox", {})
-    for branch, filename in INBOXES.items():
+    for filename, writer, reader in INBOXES:
         path = ROOT / "collab" / filename
-        who = SIDES.get(branch, branch)
         if not path.exists():
             out(f"  {filename}：尚未创建")
             continue
-
-        import hashlib
 
         content = path.read_text(encoding="utf-8", errors="replace")
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
         prev = seen.get(filename)
 
-        # 统计消息条数（约定：每条消息以 '## MSG' 开头）
+        # 约定：每条消息以行首 '## MSG' 开头
         count = sum(1 for line in content.splitlines() if line.startswith("## MSG"))
 
         if prev is None:
@@ -153,7 +153,9 @@ def check_inbox(state: dict) -> None:
             flag = "★ 有更新，建议查看"
         else:
             flag = "无新消息"
-        out(f"  {filename}（{who} 写给自己以外的一方）— 消息 {count} 条，{flag}")
+
+        mine = "  ← ★ 这是你要读的" if reader == me else ""
+        out(f"  {filename}  由 {writer} 写、给 {reader} 读 —— 消息 {count} 条，{flag}{mine}")
 
         seen[filename] = digest
     state["branch"] = current_branch()
@@ -208,7 +210,7 @@ def main() -> int:
 
     section("5. 收件箱")
     state = load_state()
-    check_inbox(state)
+    check_inbox(state, who_me)
     save_state(state)
 
     out()
