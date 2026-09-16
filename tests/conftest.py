@@ -5,7 +5,9 @@
    保证「克隆下来就能跑」；生产仍走 MySQL，由 DATABASE_URL 决定。
 2. 使用 StaticPool —— SQLite 内存库的连接销毁即丢数据，必须让所有
    session 复用同一条连接。
-3. 关闭 GLM-4 / Ollama：测试环境没有真 key，避免写出依赖网络的用例。
+3. 关闭云端模型（DeepSeek / GLM-4）与 Ollama：测试环境没有真 key，
+   也避免写出依赖网络的用例；且两个云端 key 都要清，
+   否则本机 .env 配了 key 的开发者会走到 primary 分支，令降级类用例失败。
 4. 每个用例重置限流器与 AI 会话状态，避免用例之间互相污染。
 
 运行方式（项目根目录）：
@@ -17,7 +19,12 @@ import os
 # 仓库根目录有 .env 时以 .env 为准；没有 .env（CI / 他人机器）时用下面的兜底值。
 os.environ.setdefault("JWT_SECRET", "pytest-only-secret-key-not-for-production")
 os.environ.setdefault("JWT_EXPIRATION", "3600000")
-# DB_URL 由下方 TEST_DB_URL fixture 提供（:memory:），此处不再 setdefault
+# 必须兜底 DB_URL，不能只靠下方 TEST_DB_URL fixture：
+# app/database.py 在 **模块导入时** 就 create_async_engine(DATABASE_URL)，
+# 没有 .env 时 db_url 为空 → 回落到默认 MySQL → 立刻 import aiomysql，
+# 该驱动在纯测试环境可不装，于是 collection 阶段直接 ModuleNotFoundError。
+# 用例本身仍用 TEST_DB_URL(:memory:) 覆盖 get_db，这里只是让导入不炸。
+os.environ.setdefault("DB_URL", "sqlite+aiosqlite:///:memory:")
 
 import pytest
 import pytest_asyncio
