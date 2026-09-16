@@ -73,17 +73,18 @@ recruitment-python/
 │   ├── database.py          # 异步引擎与会话工厂
 │   ├── scheduler.py         # APScheduler 定时爬取
 │   ├── init_data.py         # 建表 + 初始化数据
-│   ├── routers/             # 9 个路由模块（85 个接口，含 compat.py 兼容层）
+│   ├── routers/             # 10 个路由模块（93 个 API 端点，含 compat.py 兼容层）
 │   │   ├── auth.py          #   4  认证
-│   │   ├── jobs.py          #   20 岗位 / 统计 / 导出
+│   │   ├── jobs.py          #   20 岗位 / 统计 / 导出 / 导入
 │   │   ├── ai.py            #   5  AI 对话
 │   │   ├── model.py         #   6  模型配置管理
 │   │   ├── knowledge.py     #   12 知识库
 │   │   ├── crawler.py       #   3  爬取任务
+│   │   ├── report.py        #   6  自动化日报（生成 / 列表 / 详情 / 下载 / 推送）
 │   │   ├── user.py          #   5  用户管理
 │   │   ├── log.py           #   3  系统日志
 │   │   └── compat.py        #   21 Java 版前端兼容层（别名路由）
-│   ├── services/            # 14 个业务服务
+│   ├── services/            # 20 个业务服务
 │   │   ├── ai_service.py           # 三级降级 + SSE + 工具调用调度
 │   │   ├── react_agent.py          # ReAct 多步推理 Agent（Thought→Action→Observation 循环）
 │   │   ├── llm_client.py           # 云端统一调用层（OpenAI 兼容 + 多供应商容灾）
@@ -91,12 +92,14 @@ recruitment-python/
 │   │   ├── tool_service.py         # Function Calling 工具定义与执行
 │   │   ├── embedding_service.py    # 向量化与余弦相似度
 │   │   ├── knowledge_service.py    # 语义检索 + 关键词降级
+│   │   ├── report_service.py       # 日报聚合 / Excel 透视 / 推送编排
+│   │   ├── webhook_service.py      # 企业微信 / 钉钉 / 通用 Webhook 推送
 │   │   ├── local_model_service.py  # 规则引擎兜底
 │   │   ├── usage_service.py        # Token 用量与成本统计
 │   │   └── ...                     # auth / crawler / export / job / model
-│   ├── models/              # 7 个 SQLAlchemy 模型（含 ai_usage 用量表）
+│   ├── models/              # 8 个 SQLAlchemy 模型（含 ai_usage 用量表、daily_report 日报表）
 │   ├── schemas/             # 6 组 Pydantic Schema
-│   ├── crawlers/            # BaseCrawler 抽象类 + BossCrawler + 清洗器
+│   ├── crawlers/            # BaseCrawler 抽象类 + boss / job51 平台爬虫 + 注册表 + 清洗器
 │   ├── recommender/         # Jaccard 相似度 + 薪资预测 + 多因子分析
 │   ├── evaluation/          # RAG 检索效果评估（黄金集 + 指标 + 多策略对比）
 │   ├── middleware/          # 滑动窗口限流、请求上下文、camelCase 字段兼容
@@ -198,17 +201,31 @@ recruitment-python/
 
 ### 3. 数据采集与清洗
 
-- **抽象基类 `BaseCrawler`**：统一调度、限速、重试、去重流程，`BossCrawler` 继承实现平台解析
-- **反爬策略**：10 个 User-Agent 轮换、请求间隔 12–18 秒随机延时、失败后 4 次指数退避重试
+- **抽象基类 `BaseCrawler`**：统一调度、限速、重试、去重流程，各平台爬虫继承实现自己的解析
+- **已接入平台**：`boss`（BOSS 直聘）、`51job`（前程无忧）。
+  平台标识 → 爬虫类收敛在 `app/crawlers/registry.py`，`SUPPORTED_PLATFORMS` 由注册表派生 ——
+  此前它写死在服务层（`{"boss"}`）且实例化也硬编码，新增平台时容易漏登记，
+  接口会把新平台误判为「未实现」。新增平台现在只需在注册表加一行。
+- **反爬策略**：10 个 User-Agent 轮换、完整浏览器请求头（UA 与 Sec-CH-UA 平台协变，
+  只换 UA 仍会被识别为自动化）、请求间隔 12–18 秒随机延时、失败后 4 次指数退避重试、
+  风控信号（429 / 验证码 / 滑块）检测后自适应放大延迟
+- **51job 实现要点**（`app/crawlers/job51.py`）：
+  - 走 51job 前端自用的搜索接口取 JSON，而不是解析 HTML —— 该站搜索结果页是前端渲染的，
+    抓 HTML 只会得到「看起来正常但永远为空」的静默失败
+  - 接口字段用别名表兜住版本差异；取不到岗位数组时返回 `None`，
+    让调用方区分「响应结构变了」与「这页真的没有岗位」
+  - 薪资写法比 BOSS 杂得多（`1-1.5万` / `8千-1.2万` / `15-25万/年` / `1-1.5万·13薪`），
+    有独立解析器并统一折算为月薪；日薪、时薪、面议一律留空，不换算假数据
+  - 城市编码取自 51job 搜索页 URL 的 `jobArea` 参数，经三个独立公开来源交叉核对一致
 - **清洗规则**：9 个高级词 / 10 个无效词过滤规则，68 项技能词典抽取
 - **去重**：SHA-256 对岗位指纹去重，避免重复入库
 - **前置校验（宁可明确失败，不给错数据）**：爬取前先校验平台与城市，把两类
   「必然失败」的请求拦在网络请求之前 ——
   - **未收录城市**：曾对未收录城市回退到北京的城市编码，于是搜「南昌」实际爬的是
     北京岗位，数据看着正常但城市是错的，且不报错不留痕。现在直接失败并列出已收录城市；
-  - **未实现平台**：前端原先硬编码 4 个平台而当前只实现 `boss`，会静默跳过并把任务标成
-    「已完成 / 0 条」。现在全部未实现则任务 FAILED 并写明原因，部分未实现则在
-    `message` 中列出被跳过的平台。
+    51job 沿用同一纪律，未收录城市同样显式报错、不发请求；
+  - **未实现平台**：会静默跳过并把任务标成「已完成 / 0 条」。现在全部未实现则任务
+    FAILED 并写明原因，部分未实现则在 `message` 中列出被跳过的平台。
 
   支持范围通过 `GET /api/crawler/options`（兼容层同路径 `GET /api/crawl/options`，
   两者返回结构完全一致）暴露为**结构化**列表：`platforms` 每项含 `value` / `label`
@@ -342,6 +359,36 @@ python scripts/eval_rag.py --strategies keyword
 python scripts/eval_rag.py --output reports/rag_evaluation.md
 ```
 
+### 11. 自动化日报（聚合 → Excel → AI 摘要 → 可选推送）
+
+一条完整自动化链路，任一环节失败都不中断整条链：
+
+| 环节 | 实现 |
+|---|---|
+| 定时触发 | APScheduler，**触发时间与开关可在配置里改**（`REPORT_HOUR` / `REPORT_MINUTE` / `REPORT_ENABLED`），原先写死为 06:30 |
+| 数据聚合 | 复用可视化统计口径（只算在架岗位），保证日报数字与图表自洽 |
+| Excel 报表 | 8 个 sheet：总览 + **汇总统计（城市 × 平台 数据透视）** + 平台分布 + 城市分布 + 热门技能 + 学历要求 + 经验要求 + 薪资分布 |
+| AI 摘要 | 复用三级降级链（云端 → 本地 Ollama → 规则），并在 `generated_by` 如实标注实际生成层 |
+| 推送（可选） | 企业微信 / 钉钉 / 通用 Webhook，**默认关闭**，不配置就只在本地产出 Excel |
+
+设计要点：
+
+- **幂等**：`report_date` 唯一，同一天重复触发（定时 + 手动并发）直接返回已有记录；
+- **快照**：`stats_json` 保存生成时的统计，历史日报展示的是「当天看到的样子」，
+  不被后续数据变更污染；
+- **数据透视**：`城市 × 平台` 交叉表带合计行/列，能直接看出「某城市的数据由哪个平台贡献」——
+  「城市分布」+「平台分布」两张独立清单做不到这一点。长尾城市只列前 10，并在表内注明未列出数量；
+- **推送失败不影响日报**：推送是附加动作。HTTP 请求异常、非 200、以及
+  **HTTP 200 但业务错误码非 0**（企业微信/钉钉的 token 失效就是这样表达的）都算失败，
+  只写日志与 `message` 字段 —— 只看状态码会把这类失败记成「推送成功」，是最容易骗过监控的假成功。
+
+| 接口 | 说明 |
+|---|---|
+| `POST /api/reports/generate` | 手动生成当日日报（管理员，幂等） |
+| `GET /api/reports/latest` / `list` / `{id}` | 最新 / 列表 / 详情（详情含统计快照与推送配置状态） |
+| `GET /api/reports/{id}/download` | 下载 Excel |
+| `POST /api/reports/{id}/push` | 手动推送到 Webhook（用于「当时没配好、事后补推」；未配置时返回 400 并说明原因） |
+
 > 评估全程在内存库中进行，不触碰项目数据；缺少向量化后端时**跳过并说明原因**，
 > 而不是把环境问题呈现为"语义检索命中率 0%"。
 
@@ -440,7 +487,7 @@ python -m pytest tests/ -q
 ## 七、测试
 
 ```bash
-python -m pytest tests/ -v        # 全量 459 项
+python -m pytest tests/ -v        # 全量 547 项
 python -m pytest tests/test_auth_api.py -v   # 单个模块
 ```
 
@@ -477,7 +524,12 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 | `test_login_lockout.py` | 6 | 锁定期结束后恢复完整重试次数、剩余分钟数向上取整 |
 | `test_analysis_report.py` | 7 | AI 分析报告生成与降级、空库处理 |
 | `test_auth_api.py` + `test_react_agent.py` | 40 | 认证接口链路、ReAct 多步 Agent 的工具调用与终止条件 |
-| **合计** | **466**（含日报 11 + 缓存 6 + 反爬 6 + 技能画像 6 + CSV 3 + 熔断 8 + 视觉 9） | |
+| `test_job51_crawler.py` | 38 | 51job 薪资解析（万/千/年包/13薪）、城市编码、JSON 结构容错、字段与 job_key 口径、假 Playwright 驱动的翻页/风控/去重 |
+| `test_report_notify.py` | 32 | 平台维度聚合、城市×平台透视表合计自洽与截断、Excel 新 sheet 与旧快照兼容、三种机器人报文、`errcode != 0` 判失败、定时参数收敛 |
+| `test_boss_crawler.py` | 5 | 真实 `BossCrawler.crawl()` 端到端（此前用例把 `crawl_with_retry` 整个替换成桩函数，从未执行过 crawl 本体） |
+| `test_db_engine_dialect.py` | 4 | SQLite 不得传 `pool_size` / `max_overflow`，MySQL/PostgreSQL 仍需连接池 |
+| `test_startup_bootstrap.py` | 2 | 空库启动自举（建表 + 建默认管理员）与二次启动幂等 |
+| **合计** | **547**（含日报 32 + 51job 38 + 缓存 6 + 反爬 6 + 技能画像 6 + CSV 3 + 熔断 8 + 视觉 9 + 启动自举 2 + 引擎方言 4） | |
 
 ### 稳定性与安全加固（P1 修复记录）
 
@@ -512,6 +564,18 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 
 **已知取舍（P2）**：限流是单进程内存实现，多副本部署需换成 Redis 分布式计数器。
 
+### 第三轮加固（协作并行开发阶段）
+
+| 问题 | 修复 |
+|---|---|
+| **【P0】`BossCrawler.crawl()` 缺失 `return`**：函数在 `try` 块走完后直接结束，返回值恒为 `None`，而 `crawl_with_retry` 里的 `results or []` 于是永远得到空列表 —— **抓到的岗位全部被丢弃，任务状态却仍是 COMPLETED**（静默失败）。之所以长期未被发现：`test_crawler.py` 把 `crawl_with_retry` 整个替换成桩函数，**从未真正执行过 `crawl()` 本体** | 补上 `return results`，并新增 `test_boss_crawler.py`（假 Playwright 模块驱动真实 crawl 循环）——该文件在修复前 3 项失败 |
+| **【P0】通用版 exe 在干净机器上起不来**：建表只写在 `scripts/init_db.py`，打包后的 exe 没有任何入口建表，发布包也不带预置数据库 → 空库启动时 `init_default_admin` 先查 `user` 表即 `no such table: user`，`Application startup failed`。「任意电脑绿色软件、零依赖即用」的承诺在干净机器上不成立 | `lifespan` 中在初始化前 `create_all`（幂等，只建缺失表）；新增 `test_startup_bootstrap.py` 用子进程跑真实 lifespan，覆盖「空库启动」这一此前无任何用例触及的前提 |
+| **测试不 hermetic**：`conftest` 只清 `zhipuai_api_key`，未清 `deepseek_api_key`；本机 `.env` 配了真 key 的开发者会走通 primary 分支，令「必须降级到规则引擎」的用例失败、结果随本机配置漂移 | 两个云端 key 一并清空，并补 `DB_URL` 兜底（无 `.env` 时 `app.database` 会回落 MySQL 驱动，collection 阶段即 ImportError） |
+| **SQLite 下 import 期崩溃**：`app/database.py` 在模块导入时 `create_async_engine()`，却无条件传 `pool_size` / `max_overflow`；SQLite 内存库走 StaticPool、文件库走 SingletonThreadPool，都不接受这两个参数 → `TypeError`。而 SQLite 正是「通用版」与测试环境的默认库 | 抽成 `engine_kwargs_for(url)` 按方言裁剪，补 4 项回归用例 |
+| **平台注册两处维护**：`SUPPORTED_PLATFORMS` 写死在服务层、爬虫实例化也硬编码为 `BossCrawler()`，新增平台容易漏登记，接口会把新平台误判为「未实现」 | 收敛到 `app/crawlers/registry.py`，支持集合由注册表派生，实例化走 `get_crawler(platform)` |
+| **已知未处理（留给后续）**：`app/routers/jobs.py` 中 `VisionImportRequest` / `UrlImportRequest` 的字段名为 `validate`，遮蔽 Pydantic 的 `BaseModel.validate`，每次启动打印 2 条 UserWarning（Pydantic v3 会升级为硬错误） | 未改：该字段是对外契约（前端传 `validate=true`），重命名会造成破坏性变更。若需消除，可用 `Field(alias="validate")` + `ConfigDict(populate_by_name=True)` 把 Python 属性改名而保住契约 |
+
+
 ## 八、与 Java 版的对比
 
 | 维度 | Java 版 | 本版（Python） |
@@ -522,7 +586,7 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 | AI 接入 | 同步调用 | httpx 流式 + SSE + 三级降级 |
 | 知识库 | 关键词检索 | 语义向量检索（embedding-3 + RRF 混合）+ 关键词降级 |
 | 缓存 | — | Redis（可选）→ 内存降级 |
-| 自动化 | — | 每日日报（聚合 → Excel → AI 摘要） |
+| 自动化 | — | 每日日报（聚合 → Excel 透视 → AI 摘要 → 可选 Webhook 推送），触发时间可配置 |
 | 工具调用 | 无 | Function Calling（`query_jobs`） |
 | 日志 | AOP 切面 + `@Log` 注解 | 装饰器 |
 | 权限 | Spring Security + JWT | 手动 JWT 中间件 |
