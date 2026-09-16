@@ -19,6 +19,7 @@ from app.routers.log import router as log_router
 from app.routers.knowledge import router as knowledge_router
 from app.routers.model import router as model_router
 from app.routers.report import router as report_router
+from app.routers.settings import router as settings_router
 
 
 @asynccontextmanager
@@ -91,6 +92,7 @@ def create_app() -> FastAPI:
     app.include_router(knowledge_router)
     app.include_router(model_router)
     app.include_router(report_router)
+    app.include_router(settings_router)
 
     app.add_exception_handler(AppException, app_exception_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)

@@ -1,5 +1,76 @@
 <template>
   <div class="settings-page">
+    <!-- AI 服务配置卡片：填一次保存 → 写 config.env → 换电脑即用 -->
+    <el-card class="setting-card ai-card" shadow="never" style="margin-bottom: 20px">
+      <template #header>
+        <div class="card-header">
+          <div class="title">
+            <el-icon><MagicStick /></el-icon>
+            <span>AI 服务配置</span>
+          </div>
+          <el-tag size="small" type="success" v-if="savedFlag === 'ok'">已保存生效</el-tag>
+          <el-tag size="small" type="danger" v-else-if="savedFlag === 'err'">保存失败</el-tag>
+        </div>
+      </template>
+
+      <el-form label-width="150px" size="large">
+        <el-divider content-position="left">DeepSeek（智能对话 / 分析报告）</el-divider>
+        <el-form-item label="API Key">
+          <el-input
+            v-model="aiForm.deepSeekKey"
+            type="password" show-password clearable
+            placeholder="sk-...（填一次自动保存到 config.env，后续换电脑复制目录即用）"
+          />
+          <div class="form-tip" v-if="cfgStatus.deepSeekKey">
+            当前已配置：{{ cfgStatus.deepSeekKey }}
+          </div>
+        </el-form-item>
+        <el-form-item label="模型">
+          <el-input v-model="aiForm.deepSeekModel" placeholder="deepseek-flash（可改 deepseek-chat / deepseek-reasoner）" />
+        </el-form-item>
+
+        <el-divider content-position="left">智谱 GLM（视觉识别 / 链接导入必需）</el-divider>
+        <el-form-item label="API Key">
+          <el-input
+            v-model="aiForm.zhipuKey"
+            type="password" show-password clearable
+            placeholder="申请：https://open.bigmodel.cn"
+          />
+          <div class="form-tip" v-if="cfgStatus.zhipuKey">
+            当前已配置：{{ cfgStatus.zhipuKey }}
+          </div>
+        </el-form-item>
+
+        <el-divider content-position="left">本地模型 Ollama（可选）</el-divider>
+        <el-form-item label="启用 Ollama">
+          <el-switch v-model="aiForm.ollamaEnabled" />
+          <div class="form-tip" style="display:inline-block;margin-left:12px">
+            关闭后完全走云端；开启后可作为本地降级（零成本）
+          </div>
+        </el-form-item>
+        <el-form-item label="服务地址">
+          <el-input v-model="aiForm.ollamaBaseUrl" placeholder="http://localhost:11434" />
+        </el-form-item>
+        <el-form-item label="对话模型">
+          <el-input v-model="aiForm.ollamaModel" placeholder="qwen2.5:14b" />
+        </el-form-item>
+
+        <el-form-item>
+          <el-button type="primary" :loading="saving" @click="saveAiConfig" size="large">
+            <el-icon><Check /></el-icon>
+            保存并生效
+          </el-button>
+          <el-button size="large" @click="resetAiForm">
+            <el-icon><RefreshLeft /></el-icon>
+            重置
+          </el-button>
+          <span class="form-tip" style="margin-left:12px">
+            保存即写 config.env：重启软件后配置依旧生效
+          </span>
+        </el-form-item>
+      </el-form>
+    </el-card>
+
     <el-row :gutter="20">
       <el-col :span="16">
         <!-- 爬虫配置卡片 -->
@@ -123,8 +194,9 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, reactive, ref, computed } from 'vue';
 import { ElMessage } from 'element-plus';
-import { Setting, Connection, RefreshLeft, Monitor, List } from '@element-plus/icons-vue';
+import { Setting, Connection, RefreshLeft, Monitor, List, MagicStick, Check } from '@element-plus/icons-vue';
 import { createCrawlTask, fetchCrawlTasks, startCrawlTask } from '@/api/crawl';
+import { getProviderConfig, saveProviderConfig } from '@/api/settings';
 
 const form = reactive({
   sourceSites: ['boss', 'zhaopin', '51job'],
@@ -133,6 +205,66 @@ const form = reactive({
 });
 
 const loading = ref(false);
+
+// ---- AI 服务配置 ----
+const aiForm = reactive({
+  deepSeekKey: '',
+  deepSeekModel: 'deepseek-flash',
+  zhipuKey: '',
+  ollamaEnabled: false,
+  ollamaBaseUrl: 'http://localhost:11434',
+  ollamaModel: 'qwen2.5:14b'
+});
+const cfgStatus = reactive({ deepSeekKey: '', zhipuKey: '', loaded: false });
+const saving = ref(false);
+const savedFlag = ref('');
+
+const loadAiConfig = async () => {
+  try {
+    const c = await getProviderConfig() as any;
+    aiForm.deepSeekModel = c.deepseekModel || 'deepseek-flash';
+    aiForm.ollamaEnabled = (c.ollamaEnabled ?? false);
+    aiForm.ollamaBaseUrl = c.ollamaBaseUrl || 'http://localhost:11434';
+    aiForm.ollamaModel = c.ollamaModel || 'qwen2.5:14b';
+    cfgStatus.deepSeekKey = c.deepseekApiKey || '';
+    cfgStatus.zhipuKey = c.zhipuaiApiKey || '';
+    cfgStatus.loaded = true;
+  } catch (e) { /* 非致命：配置尽力加载 */ }
+};
+
+const saveAiConfig = async () => {
+  saving.value = true;
+  savedFlag.value = '';
+  try {
+    const payload: any = {
+      deepseekModel: aiForm.deepSeekModel.trim() || null,
+      ollamaEnabled: aiForm.ollamaEnabled,
+      ollamaBaseUrl: aiForm.ollamaBaseUrl.trim() || null,
+      ollamaModel: aiForm.ollamaModel.trim() || null
+    };
+    // 只在用户填了 Key 时提交（避免误清空已存 Key）
+    if (aiForm.deepSeekKey.trim()) payload.deepseekApiKey = aiForm.deepSeekKey.trim();
+    if (aiForm.zhipuKey.trim()) payload.zhipuaiApiKey = aiForm.zhipuKey.trim();
+    const res = await saveProviderConfig(payload) as any;
+    if (res && res.written && res.written.length) {
+      ElMessage.success('AI 配置已保存生效：' + res.written.join(', '));
+    }
+    savedFlag.value = 'ok';
+    await loadAiConfig();
+  } catch (e) {
+    savedFlag.value = 'err';
+    ElMessage.error('保存失败，请重试');
+  } finally {
+    saving.value = false;
+  }
+};
+
+const resetAiForm = () => {
+  aiForm.deepSeekKey = '';
+  aiForm.zhipuKey = '';
+  loadAiConfig();  // 恢复为已保存的实际配置
+};
+
 const taskId = ref<number | null>(null);
 const tasks = ref<any[]>([]);
 let timer: number | undefined;
@@ -186,6 +318,7 @@ const getStatusText = (status: string) => {
 
 onMounted(async () => {
   await loadTasks();
+  loadAiConfig();
   timer = window.setInterval(loadTasks, 5000);
 });
 

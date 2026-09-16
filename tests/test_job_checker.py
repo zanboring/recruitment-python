@@ -119,3 +119,185 @@ async def test_run_sweep_only_active_with_url(db_session, monkeypatch):
 async def test_url_import_invalid_url():
     with pytest.raises(RuntimeError, match="合法的 http"):
         await url_import_service.import_job_from_url(None, "not-a-url")
+
+@pytest.mark.asyncio
+async def test_fetch_page_via_http_success(monkeypatch):
+    """HTTP 直抓成功：返回去标签的正文与原始 HTML。"""
+    import httpx
+
+    html = "<html><body><h1>Python工程师</h1><p>岗位职责：开发系统</p></body></html>"
+
+    class FakeResp:
+        status_code = 200
+        text = html
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return FakeResp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    text, raw = await url_import_service._fetch_page_via_http("https://example.com/job/1")
+    assert "Python工程师" in text
+    assert raw == html
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_via_http_404_returns_none(monkeypatch):
+    """非 200 状态码视为无内容，返回 (None, None)。"""
+    import httpx
+
+    class FakeResp:
+        status_code = 404
+        text = ""
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return FakeResp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    assert await url_import_service._fetch_page_via_http("https://example.com/gone") == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_open_page_text_http_fallback_without_playwright(monkeypatch):
+    """无 Playwright（exe 环境）时：HTTP 拿到实质内容直接返回，不抛错。"""
+    import httpx
+
+    long_html = "<html><body>" + "<p>岗位职责：" + "详细职责" * 100 + "</p></body></html>"
+
+    class FakeResp:
+        status_code = 200
+        text = long_html
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return FakeResp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    # 模拟 playwright 不可用
+    def boom():
+        raise ImportError("no playwright")
+    monkeypatch.setattr(url_import_service, "_fetch_page_via_http", url_import_service._fetch_page_via_http)  # 保留真实现
+    # 直接 monkeypatch sys.modules 中 playwright 不可导入：改用源头封堵
+    import builtins
+    orig_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "playwright.async_api":
+            raise ImportError("no playwright in exe")
+        return orig_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    text, raw = await url_import_service.open_page_text("https://example.com/job/1")
+    assert "详细职责" in text
+
+
+@pytest.mark.asyncio
+async def test_open_page_text_spa_shell_falls_back_to_playwright(monkeypatch):
+    """HTTP 拿到 SPA 空壳（正文过短）时回退 Playwright 渲染。"""
+    import httpx
+
+    shell_html = "<html><body><div id=app></div></body></html>"  # 空壳，正文 < 120
+
+    class FakeResp:
+        status_code = 200
+        text = shell_html
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return FakeResp()
+
+    rendered_html = "<html><body><p>渲染后的真实岗位详情内容</p></body></html>"
+
+    class FakePage:
+        async def goto(self, *a, **k):
+            return None
+
+        async def wait_for_timeout(self, *a):
+            return None
+
+        async def content(self):
+            return rendered_html
+
+    class FakeBrowser:
+        async def new_page(self, *a, **k):
+            return FakePage()
+
+        async def close(self):
+            return None
+
+    class FakePlaywright:
+        def __init__(self, browser_object):
+            self._browser = browser_object
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        @property
+        def chromium(self):
+            return self
+
+        async def launch(self, **k):
+            return self._browser
+
+    class FakeAsyncPlaywright:
+        def __init__(self):
+            self.browser = FakeBrowser()
+            self._inner = FakePlaywright(self.browser)
+
+        def __call__(self):
+            return self._inner
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    import builtins
+    orig_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "playwright.async_api":
+            mod = type("M", (), {"async_playwright": FakeAsyncPlaywright()})()
+            return mod
+        return orig_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    text, raw = await url_import_service.open_page_text("https://example.com/spa-job")
+    assert "渲染后的真实岗位详情" in text
