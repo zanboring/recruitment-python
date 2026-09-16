@@ -194,6 +194,11 @@ class BossCrawler(BaseCrawler):
             logger.error("Playwright is not installed. Please install with: pip install playwright && playwright install chromium")
             raise
 
+        # 必须 return：此前本函数走完 try 块就直接结束，返回值恒为 None，
+        # 于是 crawl_with_retry 里的 `results or []` 永远拿到空列表 ——
+        # 抓到的岗位被静默丢弃，任务状态却记成 COMPLETED，属于静默失败。
+        return results
+
     async def parse_page(self, page_content: str, keyword: str) -> List[Dict]:
         jobs = []
         soup = BeautifulSoup(page_content, "html.parser")
