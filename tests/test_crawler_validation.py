@@ -94,15 +94,15 @@ async def test_未收录城市让任务明确失败(db_session):
 
 @pytest.mark.asyncio
 async def test_全部平台未实现时任务失败并写明原因(db_session):
-    """前端可选 zhaopin/51job/liepin，但后端只实现了 boss。"""
+    """前端可选 zhaopin/liepin（尚未实现），此任务必须明确失败。"""
     task = await crawler_service.create_pending_task(
-        db_session, "Java", "长沙", ["zhaopin", "51job"]
+        db_session, "Java", "长沙", ["zhaopin", "liepin"]
     )
-    count = await crawler_service.run_crawl(db_session, task, "Java", "长沙", ["zhaopin", "51job"])
+    count = await crawler_service.run_crawl(db_session, task, "Java", "长沙", ["zhaopin", "liepin"])
 
     assert count == 0
     assert task.status == "FAILED"
-    assert "zhaopin" in task.message and "51job" in task.message
+    assert "zhaopin" in task.message and "liepin" in task.message
     assert "boss" in task.message          # 告诉调用方实际支持什么
 
 
@@ -213,8 +213,14 @@ async def test_可选项接口暴露真实支持范围(client, db_session):
     assert by_value["zhaopin"]["implemented"] is False
     assert by_value["zhaopin"]["label"] == "智联招聘"
 
-    # 已实现的排在前面 —— 前端可直接按顺序渲染
-    assert data["platforms"][0]["value"] == "boss"
+    # 51job 已接入（app/crawlers/job51.py），应标记为可用
+    assert by_value["51job"]["implemented"] is True
+    assert by_value["51job"]["label"] == "前程无忧"
+
+    # 已实现的排在前面 —— 前端可直接按顺序渲染。
+    # 这里断言「排序性质」而不是写死某个平台名：新增平台时无需改测试。
+    implemented_flags = [p["implemented"] for p in data["platforms"]]
+    assert implemented_flags == sorted(implemented_flags, reverse=True)
 
     # 城市为全量收录清单，而不是前端那 11 个
     assert "长沙" in data["cities"]

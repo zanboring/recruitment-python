@@ -14,7 +14,7 @@ from datetime import timedelta
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.crawlers.boss import BossCrawler
+from app.crawlers.boss import BossCrawler  # noqa: F401  保留：兼容既有引用与测试的 monkeypatch 目标
 from app.crawlers.cleaner import (
     deduplicate_jobs,
     extract_skills,
@@ -22,6 +22,7 @@ from app.crawlers.cleaner import (
     is_invalid_job,
     is_senior_job,
 )
+from app.crawlers.registry import SUPPORTED_PLATFORMS, get_crawler
 from app.models.crawl_task import CrawlTask
 from app.models.job import Job
 
@@ -30,8 +31,8 @@ logger = logging.getLogger(__name__)
 # 岗位被判定下架前允许的「未再出现」宽限期（秒）。
 OFFLINE_GRACE_SECONDS = 6 * 3600
 
-# 已实现的抓取平台。未实现的平台会被请求前置校验拦下并给出明确原因。
-SUPPORTED_PLATFORMS = {"boss"}
+# 已实现的抓取平台自 ``app.crawlers.registry.CRAWLER_REGISTRY`` 派生
+# （此前写死 {"boss"}，新增平台时容易忘了同步这里，接口就把新平台误判为未实现）。
 
 # ---- 平台元数据（标识 → 中文名 / 是否已实现）----
 #
@@ -179,7 +180,7 @@ async def _crawl_platform(db: AsyncSession, keyword: str, city: str, platform: s
 
     返回 (新增条数, 本次抓到的 job_key 列表)。
     """
-    crawler = BossCrawler()
+    crawler = get_crawler(platform)
     # 走带指数退避的 retry 包装，而不是裸调用 crawl()：
     # 否则目标站点一次抖动就会让整个任务 FAILED。
     jobs = await crawler.crawl_with_retry(keyword, city)
