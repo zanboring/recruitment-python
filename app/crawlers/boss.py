@@ -130,6 +130,23 @@ class BossCrawler(BaseCrawler):
                 continue
         raise TimeoutError(f"None of the selectors found: {selectors}")
 
+    async def _launch_context(self, playwright):
+        """按配置启动浏览器上下文：完整请求头 + 可选代理。"""
+        launch_kwargs = {"headless": True}
+        proxy = settings.crawl_proxy
+        if proxy:
+            # 支持 http://user:pass@host:port 与 http://host:port 两种形式
+            launch_kwargs["proxy"] = {"server": proxy}
+        browser = await playwright.chromium.launch(**launch_kwargs)
+
+        headers = self.get_random_headers()
+        context = await browser.new_context(
+            user_agent=headers.pop("User-Agent"),
+            extra_http_headers=headers,
+            viewport={"width": 1920, "height": 1080},
+        )
+        return browser, context
+
     async def crawl(self, keyword: str, city: str = "") -> List[Dict]:
         results = []
         # 未收录城市直接抛错。此前用「查不到就回退北京编码」，会把北京的岗位
@@ -142,11 +159,7 @@ class BossCrawler(BaseCrawler):
             from playwright.async_api import async_playwright
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent=self.get_random_ua(),
-                    viewport={"width": 1920, "height": 1080}
-                )
+                browser, context = await self._launch_context(p)
                 page = await context.new_page()
 
                 while len(results) < settings.crawl_max_jobs:
@@ -157,6 +170,12 @@ class BossCrawler(BaseCrawler):
                         logger.info(f"Using selector: {found_selector}")
                         await asyncio.sleep(2)
                         html = await page.content()
+                        # 风控检测：验证码/安全验证等信号出现时标记降速并跳过该页，
+                        # 绝不把「验证码页」当「无岗位结果」静默入库。
+                        if self.detect_blocked(html, 200):
+                            self.mark_blocked()
+                            logger.warning(f"Page {page_num} 触发风控信号，跳过并自适应降速")
+                            break
                         page_results = await self.parse_page(html, keyword)
                         if not page_results:
                             break
@@ -174,9 +193,6 @@ class BossCrawler(BaseCrawler):
         except ImportError:
             logger.error("Playwright is not installed. Please install with: pip install playwright && playwright install chromium")
             raise
-
-        cleaned = [clean_job_data(job) for job in results]
-        return cleaned[:settings.crawl_max_jobs]
 
     async def parse_page(self, page_content: str, keyword: str) -> List[Dict]:
         jobs = []
@@ -198,6 +214,17 @@ class BossCrawler(BaseCrawler):
                 salary = salary_elem.get_text(strip=True) if salary_elem else ""
                 company_name = company_elem.get_text(strip=True) if company_elem else ""
                 city = location_elem.get_text(strip=True) if location_elem else ""
+
+                # 尽力提取岗位详情链接（卡片通常是 <a href=".../job_detail/xxx">）；
+                # 找不到则留空 —— job_checker 会跳过无 URL 岗位的存活核查。
+                job_url = ""
+                anchor = card.find("a", href=True) if hasattr(card, "find") else None
+                if anchor and anchor.get("href"):
+                    href = anchor["href"].strip()
+                    if href.startswith("/"):
+                        href = "https://www.zhipin.com" + href
+                    if href.startswith("http"):
+                        job_url = href
 
                 experience = ""
                 education = ""
@@ -227,6 +254,7 @@ class BossCrawler(BaseCrawler):
                     # 原先用 BOSS 的 jobId，与管理端新增岗位的口径不同，
                     # 同一岗位经两个入口会算出不同的键而重复入库。
                     "job_key": generate_job_key(self.source_site, title, company_name, city),
+                    "url": job_url,
                     "description": title + " " + ",".join(skills),
                 })
             except Exception as e:

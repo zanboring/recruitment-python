@@ -166,6 +166,7 @@ async def save_job(db: AsyncSession, job_data: dict) -> bool:
         min_salary=job_data["min_salary"],
         max_salary=job_data["max_salary"],
         skills=job_data["skills"],
+        url=job_data.get("url", ""),
         job_desc=job_data["description"],
         last_seen_at=_utc_now(),
     )

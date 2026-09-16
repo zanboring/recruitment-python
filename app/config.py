@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import sys
+from pathlib import Path
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,11 +17,39 @@ def interpolate_env_vars(content: str) -> str:
     return re.sub(pattern, replace_var, content)
 
 
-def load_env_with_interpolation(env_file: str = ".env") -> dict:
+def _candidate_env_files() -> list:
+    """按优先级返回候选配置文件路径。
+
+    通用版（发布软件）场景下，用户把 config.env 放在 exe 同目录即可，
+    不需要碰任何代码 —— 「别的电脑只放 config.env 配好 API key 即用」。
+    优先级：exe 同级 config.env > 项目根 config.env > 项目根 .env。
+    """
+    candidates = []
+    # 兜底 .env（本地调试版）放在最前，会被后续的 config.env 覆盖
+    candidates.append(str(Path(__file__).resolve().parent.parent / ".env"))
+    if getattr(sys, "frozen", False):
+        # PyInstaller 打包后：exe 所在目录 config.env（最高优先级）
+        candidates.append(str(Path(sys.executable).resolve().parent / "config.env"))
+    else:
+        # 源码运行：项目根 config.env（最高优先级）
+        candidates.append(str(Path(__file__).resolve().parent.parent / "config.env"))
+    return candidates
+
+
+def load_env_with_interpolation(env_file: str = "") -> dict:
+    """读取候选配置文件，后面的文件覆盖前面的同名变量。
+
+    设计成「候选列表逐个叠加」而非「只读一个」：通用版用户的 config.env
+    可只写要覆盖的 key（API Key 等），其余配置继续从 .env 兜底；
+    未携带任何文件时返回 {}（全部用环境变量 / 默认值）。
+    """
+    files = [env_file] if env_file else _candidate_env_files()
     env_vars = {}
-    if os.path.exists(env_file):
-        with open(env_file, "r", encoding="utf-8") as f:
-            for line in f:
+    for f in files:
+        if not f or not os.path.exists(f):
+            continue
+        with open(f, "r", encoding="utf-8") as fh:
+            for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
@@ -33,6 +63,9 @@ class Settings(BaseSettings):
     # ``production`` enables fail-fast checks at application startup.
     app_env: str = "development"
     db_url: str = ""
+    # 数据库类型：mysql（默认）| postgres | sqlite。
+    # 显式设置 DB_URL 时以 DB_URL 为准（优先级更高）。
+    db_type: str = "mysql"
     db_host: str = "localhost"
     db_port: int = 3306
     db_name: str = "recruitment_db"
@@ -124,6 +157,13 @@ class Settings(BaseSettings):
     # 工具识别只需输出一行 JSON 或 NONE，128 足够
     ai_tool_detect_max_tokens: int = 128
 
+    # ---- 熔断器（防级联雪崩）----
+    # 云端连续失败 N 次后进入 OPEN，冷却期内快速失败（不发起真实请求），
+    # 半开后放行一个试探请求。false 可整体关闭。
+    ai_circuit_breaker_enabled: bool = True
+    circuit_breaker_failure_threshold: int = 3
+    circuit_breaker_cooldown_seconds: int = 30
+
     # ---- Token 用量与成本统计 ----
     # 记录每次 LLM / embedding 调用的 token 消耗、耗时与降级路径，用于成本核算。
     # 单价按「元 / 百万 token」计，默认值仅供估算，请按实际采购价调整。
@@ -139,9 +179,25 @@ class Settings(BaseSettings):
     crawl_retry_times: int = 4
     crawl_delay_min: int = 12
     crawl_delay_max: int = 18
+    crawl_adaptive_delay_factor: tuple = (8, 16)
+    crawl_proxy: str = ""
     crawl_timeout: int = 45
 
+    # ---- 岗位存活核查（job_checker）----
+    # 默认开启：启动后后台慢速核查已存 URL 的岗位是否仍在线
+    job_checker_enabled: bool = True
+    job_checker_batch_size: int = 10        # 每轮核查条数（慢速小批）
+    checker_delay_min: float = 8.0         # 两条之间随机延迟下限（秒）
+    checker_delay_max: float = 15.0        # 随机延迟上限（秒）
+    job_checker_round_interval: int = 4    # 两轮之间间隔（小时）
+
     server_port: int = 8080
+
+    # ---- Redis 缓存（可选）----
+    # 配置 REDIS_URL（如 redis://localhost:6379/0）后启用 Redis 缓存；
+    # 留空或连接失败时自动降级为进程内内存缓存，业务无感知。
+    redis_url: str = ""
+    redis_cache_ttl: int = 600
     cors_origins: list[str] = ["http://localhost:5173"]
 
     # ---- 接口限流（滑动窗口，单进程内存实现）----

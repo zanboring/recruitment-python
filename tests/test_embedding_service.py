@@ -78,7 +78,7 @@ class TestEmbedTexts:
                 asyncio.run(embed_texts(["你好"]))
 
     def test_命中缓存不重复请求(self):
-        invalidate_embedding_cache()
+        asyncio.run(invalidate_embedding_cache())
         with patch.object(es.settings, "zhipuai_api_key", "fake-key"), \
              patch.object(es, "_embed_batch", new=AsyncMock(return_value=[[0.1, 0.2]])) as mock_batch:
             first = asyncio.run(embed_texts(["同一句话"]))
@@ -88,7 +88,7 @@ class TestEmbedTexts:
             assert first == second == [[0.1, 0.2]]
 
     def test_顺序与输入一致(self):
-        invalidate_embedding_cache()
+        asyncio.run(invalidate_embedding_cache())
         with patch.object(es.settings, "zhipuai_api_key", "fake-key"), \
              patch.object(es, "_embed_batch", new=AsyncMock(return_value=[[1.0], [2.0]])) as mock_batch:
             out = asyncio.run(embed_texts(["甲", "乙"]))
@@ -98,10 +98,10 @@ class TestEmbedTexts:
 
 class TestInvalidate:
     def test_清空缓存后需重新请求(self):
-        invalidate_embedding_cache()
+        asyncio.run(invalidate_embedding_cache())
         with patch.object(es.settings, "zhipuai_api_key", "fake-key"), \
              patch.object(es, "_embed_batch", new=AsyncMock(return_value=[[9.9]])) as mock_batch:
             asyncio.run(embed_texts(["缓存失效测试"]))
-            invalidate_embedding_cache()
+            asyncio.run(invalidate_embedding_cache())
             asyncio.run(embed_texts(["缓存失效测试"]))
             assert mock_batch.await_count == 2

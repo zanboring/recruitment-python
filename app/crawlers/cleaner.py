@@ -104,6 +104,7 @@ def clean_job_data(job: Dict) -> Dict:
         "skills": job.get("skills", "").strip(),
         "source_site": job.get("source_site", "").strip(),
         "job_key": job.get("job_key", "").strip(),
+        "url": (job.get("url") or "").strip(),
         "description": job.get("description", "").strip()[:5000],
     }
 

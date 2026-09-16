@@ -75,7 +75,9 @@ def _reset_in_memory_state():
     """
     from app.middleware.rate_limit import default_limiter
     from app.services import ai_service
+    from app.cache import cache as test_cache
 
+    test_cache.clear_sync()
     default_limiter.reset()
     ai_service.reset_runtime_state()
     yield

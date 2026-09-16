@@ -107,3 +107,86 @@ class BaseCrawler(ABC):
 
     def get_random_ua(self) -> str:
         return random.choice(USER_AGENTS)
+    def get_random_headers(self) -> dict:
+        """构造一套完整的浏览器请求头（不只是 UA）。
+
+        仅换 UA 仍能被风控识别：请求头之间是有协变特征的（UA 是 Chrome 却
+        戴着 Safari 的 Sec-Fetch 要求，或 Accept-Language 与 UA 区域不符），
+        都会被当作自动化特征。这里按 UA 类型返回配套的头集合，尽量模拟真实浏览器。
+        """
+        ua = self.get_random_ua()
+        is_iphone = 'iPhone' in ua
+        platform = 'Mobile' if is_iphone else ('Macintosh' if 'Mac' in ua else 'Windows')
+        sec_ch_ua = (
+            '\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\"'
+            if 'Chrome' in ua
+            else '\"Not_A Brand\";v=\"8\"'
+        )
+        headers = {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Cache-Control": "max-age=0",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-CH-UA": sec_ch_ua,
+            "Sec-CH-UA-Mobile": "?0",
+            "Sec-CH-UA-Platform": f'"{platform}"',
+        }
+        if is_iphone:
+            headers["Sec-CH-UA-Mobile"] = "?1"
+        return headers
+
+    # 最近一次请求是否出现风控信号（429 / 验证码 / 滑块等）
+    _blocked_signals = 0
+
+    @classmethod
+    def mark_blocked(cls):
+        """由平台爬虫在检测到风控信号时调用，触发自适应降速。
+
+        连续命中会进一步放大延迟（封号往往发生在「反复用相同节奏试探」
+        而不是「偶发一次」），因此这里用计数而非布尔。
+        """
+        BaseCrawler._blocked_signals += 1
+        logger.warning("检测到风控信号（累计 %s 次），后续延迟将自动拉大", BaseCrawler._blocked_signals)
+
+    def _adaptive_delay(self) -> float:
+        """基础随机延迟；若近期出现过风控信号，乘一个放大倍率。
+
+        单次 429 就把整轮停掉太重，这里渐进放大：风控越多、降速越狠，
+        直到用户手动降低频率或重启进程（计数清零）。
+        """
+        base = random.uniform(settings.crawl_delay_min, settings.crawl_delay_max)
+        if BaseCrawler._blocked_signals > 0:
+            lo, hi = settings.crawl_adaptive_delay_factor
+            factor = random.uniform(lo, hi) * BaseCrawler._blocked_signals
+            logger.warning("自适应降速：风控 %s 次，延迟放大 %.1f 倍", BaseCrawler._blocked_signals, factor)
+            return base * factor
+        return base
+
+    async def random_delay(self):
+        await asyncio.sleep(self._adaptive_delay())
+
+    @staticmethod
+    def detect_blocked(content: str, status_code: int = 200) -> bool:
+        """检测响应中是否出现风控信号。
+
+        返回 True 时调用方应：1) 调用 mark_blocked() 自适应降速；
+        2) 对整页结果判定为不可用（不把验证码页当空列表入库）。
+        """
+        if status_code == 429:
+            return True
+        if not content:
+            return False
+        low = content.lower()[:4000]
+        signals = (
+            'captcha', 'verify', 'verification', 'security check',
+            '登录后查看', '验证码', '滑动验证', '安全验证', '访问异常',
+            '校验', '风险', '滑块', '人机验证',
+        )
+        return any(s in low for s in signals)

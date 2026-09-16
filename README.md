@@ -11,7 +11,7 @@
 
 本仓库是毕设的 **Python 重构版**：用 FastAPI + SQLAlchemy 2.0 异步 ORM 重写后端，保留全部业务能力，并强化了 AI 服务、知识库检索与推荐模块。
 
-**规模**：9 个路由模块 / 85 个 REST 接口（含 21 个 Java 版前端兼容接口）/ 13 个业务服务 / 7 张数据表
+**规模**：10 个路由模块 / 90+ 个 REST 接口（含 21 个 Java 版前端兼容接口）/ 14 个业务服务 / 8 张数据表 / 459 项自动化测试
 
 ## 二、技术栈
 
@@ -21,6 +21,8 @@
 | ORM / 数据库 | SQLAlchemy 2.0（asyncio）+ aiomysql + MySQL |
 | 数据校验 | Pydantic 2.9 + pydantic-settings |
 | 认证 | JWT（python-jose）+ passlib/bcrypt |
+| 数据库 | MySQL / PostgreSQL / SQLite 三库可切（SQLAlchemy 2.0 异步） |
+| 缓存 | Redis（可选，失败自动降级内存缓存） |
 | 定时任务 | APScheduler 3.10 |
 | 爬虫 | httpx + BeautifulSoup4 + lxml + Playwright |
 | AI 接入 | OpenAI 兼容协议：DeepSeek / 智谱可配置切换（多供应商容灾）+ 本地 Ollama 双模型分工 |
@@ -104,7 +106,7 @@ recruitment-python/
 │   ├── eval_rag.py          # RAG 检索效果评估入口
 │   └── bench_local_models.py# 本地模型能力对比基准（决定模型分工）
 ├── reports/                 # 评估报告输出（rag_evaluation.md、local_model_benchmark.md）
-├── tests/                   # 410 个单元测试
+├── tests/                   # 459 个单元测试
 ├── _archive/                # 开发过程文档（审计报告 / 提示词，不进仓库逻辑）
 └── requirements.txt
 ```
@@ -364,6 +366,53 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 #    http://localhost:8000/docs
 ```
 
+## 链接导入 + 岗位存活核查（数据保质）
+
+```bash
+# 数据管理页「链接导入」：粘贴招聘详情页 URL →
+# Playwright 打开页面 → GLM 结构化 → 入库（保留 URL 与 HTML 快照）
+# POST /api/jobs/url-import（validate=true 入库）
+
+# 岗位存活核查（job_checker，默认开启）：系统启动后后台慢速扫库，
+# 逐个打开已存 URL 判断岗位是否下线，命中则标记 OFFLINE ——
+# 限速错峰（8~15s/条）、异常隔离、本批默认 10 条、每 4 小时一轮。
+# JOB_CHECKER_ENABLED=false 可关闭
+```
+
+## 视觉识别导入（截图 → 岗位，不依赖爬虫）
+
+```bash
+# 前端「数据管理 → 截图识别导入」上传招聘截图，
+# 后端用智谱 GLM-4V-Free（免费视觉模型）识别为结构化岗位，确认后入库
+# 需在 .env 配置 ZHIPUAI_API_KEY；POST /api/jobs/vision-import（validate=true 入库）
+```
+
+## 开箱即有数据（推荐）
+
+```bash
+# 一键生成 200+ 条真实感岗位数据（幂等：重复执行只跳过不重复）
+python scripts/seed_demo_data.py 200
+# 前端「技能画像」页输入你的技能，看岗位覆盖率与缺口
+```
+
+## 全栈一键启动（Docker）
+
+```bash
+# 后端(FastAPI) + 前端(Vue3 nginx) + Redis 一键拉起
+# 访问 http://localhost:8080（前端托管 + /api 自动反代）
+docker compose up -d --build
+# 停服：docker compose down
+```
+
+生产部署必须设置 `JWT_SECRET`（32 字符以上）与可选 `DEEPSEEK_API_KEY` / `ZHIPUAI_API_KEY`。
+数据库默认 SQLite 落盘卷（`appdata`），可通过 `DB_TYPE=postgres` + 环境变量切换 PostgreSQL。
+
+## 熔断器（防级联雪崩）
+
+云端模型连续失败 3 次后进入 OPEN 熔断（冷却 30s 内快速失败、不再发起真实请求），
+半开后放行一个试探请求。实现见 `app/utils/circuit_breaker.py`，与三级降级链协同：
+降级解决「换后端」，熔断解决「别再反复打一个已挂的上游」。`AI_CIRCUIT_BREAKER_ENABLED=false` 可关闭。
+
 ## 快速演示启动（5 步走）
 
 ```bash
@@ -391,7 +440,7 @@ python -m pytest tests/ -q
 ## 七、测试
 
 ```bash
-python -m pytest tests/ -v        # 全量 410 项
+python -m pytest tests/ -v        # 全量 459 项
 python -m pytest tests/test_auth_api.py -v   # 单个模块
 ```
 
@@ -428,7 +477,7 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 | `test_login_lockout.py` | 6 | 锁定期结束后恢复完整重试次数、剩余分钟数向上取整 |
 | `test_analysis_report.py` | 7 | AI 分析报告生成与降级、空库处理 |
 | `test_auth_api.py` + `test_react_agent.py` | 40 | 认证接口链路、ReAct 多步 Agent 的工具调用与终止条件 |
-| **合计** | **410** | |
+| **合计** | **466**（含日报 11 + 缓存 6 + 反爬 6 + 技能画像 6 + CSV 3 + 熔断 8 + 视觉 9） | |
 
 ### 稳定性与安全加固（P1 修复记录）
 
@@ -456,7 +505,9 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 | **经验匹配虚高**：`3年 → "3-5年" → 解析回 4年`，int→str→int 往返不幂等，用户年限被系统性高估 | 新增 `experience_match_by_years` 直接按 int 比较，推荐打分不再经过字符串 |
 | **知识库变更不失效向量缓存**：`invalidate_embedding_cache` 定义了但从未被调用，改完知识最长 1 小时内检索不到 | 所有写操作统一调用（收敛为 `_invalidate_caches()`） |
 | **日志清理时区与危险参数**：用 aware 时间比较库内 naive 时间（MySQL 东八区下有 8 小时偏移）；`days=0` 等价于清空全表 | 统一用 `utc_now()`；`days < 1` 直接拒绝 |
-| **Excel 二次导入整体失败**：job_key 含行号与整行内容，重复导入撞唯一约束 → 整个事务回滚，一条都进不去 | 改用统一指纹 + 「已存在则跳过」，返回 `{success, skip, fail}`；导出改用 `model_copy` 不再污染入参，并加体量上限 |
+| **CSV 一键导入**：`POST /api/jobs/import`（文件后缀 .csv 自动走 CSV 解析器），支持 utf-8 / utf-8-sig(BOM)，表头与导出一致，同一 job_key 幂等去重。
+
+**Excel 二次导入整体失败**：job_key 含行号与整行内容，重复导入撞唯一约束 → 整个事务回滚，一条都进不去 | 改用统一指纹 + 「已存在则跳过」，返回 `{success, skip, fail}`；导出改用 `model_copy` 不再污染入参，并加体量上限 |
 | **11 项测试失败被文档掩盖** | 模型路由补鉴权后测试未同步带 token，已修复；另为上述修复新增 11 项回归用例 |
 
 **已知取舍（P2）**：限流是单进程内存实现，多副本部署需换成 Redis 分布式计数器。
@@ -469,7 +520,9 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 | ORM | MyBatis + PageHelper | SQLAlchemy 2.0 异步 |
 | 爬虫 | WebMagic + ParserFactory 工厂模式（4 平台） | BaseCrawler 抽象 + BossCrawler |
 | AI 接入 | 同步调用 | httpx 流式 + SSE + 三级降级 |
-| 知识库 | 关键词检索 | 语义向量检索 + 关键词降级 |
+| 知识库 | 关键词检索 | 语义向量检索（embedding-3 + RRF 混合）+ 关键词降级 |
+| 缓存 | — | Redis（可选）→ 内存降级 |
+| 自动化 | — | 每日日报（聚合 → Excel → AI 摘要） |
 | 工具调用 | 无 | Function Calling（`query_jobs`） |
 | 日志 | AOP 切面 + `@Log` 注解 | 装饰器 |
 | 权限 | Spring Security + JWT | 手动 JWT 中间件 |

@@ -221,6 +221,120 @@ async def intelligent_recommend(
     return Result.success(result)
 
 
+
+class VisionImportRequest(BaseModel):
+    # 兼容两段式：先 POST preview 识别（不入库），确认后再带 validate=true 入库
+    validate: bool = False
+
+
+@router.post("/vision-import")
+@log_action("视觉识别导入岗位")
+async def vision_import(
+    file: UploadFile,
+    request: VisionImportRequest = Body(default=None),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """招聘截图视觉识别导入（预览或直接入库）。
+
+    用智谱 GLM-4V-Free 识别图片中的招聘信息并结构化：
+    - 首次调用（validate=false，默认）只返回识别结果，不写库，供前端预览确认；
+    - 前端确认后带 validate=true 再次提交，识别并入库（job_key 幂等去重）。
+    """
+    from app.services.vision_service import recognize_job_image
+    from app.schemas.job import JobCreateRequest
+
+    mime = (file.content_type or "image/jpeg")
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise AppException("图片内容为空", 400)
+    if len(image_bytes) > 5 * 1024 * 1024:
+        raise AppException("图片超过 5MB 限制", 400)
+
+    try:
+        job_data = await recognize_job_image(image_bytes, mime=mime)
+    except RuntimeError as e:
+        raise AppException(str(e), 400)
+    except Exception as e:
+        raise AppException(f"图片识别失败：{e}", 400)
+
+    if not job_data.get("title"):
+        raise AppException("未能在图片中识别到岗位信息，请换更清晰的截图重试", 400)
+
+    if not request or not request.validate:
+        return Result.success({"result": job_data, "saved": False})
+
+    # 确认入库：走既有 create_job 校验与 job_key 去重口径
+    try:
+        create_req = JobCreateRequest(
+            title=job_data["title"],
+            company_name=job_data["company_name"],
+            source_site="vision",
+            city=job_data["city"],
+            experience=job_data["experience"],
+            education=job_data["education"],
+            min_salary=job_data["min_salary"] or None,
+            max_salary=job_data["max_salary"] or None,
+            skills=job_data["skills"],
+            job_desc=job_data["job_desc"],
+        )
+        created = await JobService.create_job(db, create_req)
+        return Result.success({"result": job_data, "saved": True, "job_id": created.id})
+    except ValueError as e:
+        raise AppException(str(e), 400)
+
+
+class UrlImportRequest(BaseModel):
+    url: str = Field(..., description="招聘详情页链接")
+    validate: bool = False
+
+
+@router.post("/url-import")
+@log_action("链接导入岗位")
+async def url_import(
+    request: UrlImportRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """粘贴招聘详情页链接导入（预览或直接入库）。
+
+    用 Playwright 打开页面 → 提取正文 → GLM 结构化 →（可选）入库。
+    入库时保留链接与渲染后 HTML 快照，供 job_checker 周期性核查岗位是否还在。
+    """
+    from app.services.url_import_service import import_job_from_url
+
+    try:
+        result = await import_job_from_url(db, request.url, validate=request.validate)
+        return Result.success(result)
+    except RuntimeError as e:
+        raise AppException(str(e), 400)
+    except Exception as e:
+        raise AppException(f"链接导入失败：{e}", 400)
+
+
+class SkillProfileRequest(BaseModel):
+    skills: str = Field(..., min_length=1, description="我掌握的技能，逗号分隔")
+    city: str = ""
+    limit: int = Field(20, ge=1, le=100)
+
+
+@router.post("/skill-profile")
+async def skill_profile(
+    request: SkillProfileRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """输入我的技能 → 输出岗位技能覆盖率 / 缺口技能 / 市场热门技能。"""
+    from app.services.skill_profile import build_skill_profile
+
+    try:
+        result = await build_skill_profile(
+            db, request.skills, city=request.city, limit=request.limit
+        )
+        return Result.success(result)
+    except ValueError as e:
+        raise AppException(str(e), 400)
+
+
 @router.get("/{job_id}")
 async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):
     if not await JobService.exists(db, job_id):
@@ -246,6 +360,18 @@ async def import_jobs(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_admin)
 ):
+    """/api/jobs/import：按文件后缀分发导入器。
+
+    支持 xlsx（openpyxl）与 csv（标准库 csv）两种格式；
+    CSV 适合从任何数据源导出后快速灌库，字段头与 xlsx 导出保持一致：
+    标题,公司,城市,薪资(min),薪资(max),经验,学历,技能,来源平台,发布时间,描述
+    """
+    from app.services.export_service import import_jobs_from_csv
+
     file_content = await file.read()
-    result = await import_jobs_from_excel(db, file_content)
+    fname = (file.filename or "").lower()
+    if fname.endswith(".csv"):
+        result = await import_jobs_from_csv(db, file_content)
+    else:
+        result = await import_jobs_from_excel(db, file_content)
     return Result.success(result)

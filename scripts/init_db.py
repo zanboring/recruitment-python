@@ -27,6 +27,8 @@ from app.models import (  # noqa: F401,E402  导入模型以注册表结构
     CrawlTask,
     KnowledgeBase,
     SysLog,
+    AiUsage,
+    DailyReport,
 )
 from app.init_data import init_default_admin  # noqa: E402
 
@@ -48,7 +50,7 @@ async def main():
         logger.info("初始化完成，可执行：uvicorn app.main:app --reload --port 8000")
     except Exception as e:  # noqa: BLE001
         logger.error("初始化失败：%s", e)
-        logger.error("请确认 MySQL 已启动，且 .env 中 DB_HOST / DB_PORT / DB_NAME / DB_USERNAME / DB_PASSWORD 正确")
+        logger.error("请确认数据库已启动，且 .env 中 DB_TYPE / DB_HOST / DB_PORT / DB_NAME / DB_USERNAME / DB_PASSWORD 正确")
         raise SystemExit(1)
     finally:
         await engine.dispose()

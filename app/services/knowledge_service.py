@@ -22,19 +22,20 @@ KEYWORDS = {
     "Ollama", "GLM", "降级", "流式", "SSE", "向量", "RAG"
 }
 
-_cache = {"data": None, "timestamp": 0}
+CACHE_KEY_ENABLED_IDS = "kb:enabled_ids"
 CACHE_TTL = 600
 
 
-def _invalidate_caches() -> None:
+async def _invalidate_caches() -> None:
     """知识库内容变更后统一失效两类缓存。
 
-    - `_cache`：启用条目的列表缓存。不清的话新条目 600 秒内进不了检索池；
+    - 启用条目 id 列表缓存：不清的话新条目 CACHE_TTL 内进不了检索池；
     - embedding 向量缓存：不清的话旧条目的向量最长 1 小时内仍参与相似度
       计算，表现为「知识改了却检索不到新内容」。
     """
-    _cache["data"] = None
-    invalidate_embedding_cache()
+    from app.cache import cache
+    await cache.delete_prefix("kb:")
+    await invalidate_embedding_cache()
 
 
 def _escape_like(s: str) -> str:
@@ -52,14 +53,38 @@ class KnowledgeService:
 
     @staticmethod
     async def get_all_enabled(db: AsyncSession):
-        now = time.time()
-        if _cache["data"] is not None and now - _cache["timestamp"] < CACHE_TTL:
-            return _cache["data"]
+        """获取全部启用条目（带缓存）。
+
+        缓存存的是「启用条目 id 的有序列表」而非 ORM 对象：
+        - 对象无法跨进程序列化到 Redis，id 列表可以；
+        - 命中后按 id 回查数据库并保持原顺序，数据永远是从库里读的最新值，
+          不会出现「缓存里有但 DELETE 后仍被召回」的悬垂引用。
+        """
+        import json
+        from app.cache import cache
+
+        cached = await cache.get(CACHE_KEY_ENABLED_IDS)
+        if cached:
+            try:
+                ids = json.loads(cached)
+                if ids:
+                    rows = (await db.execute(
+                        select(KnowledgeBase).where(KnowledgeBase.id.in_(ids))
+                    )).scalars().all()
+                    by_id = {it.id: it for it in rows}
+                    ordered = [by_id[i] for i in ids if i in by_id]
+                    if ordered:
+                        return ordered
+            except Exception as e:
+                logger.warning("知识库缓存读取失败，重新加载: %s", e)
+
         stmt = select(KnowledgeBase).where(KnowledgeBase.status == 1).order_by(KnowledgeBase.quality_score.desc(), KnowledgeBase.usage_count.desc())
         result = await db.execute(stmt)
         items = result.scalars().all()
-        _cache["data"] = items
-        _cache["timestamp"] = now
+        try:
+            await cache.set(CACHE_KEY_ENABLED_IDS, json.dumps([it.id for it in items]), CACHE_TTL)
+        except Exception as e:
+            logger.warning("知识库缓存写入失败（不影响业务）: %s", e)
         return items
 
     @staticmethod
@@ -93,7 +118,7 @@ class KnowledgeService:
         )
         db.add(kb)
         await db.commit()
-        _invalidate_caches()
+        await _invalidate_caches()
         return kb
 
     @staticmethod
@@ -129,7 +154,7 @@ class KnowledgeService:
             raise ValueError("知识条目不存在")
         kb.status = 1 if kb.status == 0 else 0
         await db.commit()
-        _invalidate_caches()
+        await _invalidate_caches()
         return kb
 
     @staticmethod
@@ -139,7 +164,7 @@ class KnowledgeService:
             raise ValueError("知识条目不存在")
         kb.quality_score = score
         await db.commit()
-        _invalidate_caches()
+        await _invalidate_caches()
         return kb
 
     @staticmethod
@@ -369,7 +394,7 @@ class KnowledgeService:
         )
         db.add(kb)
         await db.commit()
-        _invalidate_caches()
+        await _invalidate_caches()
 
     @staticmethod
     async def get_stats(db: AsyncSession):

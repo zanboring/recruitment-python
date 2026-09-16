@@ -26,7 +26,22 @@ import httpx
 
 from app.config import settings
 
+# 熔断器：云端连续失败后快速拒绝再试，防止超时风暴拖垮降级链
+# （详见 app/utils/circuit_breaker.py；AI_CIRCUIT_BREAKER_ENABLED=false 可关闭）
+from app.utils.circuit_breaker import circuit_breaker, CircuitOpenError
+
 logger = logging.getLogger(__name__)
+
+_cloud_breaker = circuit_breaker(
+    "llm-cloud",
+    failure_threshold=3,
+    cooldown_seconds=30,
+    enabled=True,
+)
+
+def breaker_enabled() -> bool:
+    return bool(getattr(settings, "ai_circuit_breaker_enabled", True))
+
 
 # 云端调用超时（秒）。思考模式（reasoning_effort 开启）耗时更长，调用方需相应放宽。
 DEFAULT_TIMEOUT = 60
@@ -131,6 +146,10 @@ async def stream_chat(
         on_usage  可选回调，收到 usage 数据（token 用量）时触发，用于成本统计。
                   通过 `stream_options.include_usage` 让服务端在最后一片里带上用量。
     """
+    # 熔断检查：OPEN 期间快速失败（抛 CircuitOpenError 由降级链捕获）
+    if breaker_enabled() and not _cloud_breaker.closed:
+        raise CircuitOpenError(f"熔断器开启：{_cloud_breaker.state.value}")
+
     payload: Dict = {
         "model": provider.model,
         "messages": messages,
@@ -187,6 +206,10 @@ async def complete_chat(
     ``on_usage`` 在响应带 ``usage`` 时触发，字段形状与流式路径统一为
     ``{"prompt_tokens", "completion_tokens", "total_tokens"}``。
     """
+    # 熔断检查：OPEN 期间快速失败
+    if breaker_enabled() and not _cloud_breaker.closed:
+        raise CircuitOpenError(f"熔断器开启：{_cloud_breaker.state.value}")
+
     payload: Dict = {
         "model": provider.model,
         "messages": messages,
@@ -201,11 +224,17 @@ async def complete_chat(
         "Authorization": f"Bearer {provider.api_key}",
     }
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(provider.api_url, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(provider.api_url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        if breaker_enabled():
+            _cloud_breaker.record_failure()
+        raise
+    if breaker_enabled():
+        _cloud_breaker.record_success()
     if on_usage and data.get("usage"):
         on_usage(_normalize_usage(data["usage"]))
     return data["choices"][0]["message"]["content"]

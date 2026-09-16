@@ -26,6 +26,8 @@ class Job(Base):
     detail_html = Column(Text)
     publish_time = Column(DateTime)
     last_seen_at = Column(DateTime)
+    # 岗位存活核查时间（job_checker 周期性刷新；NULL = 从未核查）
+    last_checked_at = Column(DateTime)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 

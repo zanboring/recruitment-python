@@ -1,0 +1,47 @@
+# 全栈一键启动：docker compose up -d --build
+# 访问 http://localhost:8080（前端由 nginx 托管，/api 自动反代到后端）
+name: recruitment-python
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    environment:
+      APP_ENV: production
+      DB_TYPE: sqlite
+      DB_NAME: data/recruitment.db
+      JWT_SECRET: ${JWT_SECRET:-change_me_to_a_long_random_secret_for_production}
+      # AI 密钥：留空则自动降级本地/规则引擎
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ZHIPUAI_API_KEY: ${ZHIPUAI_API_KEY:-}
+      REDIS_URL: redis://redis:6379/0
+      OLLAMA_ENABLED: "false"
+      AI_TOOL_PREFILTER_ENABLED: "true"
+      CORS_ORIGINS: "http://localhost:8080"
+    volumes:
+      - appdata:/app/data
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    restart: unless-stopped
+
+volumes:
+  appdata:
+  redisdata:

@@ -276,7 +276,12 @@ async def compat_import_data(
     user: User = Depends(require_admin),
 ):
     content = await file.read()
-    result = await import_jobs_from_excel(db, content)
+    fname = (file.filename or "").lower()
+    from app.services.export_service import import_jobs_from_csv
+    if fname.endswith(".csv"):
+        result = await import_jobs_from_csv(db, content)
+    else:
+        result = await import_jobs_from_excel(db, content)
     return Result.success(result)
 
 

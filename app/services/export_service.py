@@ -100,6 +100,77 @@ async def export_jobs_to_excel(db: AsyncSession, query_dto: JobQueryDTO):
     )
 
 
+
+async def import_jobs_from_csv(db: AsyncSession, file_content: bytes) -> dict:
+    """从 CSV 导入岗位，返回 {"success", "skip", "fail"} 统计（幂等）。
+
+    表头字段与 xlsx 导出一致（中文表头）：
+    标题,公司,城市,薪资(min),薪资(max),经验,学历,技能,来源平台,发布时间,描述
+
+    复用 import_jobs_from_excel 的逐行容错与 job_key 去重口径 ——
+    同一岗位从 CSV / 爬虫 / 管理端三个入口进入都不会重复入库。
+    """
+    import csv
+    import io
+
+    if not file_content:
+        raise ValueError("文件内容为空")
+    if len(file_content) > IMPORT_MAX_BYTES:
+        raise ValueError(f"文件过大，上限 {IMPORT_MAX_BYTES // 1024 // 1024}MB")
+
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+
+    try:
+        text = file_content.decode("utf-8-sig")  # 兼容 UTF-8 BOM（Excel 导出常见）
+        reader = csv.DictReader(io.StringIO(text))
+
+        for raw in reader:
+            try:
+                title = str(raw.get("标题") or "").strip()
+                if not title:
+                    continue
+
+                company_name = str(raw.get("公司") or "").strip()
+                city = str(raw.get("城市") or "").strip()
+                source_site = str(raw.get("来源平台") or "").strip() or "import"
+                job_key = generate_job_key(source_site, title, company_name, city)
+
+                existing = await db.execute(
+                    select(Job.id).where(Job.job_key == job_key)
+                )
+                if existing.scalar_one_or_none() is not None:
+                    skip_count += 1
+                    continue
+
+                db.add(Job(
+                    title=title,
+                    company_name=company_name,
+                    city=city,
+                    min_salary=_to_float(raw.get("薪资(min)")),
+                    max_salary=_to_float(raw.get("薪资(max)")),
+                    experience=str(raw.get("经验") or ""),
+                    education=str(raw.get("学历") or ""),
+                    skills=str(raw.get("技能") or ""),
+                    source_site=source_site,
+                    job_key=job_key,
+                    job_status="ACTIVE",
+                    job_desc=str(raw.get("描述") or ""),
+                ))
+                success_count += 1
+            except Exception as e:  # noqa: BLE001 - 单行脏数据不影响其余行
+                fail_count += 1
+                logger.warning("CSV 第 %s 行导入失败：%s", raw, e)
+
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise ValueError(f"CSV 导入失败: {e}")
+
+    return {"success": success_count, "skip": skip_count, "fail": fail_count}
+
+
 async def import_jobs_from_excel(db: AsyncSession, file_content: bytes) -> dict:
     """从 xlsx 导入岗位，返回 {"success", "skip", "fail"} 统计。
 

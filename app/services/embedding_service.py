@@ -24,8 +24,7 @@ logger = logging.getLogger(__name__)
 # embedding-3 单次请求最多 64 条文本
 _CHUNK_SIZE = 64
 
-# 单条文本 embedding 的内存缓存：text_hash -> (embedding, timestamp)
-_embedding_memo: dict = {}
+# 单条文本 embedding 的缓存：text_hash -> embedding（Redis 或内存，见 app.cache）
 _MEMO_TTL = 3600  # 单条向量缓存 1 小时，知识库变更时由 invalidate 主动失效
 
 
@@ -33,9 +32,10 @@ def _text_key(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def invalidate_embedding_cache() -> None:
+async def invalidate_embedding_cache() -> None:
     """知识库内容变更（新增/修改/删除/学习入库）时调用，清空向量缓存。"""
-    _embedding_memo.clear()
+    from app.cache import cache
+    await cache.delete_prefix("emb:")
 
 
 def cosine(a: list, b: list) -> float:
@@ -162,24 +162,29 @@ async def embed_texts(texts: list) -> list:
             "（可设 EMBEDDING_BACKEND=ollama 改用本地模型）"
         )
 
-    now = time.time()
+    import json
+    from app.cache import cache
+
     results: list = [None] * len(texts)
     pending_idx: list = []
 
     for i, text in enumerate(texts):
-        key = _text_key(text)
-        hit = _embedding_memo.get(key)
-        if hit is not None and now - hit[1] < _MEMO_TTL:
-            results[i] = hit[0]
-        else:
-            pending_idx.append(i)
+        key = f"emb:{_text_key(text)}"
+        cached = await cache.get(key)
+        if cached:
+            try:
+                results[i] = json.loads(cached)
+                continue
+            except Exception as e:
+                logger.warning("向量缓存反序列化失败，重新计算: %s", e)
+        pending_idx.append(i)
 
     for start in range(0, len(pending_idx), _CHUNK_SIZE):
         chunk_idx = pending_idx[start:start + _CHUNK_SIZE]
         chunk_texts = [texts[i] for i in chunk_idx]
         vectors = await _embed_batch(chunk_texts)
         for i, vec in zip(chunk_idx, vectors):
-            _embedding_memo[_text_key(texts[i])] = (vec, now)
+            await cache.set(f"emb:{_text_key(texts[i])}", json.dumps(vec), _MEMO_TTL)
             results[i] = vec
 
     return results

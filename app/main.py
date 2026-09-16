@@ -1,4 +1,7 @@
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -15,6 +18,7 @@ from app.routers.user import router as user_router
 from app.routers.log import router as log_router
 from app.routers.knowledge import router as knowledge_router
 from app.routers.model import router as model_router
+from app.routers.report import router as report_router
 
 
 @asynccontextmanager
@@ -22,6 +26,10 @@ async def lifespan(app: FastAPI):
     validate_production_settings()
     from app.scheduler import start_scheduler
     start_scheduler()
+
+    # 岗位存活核查后台任务：启动即开始慢速扫库，不阻塞启动
+    from app.services.job_checker import start_checker
+    start_checker()
 
     from app.database import async_session
     from app.init_data import init_default_admin
@@ -82,18 +90,77 @@ def create_app() -> FastAPI:
     app.include_router(log_router)
     app.include_router(knowledge_router)
     app.include_router(model_router)
+    app.include_router(report_router)
 
     app.add_exception_handler(AppException, app_exception_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     app.add_exception_handler(Exception, global_exception_handler)
 
-    @app.get("/")
-    async def root():
-        return FileResponse("app/static/index.html")
+    # ================= 前端伺服（软件化：单进程跑全栈） =================
+    # 优先伺服前端构建产物（含完整 Vue 页面）。资源定位顺序：
+    #   1) PyInstaller 打包 -> sys._MEIPASS/frontend_dist（打进 exe 内）
+    #   2) exe 同目录 frontend_dist（绿色版外置更新）
+    #   3) 源码 frontend/dist（`npm run build` 产物）
+    # 都没有时回退 app/static 的简单版页面，保证任何情况下根路径可用。
+    dist_index = _resolve_frontend_index()
+    if dist_index is not None:
+        dist_dir = dist_index.parent  # frontend 产物根目录（含 assets/ 与 index.html）
 
-    app.mount("/static", StaticFiles(directory="app/static"), name="static")
+        @app.get("/")
+        async def root_fe():
+            return FileResponse(str(dist_index))
+
+        # Vue 构建产物的静态资源（JS/CSS/图片）
+        app.mount(
+            "/assets",
+            StaticFiles(directory=str(dist_dir / "assets")),
+            name="assets",
+        )
+
+        # SPA 路由回退（createWebHistory）：刷新 /dashboard 等前端路由时
+        # 后端返回 index.html 而非 404；但 /api/*、健康检查等真实接口不拦截。
+        @app.middleware("http")
+        async def spa_fallback(request, call_next):
+            path = request.url.path
+            if (
+                path.startswith("/api")
+                or path.startswith("/assets")
+                or path == "/docs"
+                or path == "/openapi.json"
+                or path == "/favicon.ico"
+            ):
+                return await call_next(request)
+            # 非 API 的 GET 请求：交给 index.html（SPA 前端路由接管）
+            if request.method == "GET":
+                return FileResponse("frontend/dist/index.html")
+            return await call_next(request)
+    else:
+        @app.get("/")
+        async def root_fallback():
+            return FileResponse("app/static/index.html")
+
+        app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
     return app
+
+
+def _resolve_frontend_index() -> Path:
+    """解析前端构建产物的 index.html 路径（兼容源码 / PyInstaller / 绿色版）。"""
+    if getattr(sys, "frozen", False):
+        # PyInstaller 打包：资源随 exe 释放到 _MEIPASS，或外置在 exe 同目录
+        candidates = [
+            Path(sys._MEIPASS) / "frontend_dist" / "index.html",  # noqa: SLF001
+            Path(sys.executable).resolve().parent / "frontend_dist" / "index.html",
+        ]
+    else:
+        candidates = [
+            Path(__file__).resolve().parent.parent / "frontend" / "dist" / "index.html",
+            Path(__file__).resolve().parent.parent / "frontend_dist" / "index.html",
+        ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
 
 
 app = create_app()

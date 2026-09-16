@@ -11,6 +11,7 @@ POST /api/crawler/start 走完全相同的链路（重试包装、清洗过滤�
 import logging
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from app.services import report_service
 
 logger = logging.getLogger("scheduler")
 
@@ -44,9 +45,29 @@ async def scheduled_crawl() -> None:
                     )
 
 
+async def scheduled_daily_report() -> None:
+    """每日在爬取任务之后自动生成招聘市场日报。
+
+    单次失败只记录日志，不中断调度器；日报表内同日重复执行幂等。
+    """
+    from app.database import async_session
+
+    async with async_session() as db:
+        try:
+            report = await report_service.create_daily_report(db, None)
+            logger.info("定时日报完成：%s（%s）", report.report_date, report.status)
+        except Exception as e:  # noqa: BLE001
+            logger.error("定时日报生成失败：%s", e, exc_info=True)
+
+
 def start_scheduler() -> None:
     """注册定时任务并启动调度器（幂等，可安全重复调用）。"""
     if not scheduler.get_job("scheduled_crawl"):
         scheduler.add_job(scheduled_crawl, "cron", hour=2, minute=0, id="scheduled_crawl")
+    if not scheduler.get_job("scheduled_daily_report"):
+        scheduler.add_job(
+            scheduled_daily_report, "cron", hour=6, minute=30,
+            id="scheduled_daily_report",
+        )
     if not scheduler.running:
         scheduler.start()
