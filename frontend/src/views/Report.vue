@@ -8,9 +8,18 @@
           {{ genLabel(latest.generated_by) }}
         </el-tag>
       </div>
-      <el-button type="primary" :loading="generating" @click="handleGenerate">
-        <el-icon><RefreshRight /></el-icon>&nbsp;生成当日日报
-      </el-button>
+      <div class="toolbar-actions">
+        <el-tooltip v-if="latest" :disabled="pushReady" :content="pushHint" placement="bottom-end">
+          <span>
+            <el-button :disabled="!pushReady" :loading="pushing" @click="handlePush">
+              <el-icon><Promotion /></el-icon>&nbsp;推送到机器人
+            </el-button>
+          </span>
+        </el-tooltip>
+        <el-button type="primary" :loading="generating" @click="handleGenerate">
+          <el-icon><RefreshRight /></el-icon>&nbsp;生成当日日报
+        </el-button>
+      </div>
     </div>
 
     <!-- 最新日报概览 -->
@@ -46,9 +55,38 @@
           <ChartBlock title="城市岗位分布" :data="stats.city" color="#409eff" />
         </el-col>
         <el-col :span="12">
-          <ChartBlock title="薪资区间分布" :data="stats.salary_range" color="#67c23a" />
+          <ChartBlock title="来源平台分布" :data="stats.platform" color="#409eff" />
         </el-col>
       </el-row>
+      <el-row :gutter="16" v-if="stats" style="margin-top: 16px">
+        <el-col :span="12">
+          <ChartBlock title="薪资区间分布" :data="stats.salary_range" color="#67c23a" />
+        </el-col>
+        <el-col :span="12">
+          <ChartBlock title="热门技能" :data="stats.skill" color="#e6a23c" />
+        </el-col>
+      </el-row>
+
+      <!-- 城市 × 平台 交叉表：数据透视，看「城市的数据由哪个平台贡献」 -->
+      <div v-if="pivot" class="pivot-block">
+        <div class="pivot-header">
+          <span class="pivot-title"><el-icon><Grid /></el-icon>&nbsp;城市 × 平台 汇总</span>
+          <span v-if="pivot.truncated_cities" class="pivot-hint">
+            仅列出岗位量前 {{ pivot.rows.length }} 的城市，另有 {{ pivot.truncated_cities }} 个未列出
+          </span>
+        </div>
+        <el-table :data="pivotRows" size="small" stripe>
+          <el-table-column prop="city" label="城市" width="120" />
+          <el-table-column
+            v-for="p in pivot.platforms"
+            :key="p"
+            :prop="p"
+            :label="p"
+            align="center"
+          />
+          <el-table-column prop="合计" label="合计" align="center" />
+        </el-table>
+      </div>
     </el-card>
 
     <!-- 无日报占位 -->
@@ -82,16 +120,43 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, h, type Component } from 'vue';
 import { ElMessage } from 'element-plus';
-import { RefreshRight, Document, Download, Cpu, TrendCharts, Briefcase, Files, Money } from '@element-plus/icons-vue';
+import { RefreshRight, Document, Download, Cpu, TrendCharts, Briefcase, Files, Money, Promotion, Grid } from '@element-plus/icons-vue';
 import {
-  generateReportApi, getLatestReportApi, getReportListApi, downloadReportExcelApi,
+  generateReportApi, getLatestReportApi, getReportListApi, downloadReportExcelApi, pushReportApi,
   type ReportDetail, type ReportSummary
 } from '@/api/report';
 
 const latest = ref<ReportDetail | null>(null);
 const reports = ref<ReportSummary[]>([]);
 const generating = ref(false);
+const pushing = ref(false);
 const stats = computed(() => latest.value?.stats);
+
+/* ---- 城市 × 平台 交叉表 ---- */
+const pivot = computed(() => stats.value?.city_platform_pivot);
+
+/** 把嵌套的 counts 摊平成一行的键，并追加「合计」行 —— el-table 只认平铺字段。 */
+const pivotRows = computed(() => {
+  const p = pivot.value;
+  if (!p) return [];
+  const rows: Record<string, string | number>[] = p.rows.map((row) => ({
+    city: row.city,
+    合计: row.total,
+    ...row.counts
+  }));
+  rows.push({ city: '合计', 合计: p.grand_total, ...p.totals });
+  return rows;
+});
+
+/* ---- 推送可用性：未配置时按钮置灰并说明原因，而不是点了才报错 ---- */
+const pushReady = computed(() => latest.value?.push?.configured === true);
+
+const pushHint = computed(() => {
+  const p = latest.value?.push;
+  if (!p) return '未取到推送配置';
+  if (!p.enabled) return '推送已关闭（REPORT_WEBHOOK_ENABLED=false）';
+  return '未配置 Webhook 地址（REPORT_WEBHOOK_URL）';
+});
 
 const genLabel = (v: string) => ({ primary: 'AI 云端生成', local: 'AI 本地生成', rule: '规则摘要' })[v] ?? v;
 
@@ -115,6 +180,22 @@ const handleGenerate = async () => {
     ElMessage.error(e?.message || '生成失败');
   } finally {
     generating.value = false;
+  }
+};
+
+const handlePush = async () => {
+  const id = latest.value?.id;
+  if (!id) return;
+  pushing.value = true;
+  try {
+    const r = await pushReportApi(id);
+    r.success ? ElMessage.success(r.message) : ElMessage.warning(r.message);
+    await load();
+  } catch (e: any) {
+    // 后端在「未开启/未配置」时返回 400 并给出具体原因，直接透出给用户
+    ElMessage.error(e?.message || '推送失败');
+  } finally {
+    pushing.value = false;
   }
 };
 
@@ -176,6 +257,7 @@ const ChartBlock = (props: Record<string, any>) => {
 <style scoped>
 .page-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .toolbar-left { display: flex; align-items: center; gap: 12px; }
+.toolbar-actions { display: flex; align-items: center; gap: 10px; }
 .page-title { margin: 0; font-size: 18px; font-weight: 600; }
 .card-header { display: flex; justify-content: space-between; align-items: center; }
 .card-title { display: flex; align-items: center; font-weight: 600; }
@@ -197,5 +279,9 @@ const ChartBlock = (props: Record<string, any>) => {
 .chart-bar-fill { height: 100%; border-radius: 4px; transition: width .4s ease; }
 .chart-bar-count { width: 44px; font-size: 12px; color: #909399; }
 .latest-card { margin-bottom: 16px; }
+.pivot-block { margin-top: 16px; border: 1px solid #f0f0f0; border-radius: 10px; padding: 16px; }
+.pivot-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 12px; }
+.pivot-title { display: flex; align-items: center; font-weight: 600; color: #303133; }
+.pivot-hint { font-size: 12px; color: #909399; }
 .history-card :deep(.el-card__header) { padding: 14px 20px; }
 </style>

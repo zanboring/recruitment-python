@@ -214,6 +214,26 @@ class Settings(BaseSettings):
     # 只有应用确实部署在可信反向代理（Nginx / 网关）之后、且代理会重写该头时才开启。
     rate_limit_trust_forwarded_for: bool = False
 
+    # ---- 定时任务（APScheduler，时区 Asia/Shanghai）----
+    # 原先触发时间写死在 app/scheduler.py（爬取 02:00、日报 06:30），
+    # 换部署环境必须改代码。这里改为配置化，并把开关也一并放开。
+    scheduled_crawl_enabled: bool = True
+    scheduled_crawl_hour: int = 2
+    scheduled_crawl_minute: int = 0
+
+    report_enabled: bool = True
+    report_hour: int = 6
+    report_minute: int = 30
+
+    # ---- 日报推送 Webhook（可选）----
+    # 默认关闭：不配置就只在本地产出 Excel，不发任何外部请求。
+    # 支持 wecom（企业微信机器人）/ dingtalk（钉钉机器人）/ generic（通用 JSON）。
+    report_webhook_enabled: bool = False
+    report_webhook_type: str = "wecom"
+    report_webhook_url: str = ""
+    # 推送内容里最多列几个城市/技能，避免消息过长被机器人截断
+    report_webhook_top_n: int = 5
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, v):

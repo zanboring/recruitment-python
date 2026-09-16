@@ -48,6 +48,41 @@ async def report_list(
     return Result.success([report_service.report_to_dict(r) for r in reports])
 
 
+@router.post("/{report_id}/push")
+@log_action("推送日报")
+async def push_report(
+    report_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """手动把某期日报推送到配置的 Webhook。
+
+    生成本身已会自动推送一次；这个接口用于「当时没配好，事后补推」，
+    所以必须显式告知未配置，而不是返回一个含糊的成功。
+    """
+    report = await report_service.get_report_by_id(db, report_id)
+    if not report:
+        raise AppException("日报不存在", 404)
+    if report.status != "GENERATED":
+        raise AppException("该期日报未成功生成，没有可推送的内容", 400)
+
+    result = await report_service.push_report(report, report_service.load_stats(report))
+    if not result.attempted:
+        # 未开启/未配置 URL 属于「前置条件不满足」，用 400 让调用方看清楚原因
+        raise AppException(f"未执行推送：{result.detail}", 400)
+
+    report.message = result.describe()
+    await db.commit()
+    await db.refresh(report)
+
+    return Result.success({
+        "success": result.success,
+        "target": result.target,
+        "detail": result.detail,
+        "message": result.describe(),
+    })
+
+
 @router.get("/{report_id}")
 async def report_detail(
     report_id: int,

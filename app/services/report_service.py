@@ -24,9 +24,11 @@ from openpyxl import Workbook
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import async_session, Base
 from app.models.job import Job
-from app.services.job_service import JobService
+from app.services.job_service import JobService, VISIBLE_STATUS
+from app.services import webhook_service
 
 logger = logging.getLogger(__name__)
 
@@ -57,12 +59,82 @@ async def count_new_jobs_today(db: AsyncSession, since: datetime) -> int:
     return result.scalar() or 0
 
 
+async def build_platform_stats(db: AsyncSession) -> list:
+    """按**来源平台**聚合在架岗位数。
+
+    口径与图表一致：只算在架岗位（``VISIBLE_STATUS``），否则日报里的
+    「平台分布」会把已下架岗位也算进去，与同页的总览数字对不上。
+    """
+    stmt = (
+        select(Job.source_site, func.count(Job.id))
+        .where(Job.job_status == VISIBLE_STATUS)
+        .group_by(Job.source_site)
+        .order_by(func.count(Job.id).desc())
+    )
+    rows = (await db.execute(stmt)).all()
+    return [{"name": site or "未知", "count": count} for site, count in rows]
+
+
+async def build_city_platform_pivot(db: AsyncSession, top_n: int = 10) -> dict:
+    """构造「城市 × 来源平台」交叉表（数据透视）。
+
+    比「城市分布」+「平台分布」两份独立清单更易读：能直接看出
+    「某个城市的数据是哪个平台贡献的」，而两张独立表只能各自看总量。
+
+    只保留岗位量前 ``top_n`` 的城市，避免长尾城市把表撑成几十行；
+    返回结构里同时带上合计行/列，方便在 Excel 里直接看占比。
+    """
+    stmt = (
+        select(Job.city, Job.source_site, func.count(Job.id))
+        .where(Job.job_status == VISIBLE_STATUS)
+        .group_by(Job.city, Job.source_site)
+    )
+    rows = (await db.execute(stmt)).all()
+
+    city_totals: dict = {}
+    matrix: dict = {}
+    platform_totals: dict = {}
+    grand_total = 0
+
+    for city, site, count in rows:
+        city = city or "未知"
+        site = site or "未知"
+        city_totals[city] = city_totals.get(city, 0) + count
+        matrix.setdefault(city, {})[site] = count
+        platform_totals[site] = platform_totals.get(site, 0) + count
+        grand_total += count
+
+    top_cities = sorted(city_totals, key=lambda c: (-city_totals[c], c))[:top_n]
+    # 平台列按总量倒序，最多的平台放最左边
+    platforms = sorted(platform_totals, key=lambda p: (-platform_totals[p], p))
+
+    pivot_rows = [
+        {
+            "city": city,
+            "counts": {p: matrix.get(city, {}).get(p, 0) for p in platforms},
+            "total": city_totals[city],
+        }
+        for city in top_cities
+    ]
+
+    return {
+        "platforms": platforms,
+        "rows": pivot_rows,
+        "totals": platform_totals,
+        "grand_total": grand_total,
+        "truncated_cities": max(len(city_totals) - len(top_cities), 0),
+    }
+
+
 async def build_report_stats(db: AsyncSession) -> dict:
     """聚合日报所需的多维统计（复用可视化统计口径，保证数字自洽）。"""
     date_str, since = _beijing_today()
     base = await JobService.collect_analysis_stats(db)
     base["date"] = date_str
     base["new_today"] = await count_new_jobs_today(db, since)
+    # 平台维度：可视化统计里没有，日报需要（Excel 的平台分布与透视表都依赖它）
+    base["platform"] = await build_platform_stats(db)
+    base["city_platform_pivot"] = await build_city_platform_pivot(db)
     return base
 
 
@@ -73,6 +145,46 @@ def _write_sheet(ws, headers: list, rows: list) -> None:
     ws.append(headers)
     for row in rows:
         ws.append(row)
+    for col in ws.columns:
+        max_len = 0
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_len:
+                    max_len = len(str(cell.value))
+            except (TypeError, AttributeError):
+                pass
+        ws.column_dimensions[col[0].column_letter].width = min((max_len + 2) * 1.2, 50)
+
+
+def _write_pivot_sheet(ws, pivot: dict, corner: str = "城市") -> None:
+    """写「行维 × 平台」交叉表，并补上合计行与合计列。
+
+    交叉表的价值就在于合计：只看分项数字，读者还要自己心算总量；
+    把合计直接写进表里，「这个城市的数据主要由哪个平台贡献」一眼可见。
+    """
+    platforms = list(pivot.get("platforms") or [])
+    ws.append([corner] + platforms + ["合计"])
+
+    for row in pivot.get("rows") or []:
+        counts = row.get("counts") or {}
+        ws.append(
+            [row.get("city", "")]
+            + [counts.get(p, 0) for p in platforms]
+            + [row.get("total", 0)]
+        )
+
+    totals = pivot.get("totals") or {}
+    ws.append(
+        ["合计"]
+        + [totals.get(p, 0) for p in platforms]
+        + [pivot.get("grand_total", 0)]
+    )
+
+    truncated = pivot.get("truncated_cities", 0)
+    if truncated:
+        ws.append([])
+        ws.append([f"（仅列出岗位量前 {len(pivot.get('rows') or [])} 的城市，另有 {truncated} 个城市未列出）"])
+
     for col in ws.columns:
         max_len = 0
         for cell in col:
@@ -100,8 +212,13 @@ def build_excel(stats: dict) -> bytes:
         ["平均薪资(元/月)", summary.get("avg_salary", 0)],
     ])
 
+    # 汇总统计（城市 × 来源平台 交叉表）：放在总览之后，先看结构性分布
+    pivot_ws = wb.create_sheet(title="汇总统计")
+    _write_pivot_sheet(pivot_ws, stats.get("city_platform_pivot") or {})
+
     # 各维度 sheet
     sheet_defs = [
+        ("平台分布", ["来源平台", "岗位数"], stats.get("platform", [])),
         ("城市分布", ["城市", "岗位数"], stats.get("city", [])),
         ("热门技能", ["技能", "岗位数"], stats.get("skill", [])),
         ("学历要求", ["学历", "岗位数"], stats.get("education", [])),
@@ -162,6 +279,54 @@ async def summarize_with_ai(stats: dict, db: AsyncSession) -> tuple[str, str]:
     return text, "rule"
 
 
+def build_webhook_content(report, stats: dict, top_n: int = None) -> tuple:
+    """把日报压成一条 markdown 消息，返回 ``(标题, 正文)``。
+
+    只挑最有信息量的几项，并按 ``report_webhook_top_n`` 截断列表：
+    企业微信/钉钉对消息体长度有限制，塞进全部维度会被截断成半句话。
+    """
+    top_n = top_n or settings.report_webhook_top_n
+    summary = stats.get("summary", {}) or {}
+    date_str = stats.get("date", "") or getattr(report, "report_date", "")
+    title = f"招聘市场日报 {date_str}"
+
+    lines = [
+        f"**{title}**",
+        f"- 今日新增：{stats.get('new_today', 0)}",
+        f"- 在架岗位：{summary.get('active', 0)}",
+        f"- 累计岗位：{summary.get('total', 0)}",
+        f"- 平均薪资：{summary.get('avg_salary', 0)} 元/月",
+    ]
+
+    for label, key in (("热门城市", "city"), ("来源平台", "platform"), ("热门技能", "skill")):
+        items = (stats.get(key) or [])[:top_n]
+        if items:
+            body = "、".join(f"{i.get('name', '-')}({i.get('count', 0)})" for i in items)
+            lines.append(f"**{label}**：{body}")
+
+    summary_text = (getattr(report, "ai_summary", "") or "").strip()
+    if summary_text:
+        if len(summary_text) > 600:
+            summary_text = summary_text[:600] + "…"
+        lines.append(f"\n**摘要**（{getattr(report, 'generated_by', 'rule')}）：{summary_text}")
+
+    return title, "\n".join(lines)
+
+
+async def push_report(report, stats: dict) -> webhook_service.PushResult:
+    """把日报推送到配置的 webhook。
+
+    未开启/未配置时返回 ``attempted=False``（安静跳过）；任何异常都被吞掉
+    并转成失败结果 —— 推送只是附加动作，不能让它把已生成的日报拖成失败。
+    """
+    try:
+        title, content = build_webhook_content(report, stats)
+        return await webhook_service.push(title, content)
+    except Exception as e:  # noqa: BLE001 - 见 docstring
+        logger.warning("日报推送构造或发送异常：%s", e)
+        return webhook_service.PushResult(detail=f"异常：{e}")
+
+
 async def create_daily_report(db: AsyncSession, crawler) -> object:
     """生成当日日报（编排入口），返回 DailyReport 实例。
 
@@ -197,6 +362,15 @@ async def create_daily_report(db: AsyncSession, crawler) -> object:
         db.add(report)
         await db.commit()
         await db.refresh(report)
+
+        # 推送放在落库之后：日报已经生成成功这一事实不能被推送结果影响。
+        # 未配置 webhook 时 attempted=False，连日志都不写。
+        push_result = await push_report(report, stats)
+        if push_result.attempted:
+            report.message = push_result.describe()
+            await db.commit()
+            await db.refresh(report)
+
         logger.info("日报生成完成：%s（%s）", date_str, generated_by)
         return report
     except Exception as e:  # noqa: BLE001 - 落库失败要留痕而不是静默
@@ -262,11 +436,26 @@ def report_to_dict(report) -> dict:
     }
 
 
+def load_stats(report) -> dict:
+    """从 ``stats_json`` 还原统计快照。
+
+    解析失败返回空字典而不是抛异常：历史日报可能存着旧格式或被截断的 JSON，
+    读列表时不该因为一条坏数据就让整个接口 500。
+    """
+    try:
+        return json.loads(report.stats_json) if report.stats_json else {}
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
 def report_detail_to_dict(report) -> dict:
     """附上完整统计快照的详情视图。"""
     data = report_to_dict(report)
-    try:
-        data["stats"] = json.loads(report.stats_json) if report.stats_json else {}
-    except (TypeError, json.JSONDecodeError):
-        data["stats"] = {}
+    data["stats"] = load_stats(report)
+    # 前端据此决定「推送」按钮是否可用，以及提示是「未配置」还是「已关闭」
+    data["push"] = {
+        "configured": webhook_service.is_configured(),
+        "enabled": bool(settings.report_webhook_enabled),
+        "type": settings.report_webhook_type,
+    }
     return data

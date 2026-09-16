@@ -60,14 +60,61 @@ async def scheduled_daily_report() -> None:
             logger.error("定时日报生成失败：%s", e, exc_info=True)
 
 
+def _clamp(value, low: int, high: int, default: int) -> int:
+    """把配置里的时间参数收敛到合法区间。
+
+    配置写错（越界、非数字）时用默认值并在日志里说明，而不是让
+    APScheduler 抛异常把整个应用启动带崩 —— 一个「几点跑」的参数
+    不该有能力阻止服务起来。
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        logger.warning("定时任务时间配置非法（%r），回退默认值 %s", value, default)
+        return default
+    if not low <= number <= high:
+        logger.warning("定时任务时间配置越界（%s），回退默认值 %s", number, default)
+        return default
+    return number
+
+
+def _sync_job(job_id: str, func, enabled: bool, hour: int, minute: int, label: str) -> None:
+    """按配置注册/移除一个 cron 任务（幂等）。"""
+    existing = scheduler.get_job(job_id)
+    if not enabled:
+        if existing:
+            scheduler.remove_job(job_id)
+        logger.info("定时任务「%s」已按配置关闭", label)
+        return
+    if existing:
+        # 已注册时也重建一次：否则改了 .env 里的时间却不重启就永远不生效
+        scheduler.remove_job(job_id)
+    scheduler.add_job(func, "cron", hour=hour, minute=minute, id=job_id)
+    logger.info("定时任务「%s」已注册：%02d:%02d", label, hour, minute)
+
+
 def start_scheduler() -> None:
-    """注册定时任务并启动调度器（幂等，可安全重复调用）。"""
-    if not scheduler.get_job("scheduled_crawl"):
-        scheduler.add_job(scheduled_crawl, "cron", hour=2, minute=0, id="scheduled_crawl")
-    if not scheduler.get_job("scheduled_daily_report"):
-        scheduler.add_job(
-            scheduled_daily_report, "cron", hour=6, minute=30,
-            id="scheduled_daily_report",
-        )
+    """注册定时任务并启动调度器（幂等，可安全重复调用）。
+
+    触发时间与开关全部来自配置（``app/config.py`` 的 scheduled_* / report_*），
+    原先写死为「爬取 02:00、日报 06:30」，换部署环境必须改代码。
+    """
+    from app.config import settings
+
+    _sync_job(
+        "scheduled_crawl", scheduled_crawl,
+        enabled=settings.scheduled_crawl_enabled,
+        hour=_clamp(settings.scheduled_crawl_hour, 0, 23, 2),
+        minute=_clamp(settings.scheduled_crawl_minute, 0, 59, 0),
+        label="定时爬取",
+    )
+    _sync_job(
+        "scheduled_daily_report", scheduled_daily_report,
+        enabled=settings.report_enabled,
+        hour=_clamp(settings.report_hour, 0, 23, 6),
+        minute=_clamp(settings.report_minute, 0, 59, 30),
+        label="每日日报",
+    )
+
     if not scheduler.running:
         scheduler.start()
