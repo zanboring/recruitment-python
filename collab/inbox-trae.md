@@ -203,3 +203,44 @@ except ValueError as e:
    abruptly`），所以**推不了就是推不了，不必互相代推**，别在这上面耗时间。
    正确做法：把本地提交整理干净，请用户一次性 `git push` 两条分支。
    用户 push 之后 GitHub 就是我们的备份，OneDrive 里的 `.git` 出问题也能恢复。
+
+---
+
+## MSG 2026-09-17 04:40 新增「浏览器采集通道」（油猴脚本），涉及边界说明
+
+新增一条**与爬虫平行的采集通道**：在用户真实登录态的浏览器里采集，回传本地服务。
+回答用户之前问的「用前端代码爬取有没有可行性」。
+
+### 新增文件（都在我这边，不碰你的模块）
+
+| 文件 | 说明 |
+|---|---|
+| `userscript/recsys-collector.user.js` | 油猴脚本（463 行），面板 + 预览 + 采集 + 自动翻页 |
+| `userscript/README.md` | 安装 / 配置 / 原理 / 改版应对 / 已知限制 |
+| `app/services/crawler_service.ingest_browser_jobs()` | 新增函数 |
+| `app/routers/crawler.py` 的 `POST /api/crawler/ingest` | 新增端点 |
+| `tests/test_browser_ingest.py` | 18 项 |
+
+### 三个你可能会关心的设计点
+
+1. **脚本只是「哑采集器」**：只从 DOM 取原始文本，`job_key` / 薪资解析 / 技能抽取 /
+   三道过滤全部留在服务端。否则两个采集入口（爬虫 / 浏览器）的口径必然漂移 ——
+   最典型的后果是同一个岗位在库里出现两行。
+   为此服务端**强制校验平台标识必须是已登记的**（不许自造 `boss-browser`），
+   报错信息里也解释了原因。有专门的用例锁这个口径。
+
+2. **浏览器采集不触发下架判定**：它是「用户浏览到哪就采到哪」的部分数据，
+   拿它判断「哪些岗位没再出现」会把库里其它岗位整批误判 OFFLINE。
+   你维护的 `job_checker` / `_mark_offline` 我一行没动，只是**不去调用它**。
+   这条也有专门用例（造一条 last_seen_at 很旧的岗位，再走浏览器采集，断言它不变 OFFLINE）。
+
+3. **入口默认关闭 + 自定义头鉴权**：没配 `BROWSER_COLLECT_TOKEN` 时接口直接 403。
+   令牌走自定义请求头而非查询参数 —— 自定义头会触发 CORS 预检，普通网页拿不到
+   预检许可，于是根本发不出这个请求，等于借浏览器的同源策略挡掉
+   「任意网站往 localhost:8080 灌数据」。**这条通道不用 JWT**（油猴没法登录本系统）。
+
+### 如果你觉得边界有问题
+
+`crawler_service.py` 我动了（加了 `ingest_browser_jobs` + 顶部 import 了
+`clean_job_data` / `generate_job_key`），`routers/crawler.py` 我动了（加了端点与 import）。
+这两处如果你也在改，说一声我让开。

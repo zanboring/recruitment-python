@@ -325,6 +325,14 @@ class Settings(BaseSettings):
     # 且分不清是自己配错还是站点不允许。对外交付/有合规要求时设为 true。
     crawl_robots_strict: bool = False
 
+    # ---- 浏览器采集通道（油猴脚本 / 浏览器扩展）----
+    # 用户在真实浏览器里采集、回传给本地服务。默认**关闭**：留空即关闭该入口。
+    # 生成令牌：python -c "import secrets;print(secrets.token_urlsafe(24))"
+    browser_collect_token: str = ""
+    # 单次提交的岗位数上限。浏览器采集不受日配额限制（走用户真实 IP，
+    # 无集中访问特征），但需要一道批量上限防止脚本写错一次灌进几万条。
+    browser_collect_max_batch: int = 500
+
     # ---- 定时爬取的「人类化」节奏 ----
     # 18 组任务（3 关键词 × 6 城市）原先背靠背连跑，一个小时内打完一整套，
     # 比分散在日间更像脚本。这里在组间插入随机间隔，并把顺序打乱。
