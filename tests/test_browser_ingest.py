@@ -105,6 +105,88 @@ async def test_未知平台被拒绝并给出提示(client, collect_on):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("platform", ["zhaopin", "liepin"])
+async def test_未写爬虫的平台也能通过浏览器通道入库(client, collect_on, db_session, platform):
+    """「已知平台」与「爬虫已实现平台」是两个集合。
+
+    浏览器采集不需要服务端有对应爬虫 —— 数据是用户在真实浏览器里取好回传的。
+    若按「爬虫已实现」校验，想支持智联/猎聘就得先写一个完整的 Playwright 爬虫，
+    这显然不合理。这条用例锁住这个区分。
+    """
+    resp = await post_ingest(client, {
+        "source_site": platform,
+        "city": "长沙",
+        "jobs": [make_job(1, title=f"{platform} 上的岗位")],
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["saved"] == 1
+
+    job = (await db_session.execute(
+        select(Job).where(Job.source_site == platform)
+    )).scalars().one()
+    assert job.title == f"{platform} 上的岗位"
+
+
+@pytest.mark.asyncio
+async def test_爬虫未实现的平台仍不能启动爬取任务(client, db_session):
+    """反过来也要成立：浏览器通道能收，不代表能对它启动爬取任务。
+
+    否则接口会把用户引向一个必然失败的任务（`get_crawler` 会 KeyError）。
+    两个集合分得清，才能一边「收数据」一边「不承诺抓取」。
+    """
+    from tests.helpers import admin_token as _admin_token
+
+    token = await _admin_token(client, db_session, "admin_zhaopin_crawl")
+    resp = await client.post(
+        "/api/crawler/start",
+        json={"keyword": "Java", "city": "长沙", "platforms": ["zhaopin"]},
+        headers=auth_headers(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    data = resp.json()["data"]
+    assert data["status"] == "FAILED"
+    assert "zhaopin" in (data["message"] or "")
+    # 失败原因必须可读 —— 只回一个「成功 0 条」会让用户无从排查
+    assert "未实现" in (data["message"] or "")
+
+
+def test_油猴脚本的站点适配器与后端平台集合一致():
+    """跨产物契约测试：脚本里每个 platform 都必须是后端认可的「已知平台」。
+
+    两边是独立的文件，很容易出现「脚本加了新站点、后端不认识」的漂移 ——
+    那种情况下用户点采集只会拿到一个 400，且从脚本面板看不出来原因。
+    """
+    import re
+    from pathlib import Path
+
+    from app.services.crawler_service import KNOWN_PLATFORMS
+
+    script = Path(__file__).resolve().parent.parent / "userscript" / "recsys-collector.user.js"
+    text = script.read_text(encoding="utf-8")
+    declared = set(re.findall(r"platform:\s*'([a-z0-9]+)'", text))
+
+    assert declared, "未能从脚本中解析出任何 platform（正则或脚本结构变了）"
+    unknown = declared - KNOWN_PLATFORMS
+    assert not unknown, f"脚本声明了后端不认识的平台：{sorted(unknown)}"
+
+
+def test_油猴脚本的站点适配器数量与说明一致():
+    """脚本声明的站点数应与 README 里列的站点数一致，避免文档过期。"""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    script = (root / "userscript" / "recsys-collector.user.js").read_text(encoding="utf-8")
+    readme = (root / "userscript" / "README.md").read_text(encoding="utf-8")
+
+    names = re.findall(r"name:\s*'([^']+)'", script)
+    assert len(names) >= 4, f"适配器数量异常：{names}"
+    for name in names:
+        assert name in readme, f"适配器「{name}」未在 userscript/README.md 中出现，文档已过期"
+
+
+@pytest.mark.asyncio
 async def test_超出批量上限被拒绝(client, collect_on, monkeypatch):
     monkeypatch.setattr(settings, "browser_collect_max_batch", 2)
     resp = await post_ingest(client, {"source_site": "boss", "jobs": [make_job(i) for i in range(3)]})

@@ -68,14 +68,29 @@ git 无法自动合并同一区域的两份不同改动 —— 只要共用文�
 
 ### 正确的切法：一套代码 + 两个交付目标，按模块分人
 
-| 归属 | 域 | 主要文件 |
+> **这是当前生效的分工（用户要求「先各自分好工」）。有变更请改本表，不要靠口头约定。**
+
+| 归属 | 域 | 独占的文件 / 目录 |
 |---|---|---|
-| **WorkBuddy** | 采集域（平台接入、反爬、合规、节流） | `app/crawlers/**`、`crawler_service.py` |
-| **WorkBuddy** | 日报域 | `report_service.py`、`routers/report.py`、`webhook_service.py`、`Report.vue` |
-| **WorkBuddy** | 版本与发布机制、系统信息 | `app/version.py`、`update_service.py`、`routers/system.py`、`CHANGELOG.md` |
-| **Trae** | 数据导入域（视觉 / 链接 / CSV） | `url_import_service.py`、`vision_service.py`、`routers/jobs.py` |
-| **Trae** | 稳定性链路 | `llm_client.py`、`ai_service.py`、`job_checker.py` |
-| **Trae** | 打包与 Release、设置中心 | `recsys.spec`、`build-exe.bat`、`routers/settings.py`、`Settings.vue` |
+| **WorkBuddy** | 采集域 | `app/crawlers/**`、`app/services/crawler_service.py`、`app/routers/crawler.py` |
+| **WorkBuddy** | 浏览器采集通道 | `userscript/**`、`crawler_service.ingest_browser_jobs()`、`routers/crawler.py` 的 `/ingest` |
+| **WorkBuddy** | 日报域 | `app/services/report_service.py`、`webhook_service.py`、`app/routers/report.py`、`frontend/.../Report.vue` |
+| **WorkBuddy** | 版本与发布机制 | `app/version.py`、`app/services/update_service.py`、`app/routers/system.py`、`CHANGELOG.md` |
+| **WorkBuddy** | 协作信道 | `collab/**`（`inbox-workbuddy.md` 除外）、`collab-check.cmd` |
+| **Trae** | 数据导入域（视觉 / 链接 / CSV） | `app/services/url_import_service.py`、`vision_service.py`、`app/routers/jobs.py` |
+| **Trae** | 稳定性链路 | `app/services/llm_client.py`、`ai_service.py`、`job_checker.py` |
+| **Trae** | 打包与 Release | `recsys.spec`、`build-exe.bat`、`run_entry.py`、`start*.bat`、`git-sync.cmd` |
+| **Trae** | 设置中心 | `app/routers/settings.py`、`frontend/.../Settings.vue`、`frontend/src/api/settings.ts` |
+| **Trae** | 协作状态表 | `COLLAB.md` §2、`collab/inbox-workbuddy.md` |
+
+**共用文件（双方都会改，按下面规则来）**：
+
+| 文件 | 规则 |
+|---|---|
+| `app/config.py` | 新增配置项**追加到 `Settings` 类末尾自己的区块**，不要插进别人区块中间 |
+| `app/main.py` | 导入行与 `include_router` 都追加到末尾；冲突时通常「两边都保留」 |
+| `README.md` | 只改自己负责的章节 |
+| `tests/**` | 各自新增自己的测试文件；**不要改对方的测试文件**（要改先发消息） |
 
 **两个交付目标**（不是两套代码）：
 
@@ -87,13 +102,28 @@ git 无法自动合并同一区域的两份不同改动 —— 只要共用文�
 > ⚠️ 兼容版必须从 `main` 打包。如果从 `dev-trae` 打包，它会缺掉 WorkBuddy 已合入的功能，
 > 于是"兼容版"变成"功能少一截的版本"—— 那正好是拆代码库会掉的坑。
 
-### 边界文件（双方都会改，约定「只追加、不插中间」）
+---
 
-| 文件 | 双方都会做什么 | 约定 |
-|---|---|---|
-| `app/config.py` | 各自新增配置项 | 追加到 `Settings` 类**末尾自己的区块**，不要插到别人区块中间 |
-| `app/main.py` | 各自注册路由 | 导入行与 `include_router` 都追加在末尾；冲突时通常「两边都保留」 |
-| `README.md` | 各自补自己模块的说明 | 只改自己章节 |
+## 五之二、通信频率约定（用户要求「交流频率少一些」）
+
+之前的做法是一条小改动就写一条消息，结果收件箱堆了 8 条、还各自触发一轮合并 ——
+**通信成本比改代码本身还高**。改为：
+
+| 场景 | 做法 |
+|---|---|
+| 日常改动、小修复 | **不写消息**。各自提交，靠 `collab-check.cmd` 自查（它本来就会显示对方新提交与冲突预警） |
+| 一个里程碑完成 | **写一条**汇总消息（含：做了什么、需要对方注意什么、下一步） |
+| 发现对方代码有 bug | **写一条**，但要带可复现步骤（不要只说"有问题"） |
+| 边界要变（动了对方的文件） | **写一条**，先问再动 |
+| 阻塞、需要对方配合 | **写一条**，并在标题写「⚠️ 待处理」 |
+
+**不用写信的情况**：改了只属于自己的文件、加了只属于自己的测试、文档同步 ——
+这些 `collab-check.cmd` 的「对方新提交」列表已经能说明。
+
+**push 频率同理**：本地提交随便攒，**等一个里程碑再一起 push**（网络不稳定，少推几次）。
+用户只在这时候需要动手：`git push origin dev-workbuddy dev-trae`。
+
+---
 
 ## 六、工作区布局（当前实际状态）
 

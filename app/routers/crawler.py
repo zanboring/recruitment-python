@@ -3,13 +3,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from app.config import settings
-from app.crawlers.registry import SUPPORTED_PLATFORMS
 from app.database import get_db
 from app.dependencies import require_admin
 from app.exceptions import AppException
 from app.models.user import User
 from app.models.crawl_task import CrawlTask
 from app.services.crawler_service import (
+    KNOWN_PLATFORMS,
     ingest_browser_jobs,
     platform_label,
     platform_options,
@@ -152,11 +152,15 @@ async def ingest_from_browser(
         raise AppException("采集令牌不正确", 403)
 
     source_site = (request.source_site or "").strip()
-    if source_site not in SUPPORTED_PLATFORMS:
+    # 校验用的是「**已知平台**」而不是「爬虫已实现平台」——
+    # 浏览器采集不需要服务端有对应爬虫：数据是用户在真实浏览器里取好回传的，
+    # 服务端只负责入库。若按「爬虫已实现」校验，想支持智联/猎聘就得先写一个
+    # 完整的 Playwright 爬虫，这显然不合理。（两个集合的定义见 crawler_service）
+    if source_site not in KNOWN_PLATFORMS:
         raise AppException(
-            f"未知平台：{source_site}。已登记：{', '.join(sorted(SUPPORTED_PLATFORMS))}。"
-            f"请沿用与爬虫相同的平台标识，不要另造新名 —— job_key 含平台名，"
-            f"换名会让同一个岗位在库里出现两行。",
+            f"未知平台：{source_site}。已知平台：{', '.join(sorted(KNOWN_PLATFORMS))}。"
+            f"请沿用这些标识之一，不要另造新名（如 {source_site}-browser）——"
+            f"job_key 含平台名，换名会让同一个岗位在库里出现两行。",
             400,
         )
 

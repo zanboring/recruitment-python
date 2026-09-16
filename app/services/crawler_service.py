@@ -69,6 +69,16 @@ PLATFORM_ALIASES = {
     "猎聘": "liepin",
 }
 
+# 「已知平台」—— 与「爬虫已实现平台」（``SUPPORTED_PLATFORMS``）是**两个不同的集合**。
+#
+# 为什么必须分开：浏览器采集通道（油猴脚本）根本不需要服务端有对应爬虫 ——
+# 数据是用户在真实浏览器里取好回传的，服务端只负责入库。若沿用「爬虫已实现」做校验，
+# 想支持智联/猎聘就得先写一个完整的 Playwright 爬虫，这显然不合理。
+#
+# 而 ``SUPPORTED_PLATFORMS`` 仍然是「能不能启动一次爬取任务」的判据：
+# 它必须与 ``get_crawler()`` 能实例化的范围一致，否则接口会把用户引向必然失败的任务。
+KNOWN_PLATFORMS = frozenset(PLATFORM_META)
+
 
 def normalize_platform(raw) -> str:
     """把外部传入的平台标识归一化到内部标识。

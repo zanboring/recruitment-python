@@ -1,12 +1,16 @@
 // ==UserScript==
 // @name         RecSys 招聘数据采集器
 // @namespace    recsys.local
-// @version      1.0.0
-// @description  在你真实登录态的浏览器里采集招聘岗位，回传到本地 RecSys 服务（默认 localhost:8080）。不依赖服务端爬虫，因此不存在集中 IP 访问与无头浏览器指纹。
+// @version      1.1.0
+// @description  在你真实登录态的浏览器里采集招聘岗位（BOSS直聘 / 前程无忧 / 智联招聘 / 猎聘），回传到本地 RecSys 服务（默认 localhost:8080）。不依赖服务端爬虫，因此不存在集中 IP 访问与无头浏览器指纹。
 // @author       RecSys
 // @match        https://www.zhipin.com/*
 // @match        https://we.51job.com/*
 // @match        https://jobs.51job.com/*
+// @match        https://sou.zhaopin.com/*
+// @match        https://www.zhaopin.com/*
+// @match        https://www.liepin.com/*
+// @match        https://*.liepin.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -102,6 +106,48 @@
         education: ['.d', '.job-info .d'],
       },
       tags: ['.tags span', '.tag', 'span.tag'],
+    },
+    {
+      name: '智联招聘',
+      platform: 'zhaopin',
+      matches: (h) => /(^|\.)zhaopin\.com$/.test(h),
+      hrefPattern: /jobdetail|\/jobs\/|jobs\.zhaopin\.com/i,
+      card: [
+        '.joblist-box__item',
+        '.joblist-item',
+        'div[class*="joblist"] > div[class*="item"]',
+        'div[class*="joblist"] li',
+      ],
+      fields: {
+        title: ['.iteminfo__line1__jobname', '[class*="jobname"]', 'a[class*="jobname"]', '.jobname'],
+        salary: ['.iteminfo__line2__jobdesc__salary', '[class*="salary"]', '.salary'],
+        company: ['.iteminfo__line1__compname', '[class*="compname"]', '.companyname'],
+        area: ['.iteminfo__line2__jobdesc__address', '[class*="address"]', '.address'],
+        experience: ['[class*="jobdesc"] span', '.job-tag span'],
+        education: ['[class*="jobdesc"] span', '.job-tag span'],
+      },
+      tags: ['.iteminfo__line2__jobdesc__tags span', '[class*="tags"] span', '.job-tag span'],
+    },
+    {
+      name: '猎聘',
+      platform: 'liepin',
+      matches: (h) => /(^|\.)liepin\.com$/.test(h),
+      hrefPattern: /\/job\/|job\.liepin\.com|liepin\.com\/zhaopin/i,
+      card: [
+        '.job-card-pc-container',
+        'div[class*="job-card"]',
+        'li[class*="job-card"]',
+        '.job-list-item',
+      ],
+      fields: {
+        title: ['.job-title', '[class*="job-title"]', '.ellipsis-1', 'a[title]'],
+        salary: ['.job-salary', '[class*="salary"]'],
+        company: ['.company-name', '[class*="company-name"]', '[class*="comp-name"]'],
+        area: ['.job-dq-box', '[class*="job-area"]', '[class*="address"]', '.area'],
+        experience: ['[class*="labels"] span', '[class*="tag"] span'],
+        education: ['[class*="labels"] span', '[class*="tag"] span'],
+      },
+      tags: ['.job-labels-box span', '[class*="labels"] span', '[class*="tag"] span'],
     },
   ];
 
