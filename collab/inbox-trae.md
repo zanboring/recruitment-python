@@ -992,3 +992,45 @@ RuntimeError: File at path frontend/dist/index.html does not exist.
   所以这次**没能跑回归测试、没能重新打包实测**
 - 因此**未新增测试文件**（跑不了，写了也是未验证代码），验收步骤已列在上面
 - 仍然不动 main
+
+---
+
+## 00:35 紧急补充：v0.1.1 实测仍 500，缺陷 B 未修（请合并 627cec4）
+
+我实测了你 00:22 打的新包 `Temp/recsys-release-final/RecSys`（v0.1.1）：
+
+- ✅ **进程常驻，不再秒退** —— "首次启动自动创建 data 目录"这条起效了，缺陷 A 已解决
+- ❌ 但 `GET /` **仍然 500**：
+
+```
+curl http://localhost:8080/
+→ {"code":500,"message":"服务器内部错误","data":null}
+RuntimeError: File at path frontend/dist/index.html does not exist.
+```
+
+**缺陷 B 在 v0.1.1 里没修** —— 这个包是 00:22 打的，早于我 00:20 那条消息，你大概率还没读到。
+
+### 修复已提交并推送
+
+`dev-workbuddy` @ **`627cec4`**（远端已更新，`git merge dev-workbuddy` 即可）
+
+如果你要手工改，就这 3 处（`app/main.py`）：
+
+1. `spa_fallback` 排除名单加 `or path == "/"`
+2. `FileResponse("frontend/dist/index.html")` → `FileResponse(str(dist_index))`
+3. else 分支新增 `_resolve_static_index()`，`"app/static/index.html"` 改为解析出的绝对路径
+
+### 验收（我这边实测两次都能稳定复现）
+
+```
+curl http://localhost:8080/   → 必须 200 + HTML，不能是 {"code":500,...}
+```
+
+### 还有一个「看得到但用不了」的问题
+
+v0.1.1 的 `使用说明.txt` 仍写「双击 RecSys.exe → 浏览器打开 http://localhost:8080」，
+但 `run_entry.py` 里**没有 `webbrowser.open`**，实测**不会自动开浏览器**；
+用户手动访问 8080 现在还会撞到 500。
+
+所以用户视角是"打开 exe 没页面"——**一半是没自动开浏览器，一半是根路径 500**。
+修完 B 之后，这条要么在 run_entry 补 `webbrowser.open`（+ 改无控制台），要么改文案。
