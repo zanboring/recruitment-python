@@ -18,8 +18,10 @@ from app.config import settings
 from app.crawlers import robots
 from app.crawlers.boss import BossCrawler  # noqa: F401  保留：兼容既有引用与测试的 monkeypatch 目标
 from app.crawlers.cleaner import (
+    clean_job_data,
     deduplicate_jobs,
     extract_skills,
+    generate_job_key,
     is_high_salary,
     is_invalid_job,
     is_senior_job,
@@ -176,6 +178,71 @@ async def save_job(db: AsyncSession, job_data: dict) -> bool:
     )
     db.add(job)
     return True
+
+
+async def ingest_browser_jobs(db: AsyncSession, jobs: list, source_site: str, city: str) -> dict:
+    """接收浏览器端（油猴脚本 / 扩展）采集到的岗位并入库。
+
+    与爬虫共用**同一条**清洗、去重、入库链路，但有四处刻意不同：
+
+    1. **不触发下架判定**。浏览器采集是「用户浏览到哪就采到哪」的部分数据，
+       拿它去判断「哪些岗位没再出现」会把库里其它岗位整批误判下架。
+       （爬虫按「关键词 × 城市」系统性抓取、覆盖范围已知，所以它可以判断下架。）
+    2. **不消费日配额**。配额是给自动爬虫设的防封闸门；浏览器采集走用户真实 IP
+       与真实指纹，不存在「集中访问」这个特征。但仍受单次批量上限约束 ——
+       那一道是防脚本写错一次灌进几万条。
+    3. **必须沿用同一个平台标识**（如 ``boss`` / ``51job``），不要造 ``boss-browser``。
+       因为 ``job_key`` 由「平台 + 标题 + 公司 + 城市」生成，换平台名会让同一个岗位
+       在库里出现两行 —— 爬虫采一次、浏览器采一次，统计随之翻倍。
+    4. **``job_key`` 与过滤规则都由服务端决定**。浏览器端只做「哑采集器」，
+       只负责从 DOM 里取原始文本；业务口径（指纹算法、薪资解析、技能抽取、
+       过滤规则）单一来源留在服务端，否则两个入口的口径必然漂移。
+    """
+    result = {"received": len(jobs or []), "saved": 0, "duplicate": 0, "filtered": 0, "invalid": 0}
+
+    for raw in jobs or []:
+        if not isinstance(raw, dict):
+            result["invalid"] += 1
+            continue
+
+        title = str(raw.get("title") or "").strip()
+        if not title:
+            # 没有标题的条目无法生成指纹，也无法展示，直接计为无效
+            result["invalid"] += 1
+            continue
+
+        cleaned = clean_job_data({
+            "title": title,
+            "company_name": str(raw.get("company_name") or "").strip(),
+            "city": str(raw.get("city") or city or "").strip(),
+            "experience": str(raw.get("experience") or "").strip(),
+            "education": str(raw.get("education") or "").strip(),
+            "salary": str(raw.get("salary") or "").strip(),
+            "skills": str(raw.get("skills") or "").strip(),
+            "source_site": source_site,
+            "url": str(raw.get("url") or "").strip(),
+            "description": str(raw.get("description") or "").strip(),
+        })
+        cleaned["job_key"] = generate_job_key(
+            source_site, cleaned["title"], cleaned["company_name"], cleaned["city"]
+        )
+
+        # 与爬虫同一套三道过滤，保证两个入口的数据口径一致
+        if (
+            is_senior_job(cleaned["title"], cleaned["experience"])
+            or is_invalid_job(cleaned["title"], cleaned["description"])
+            or is_high_salary(cleaned["min_salary"])
+        ):
+            result["filtered"] += 1
+            continue
+
+        if await save_job(db, cleaned):
+            result["saved"] += 1
+        else:
+            result["duplicate"] += 1
+
+    await db.commit()
+    return result
 
 
 async def _crawl_platform(db: AsyncSession, keyword: str, city: str, platform: str) -> tuple:

@@ -1,13 +1,16 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
+from app.config import settings
+from app.crawlers.registry import SUPPORTED_PLATFORMS
 from app.database import get_db
 from app.dependencies import require_admin
 from app.exceptions import AppException
 from app.models.user import User
 from app.models.crawl_task import CrawlTask
 from app.services.crawler_service import (
+    ingest_browser_jobs,
     platform_label,
     platform_options,
     start_crawl_task,
@@ -103,3 +106,70 @@ async def get_task_detail(
     if not task:
         raise AppException("任务不存在", 404)
     return Result.success(_task_to_dict(task))
+
+class BrowserCollectRequest(BaseModel):
+    """浏览器端（油猴脚本 / 扩展）提交的岗位批次。
+
+    字段刻意做得很薄：脚本只从页面 DOM 取原始文本，**不计算 job_key、
+    不解析薪资、不做过滤** —— 那些口径留在服务端，否则两个采集入口必然漂移。
+    """
+    source_site: str = "boss"
+    city: str = ""
+    keyword: str = ""
+    jobs: list[dict] = []
+
+
+@router.post("/ingest")
+async def ingest_from_browser(
+    request: BrowserCollectRequest,
+    x_collect_token: str = Header("", alias="X-Collect-Token"),
+    db: AsyncSession = Depends(get_db),
+):
+    """接收浏览器端采集的岗位。
+
+    与其它接口不同，这里**不用 JWT**：油猴脚本跑在招聘网站上，没法让用户
+    去登录本系统拿 token。改用专门的采集令牌（``BROWSER_COLLECT_TOKEN``）。
+
+    为什么是「自定义请求头 + 令牌」而不用查询参数：
+    自定义头会让跨源请求先走 CORS 预检，而普通网页拿不到预检许可，
+    于是**网页根本发不出这个请求**；油猴脚本用 ``GM_xmlhttpRequest``
+    不受同源策略限制，照常能发。等于借浏览器自己的同源策略，
+    顺手挡掉了「任意网站偷偷往 localhost:8080 灌数据」。
+    """
+    import hmac
+    import logging
+
+    logger = logging.getLogger(__name__)
+    expected = str(settings.browser_collect_token or "").strip()
+    if not expected:
+        # 未配置令牌即视为关闭该入口 —— 默认安全，不给出「能写但没有鉴权」的窗口
+        raise AppException(
+            "浏览器采集入口未开启：请在配置中设置 BROWSER_COLLECT_TOKEN"
+            "（生成方式：python -c \"import secrets;print(secrets.token_urlsafe(24))\"）",
+            403,
+        )
+    if not hmac.compare_digest(str(x_collect_token or ""), expected):
+        raise AppException("采集令牌不正确", 403)
+
+    source_site = (request.source_site or "").strip()
+    if source_site not in SUPPORTED_PLATFORMS:
+        raise AppException(
+            f"未知平台：{source_site}。已登记：{', '.join(sorted(SUPPORTED_PLATFORMS))}。"
+            f"请沿用与爬虫相同的平台标识，不要另造新名 —— job_key 含平台名，"
+            f"换名会让同一个岗位在库里出现两行。",
+            400,
+        )
+
+    jobs = request.jobs or []
+    limit = settings.browser_collect_max_batch
+    if limit > 0 and len(jobs) > limit:
+        raise AppException(f"单次提交不得超过 {limit} 条（收到 {len(jobs)} 条）", 400)
+
+    result = await ingest_browser_jobs(db, jobs, source_site, request.city)
+    logger.info(
+        "浏览器采集入库：平台=%s 城市=%s 关键词=%s 收到=%s 新增=%s 重复=%s 过滤=%s 无效=%s",
+        source_site, request.city, request.keyword,
+        result["received"], result["saved"], result["duplicate"],
+        result["filtered"], result["invalid"],
+    )
+    return Result.success(result)
