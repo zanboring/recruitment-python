@@ -912,3 +912,83 @@ HTTP 400 {"code": 400, "message": "配置值不能包含换行：deepseek_api_ke
 ### main 的约定不变
 
 我**仍然不动 main**。
+
+---
+
+## 2026-09-18 00:20 · 致命：v0.1 的 exe「启动即崩」，修好驱动后仍无页面（缺陷 15）
+
+用户反馈：双击 RecSys.exe 只弹出一个命令行窗口就关闭，**没有 app 页面**。
+我把本地 v0.1 发布包（`Temp/recsys-release-v2/RecSys`）实测了一遍，**两个独立缺陷**：
+
+### 缺陷 A：启动即崩 —— 解释「命令行一闪就关」
+
+捕获到的真实崩溃栈（重定向 stdout/stderr 拿到）：
+
+```
+File "app\database.py", line 41, in <module>
+File "sqlalchemy\engine\create.py", line 617, in create_engine
+File "sqlalchemy\dialects\mysql\aiomysql.py", line 229, in import_dbapi
+ModuleNotFoundError: No module named 'aiomysql'
+[PYI-25316:ERROR] Failed to execute script 'run_entry' due to unhandled exception!
+```
+
+进程在 `database.py` **模块级建引擎**时就炸了，uvicorn 根本没机会启动。
+
+根因：v0.1 产物**不含**「frozen 默认走 SQLite」那处修复
+（`app/config.py` 应为 `db_type = "sqlite" if getattr(sys,"frozen",False) else "mysql"`）。
+它仍按 MySQL 方言找驱动，而发布包 `_internal/` 里
+`aiosqlite / aiomysql / asyncpg` **一个都没有**（只有内置的 `_sqlite3.pyd`）。
+
+**结论：v0.1 那个二进制产物是坏的，任何用户双击都会秒退，建议废弃重发。**
+
+### 缺陷 B：根路径 500 —— 解释「没有 app 页面」（已修，在 dev-workbuddy）
+
+我用**已含修复**的 wb 打包产物（dist_v2）实测：服务能常驻了（A 已解决），
+但访问 `/` 返回 500：
+
+```
+RuntimeError: File at path frontend/dist/index.html does not exist.
+```
+
+注意前端资源**其实是打进去了**的（`_internal/frontend_dist/index.html` 确实存在），
+不是资源缺失，是**路径写死**：
+
+`app/main.py` 的 `spa_fallback` 中间件里有一句
+`return FileResponse("frontend/dist/index.html")` —— 这是**源码相对路径**。
+中间件先于路由执行，且 `path == "/"` 不在它的排除名单里，
+于是根路径被中间件劫持，`@app.get("/")` 那个返回正确 `dist_index` 的路由永远走不到。
+源码目录下这段代码碰巧能跑（工作目录正好有 `frontend/dist`），**打包后必然 500**。
+
+已修（3 处，dev-workbuddy）：
+
+- 中间件排除 `path == "/"`，把根路径交还给 `@app.get("/")`
+- SPA 回退改用已解析的绝对路径 `FileResponse(str(dist_index))`
+- 新增 `_resolve_static_index()`，修掉 else 分支同样写死的 `"app/static/index.html"`
+  （打包后 `app/static` 位于 `_MEIPASS/app_static`，相对路径同样失效）
+
+### 顺带两个「使用说明与代码不一致」
+
+1. `使用说明.txt` 承诺「双击 → 浏览器自动打开 localhost:8080」，
+   但 `run_entry.py` 只有 `uvicorn.run(...)`，**没有任何 `webbrowser.open`**。
+   修好 B 之后，双击仍只是弹一个黑窗常驻，不会自动开浏览器。
+   要么在 run_entry 里 `webbrowser.open` + 改成无控制台，要么改使用说明。
+2. 启动失败时窗口直接关闭，用户看不到任何报错（这次就是靠重定向才拿到栈）。
+   建议 run_entry 包一层 try/except，打印后 `input("按回车退出")`，或写 `startup-error.log`。
+
+### 请你做的（我不动 main）
+
+1. main 合并 dev-workbuddy（含此前 4 项 + 今天缺陷 15），**重新打包**
+2. 验收（请在你的环境跑，这几条能直接复现/证伪）：
+   - `ls dist/RecSys/_internal | grep -i aiosqlite` → 必须有
+   - 运行 exe → **进程常驻不退出**
+   - `curl http://localhost:8080/` → **200 + HTML**，不能是 `{"code":500,...}`
+   - 浏览器打开 → 看到完整 Vue 页面（不是空白/500 JSON）
+3. 跑全量 pytest
+
+### 我这边的状态（说明清楚，不想交付没验过的东西）
+
+- `app/main.py` 3 处改动已完成，`py_compile` 语法通过
+- **本机 `.venv` 被清理了，没有 fastapi/pytest 环境**，
+  所以这次**没能跑回归测试、没能重新打包实测**
+- 因此**未新增测试文件**（跑不了，写了也是未验证代码），验收步骤已列在上面
+- 仍然不动 main
