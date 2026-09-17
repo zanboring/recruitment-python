@@ -9,7 +9,7 @@ from app.middleware.rate_limit import (
     SlidingWindowLimiter, RateLimitMiddleware, default_limiter,
     resolve_limit, _client_identity,
 )
-from tests.helpers import register, build_register_payload
+from tests.helpers import admin_token, auth_headers, register, build_register_payload
 
 
 class TestSlidingWindowLimiter:
@@ -162,14 +162,19 @@ class TestRateLimitMiddleware:
         assert resp.headers["retry-after"].isdigit()
         assert int(resp.headers["retry-after"]) >= 1
 
-    async def test_放行请求的响应带配额头(self, client):
-        resp = await client.get("/api/jobs/stat/city")
+    async def test_放行请求的响应带配额头(self, client, db_session):
+        # 注意：这里用 /api/jobs/stat/city 作为「一个正常接口」的样本，
+        # 而它要求登录（岗位数据属业务数据）—— 所以必须带认证头。
+        token = await admin_token(client, db_session)
+        resp = await client.get("/api/jobs/stat/city", headers=auth_headers(token))
         assert resp.status_code == 200
         assert int(resp.headers["x-ratelimit-remaining"]) < settings.rate_limit_default_per_minute
 
-    async def test_静态资源不受限流影响(self, client):
+    async def test_静态资源不受限流影响(self, client, db_session):
+        token = await admin_token(client, db_session)
         for _ in range(settings.rate_limit_default_per_minute + 5):
-            assert (await client.get("/api/jobs/stat/city")).status_code in (200, 429)
+            resp = await client.get("/api/jobs/stat/city", headers=auth_headers(token))
+            assert resp.status_code in (200, 429)
 
     async def test_已登录用户按用户维度计数(self, client, db_session):
         """同一用户名下的并发请求走 user:<id> 计数，不会被同 IP 的其他用户挤占。"""
@@ -184,8 +189,9 @@ class TestRateLimitMiddleware:
             codes.append(resp.status_code)
         assert codes[-1] == 429
 
-    async def test_注册超限后仍可访问其它接口(self, client):
+    async def test_注册超限后仍可访问其它接口(self, client, db_session):
         """限流是分桶的：注册被打满不应影响查询接口。"""
+        token = await admin_token(client, db_session)
         limit = settings.rate_limit_register_per_minute
         for i in range(limit + 1):
             resp = await client.post(
@@ -193,7 +199,8 @@ class TestRateLimitMiddleware:
             )
         assert resp.status_code == 429
 
-        assert (await client.get("/api/jobs/stat/city")).status_code == 200
+        resp = await client.get("/api/jobs/stat/city", headers=auth_headers(token))
+        assert resp.status_code == 200
 
     async def test_关闭限流开关后不再拦截(self, app, engine):
         settings.rate_limit_enabled = False

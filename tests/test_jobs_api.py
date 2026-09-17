@@ -1,8 +1,16 @@
 """岗位模块集成测试：增删改查 / 分页 / 统计 / 薪资预测 / 推荐 / 权限。
 
 覆盖 routes: /api/jobs/*
+
+**关于登录态**：`/api/jobs/*` 下的全部接口都要求登录（岗位数据属业务数据，
+见 `app/routers/jobs.py` 的 router 级依赖）。下面三个查询/统计/推荐类
+用类级 autouse fixture 统一注入登录态 —— 此前它们没带认证头也能通过，
+是因为**接口当时漏了鉴权**（已修），而不是接口本就公开。
+`TestJobCRUD` 不能这么做：它里面有「未登录应 401」「普通用户应 403」这类用例，
+必须保留不带默认认证头的能力。
 """
 import pytest
+import pytest_asyncio
 
 from tests.helpers import admin_token, auth_headers, create_job, register_and_login
 
@@ -63,11 +71,12 @@ class TestJobCRUD:
         resp = await client.delete(f"/api/jobs/{job_id}", headers=auth_headers(token))
         assert resp.status_code == 200
 
-        detail = await client.get(f"/api/jobs/{job_id}")
+        detail = await client.get(f"/api/jobs/{job_id}", headers=auth_headers(token))
         assert detail.status_code == 404
 
-    async def test_查看详情不存在返回404(self, client):
-        resp = await client.get("/api/jobs/404")
+    async def test_查看详情不存在返回404(self, client, db_session):
+        token = await admin_token(client, db_session)
+        resp = await client.get("/api/jobs/404", headers=auth_headers(token))
         assert resp.status_code == 404
         assert resp.json()["message"] == "岗位不存在"
 
@@ -75,13 +84,20 @@ class TestJobCRUD:
         token = await admin_token(client, db_session)
         job_id = (await create_job(client, token)).json()["data"]["id"]
 
-        resp = await client.get(f"/api/jobs/{job_id}")
+        resp = await client.get(f"/api/jobs/{job_id}", headers=auth_headers(token))
         assert resp.status_code == 200
         assert resp.json()["data"]["title"] == "Java 后端开发工程师"
 
 
 @pytest.mark.asyncio
 class TestJobQuery:
+    @pytest_asyncio.fixture(autouse=True)
+    async def _logged_in(self, client, db_session):
+        """本类用例都需登录态（岗位查询接口要求认证）。"""
+        token = await admin_token(client, db_session)
+        client.headers["Authorization"] = f"Bearer {token}"
+        return token
+
     async def _seed(self, client, db_session):
         token = await admin_token(client, db_session)
         await create_job(client, token, title="Java 开发", city="长沙", skills="Java,SpringBoot")
@@ -135,6 +151,13 @@ class TestJobQuery:
 
 @pytest.mark.asyncio
 class TestJobStats:
+    @pytest_asyncio.fixture(autouse=True)
+    async def _logged_in(self, client, db_session):
+        """本类用例都需登录态（统计接口要求认证）。"""
+        token = await admin_token(client, db_session)
+        client.headers["Authorization"] = f"Bearer {token}"
+        return token
+
     async def _seed(self, client, db_session):
         token = await admin_token(client, db_session)
         await create_job(client, token, city="长沙", min_salary=8000, max_salary=12000,
@@ -182,6 +205,13 @@ class TestJobStats:
 
 @pytest.mark.asyncio
 class TestRecommendAndSalary:
+    @pytest_asyncio.fixture(autouse=True)
+    async def _logged_in(self, client, db_session):
+        """本类用例都需登录态（推荐与薪资预测接口要求认证）。"""
+        token = await admin_token(client, db_session)
+        client.headers["Authorization"] = f"Bearer {token}"
+        return token
+
     async def _seed(self, client, db_session):
         token = await admin_token(client, db_session)
         await create_job(client, token, title="Java 开发", skills="Java,SpringBoot",
@@ -252,3 +282,50 @@ class TestRecommendAndSalary:
             "/api/jobs/predict-salary", params={"skills": "算法,机器学习,深度学习"})).json()["data"]
         assert premium["skill_premium"] > plain["skill_premium"]
         assert premium["skill_premium"] <= 15
+
+
+# ---------------------------------------------------------------------------
+# 系统性防护：/api/jobs/* 下**全部**接口都必须要求登录
+# ---------------------------------------------------------------------------
+#
+# 背景：此前本文件 16 个接口（列表 / 详情 / 7 个统计 / 分析 / 薪资预测 /
+# 推荐 / 技能画像）**都没有认证依赖**，任何人无需登录即可读取岗位数据
+# （实测 `POST /api/jobs/page` 返回 200 + 数据、`/api/jobs/predict-salary`
+# 返回薪资区间）。而同项目其它接口都要求登录 —— 是遗漏而非设计。
+#
+# 修法是在 router 级声明 `dependencies=[Depends(get_current_user)]`，
+# 一行覆盖全部现有接口与将来新增的接口。**但那一行很容易被误删**
+# （比如有人在整理 import 时顺手删掉"未使用"的 Depends），
+# 所以这里遍历全部路由做一次穷举断言。
+
+
+@pytest.mark.asyncio
+async def test_岗位接口全部要求登录(app, client):
+    """无 token 访问 /api/jobs 下任何接口都不应放行。
+
+    这条用例不针对某个接口，而是针对「鉴权覆盖」本身 ——
+    它是防止未来新增接口再漏的第一道网。
+    """
+    targets = set()
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        if path.startswith("/api/jobs"):
+            targets.add(path)
+
+    assert targets, "未枚举到 /api/jobs 路由，测试前提不成立"
+
+    leaked = []
+    for path in sorted(targets):
+        # 把路径参数替换成占位值，避免 404 掩盖鉴权结果
+        url = path.replace("{job_id}", "1").replace("{task_id}", "1")
+        resp = await client.get(url)
+        # 依赖在请求处理前执行 → 未登录应 401；
+        # 允许 403（理论上不该出现）与 405（方法不匹配）之外的放行都算漏。
+        if resp.status_code not in (401, 403, 405, 422):
+            leaked.append((path, resp.status_code))
+
+    assert not leaked, (
+        "以下岗位接口未要求登录（任何人都能读取岗位数据）：\n  "
+        + "\n  ".join(f"{p} → HTTP {c}" for p, c in leaked)
+        + "\n请确认 app/routers/jobs.py 的 router 级 dependencies 仍在。"
+    )

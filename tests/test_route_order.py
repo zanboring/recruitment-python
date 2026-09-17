@@ -29,9 +29,9 @@ class TestStaticRoutesNotShadowed:
         assert resp.status_code == 200, f"批量删除被路由吞掉：{resp.status_code} {resp.text}"
         assert resp.json()["code"] == 0
 
-        # 确认真的删掉了
+        # 确认真的删掉了（岗位详情接口要求登录，需带认证头）
         for job_id in job_ids:
-            assert (await client.get(f"/api/jobs/{job_id}")).status_code == 404
+            assert (await client.get(f"/api/jobs/{job_id}", headers=h)).status_code == 404
 
     async def test_知识库all与stats不被路径参数吞掉(self, client, db_session):
         """GET /api/knowledge/all 与 /stats 是静态路径，不能被 /{knowledge_id} 抢先匹配。"""
@@ -62,6 +62,6 @@ class TestStaticRoutesNotShadowed:
         token = await admin_token(client, db_session)
         job_id = (await create_job(client, token)).json()["data"]["id"]
 
-        resp = await client.get(f"/api/jobs/{job_id}")
+        resp = await client.get(f"/api/jobs/{job_id}", headers=auth_headers(token))
         assert resp.status_code == 200
         assert resp.json()["data"]["id"] == job_id

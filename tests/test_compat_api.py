@@ -230,6 +230,18 @@ class TestAuthCompat:
         assert resp.status_code == 200
         assert resp.json()["data"]["username"]
 
+    async def test_默认用户名接口在生产环境被拒绝(self, client, db_session, monkeypatch):
+        """该接口明文返回管理员用户名，生产环境必须关闭。
+
+        与相邻的 `/api/auth/auto-login` 同一理由：它是「用户名」这半个凭据，
+        配合文档里公开的默认口令就是完整凭据 —— 所以不能无条件开放。
+        """
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "app_env", "production")
+        resp = await client.get("/api/auth/default-username")
+        assert resp.status_code == 403, resp.text
+
     async def test_自动登录在非生产环境可用(self, client, db_session):
         await admin_token(client, db_session)  # 确保存在管理员
         resp = await client.post("/api/auth/auto-login")

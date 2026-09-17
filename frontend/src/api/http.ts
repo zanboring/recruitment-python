@@ -90,14 +90,24 @@ instance.interceptors.response.use(
     }
     const res = response.data;
     if (res.code !== 0) {
-      ElMessage.error(res.msg || '请求失败');
+      // 后端契约字段是 `message`（见 app/schemas/common.py 的 Result
+      // 与 app/exceptions.py 的三个处理器）。这里曾写成 `res.msg` ——
+      // 后端从来没有这个字段，于是所有业务错误都退化成固定的「请求失败」，
+      // 把后端的可读提示（如「配置值不能包含换行」）整个吞掉了。
+      // 保留 `msg` 兜底是为了兼容极少数可能自造该字段的响应。
+      ElMessage.error(res.message || res.msg || '请求失败');
       return Promise.reject(res);
     }
     return res.data;
   },
   async (error) => {
     // 统一错误处理：网络超时/服务器错误等
-    const message = error.response?.data?.msg || error.message || '网络错误';
+    // 同样优先读 `message`（后端契约），`msg` 仅作兜底 —— 参见上方说明。
+    const message =
+      error.response?.data?.message ||
+      error.response?.data?.msg ||
+      error.message ||
+      '网络错误';
     devLog('error', { message });
     
     // 根据HTTP状态码提供更友好的提示

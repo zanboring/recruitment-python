@@ -23,7 +23,23 @@ class IntelligentRecommendRequest(BaseModel):
     city: str = ""
     limit: int = Field(10, ge=1, le=100)
 
-router = APIRouter(prefix="/api/jobs", tags=["岗位"])
+# 岗位数据属于业务数据，**全部接口都要求登录**。
+#
+# 在 router 级声明依赖，而不是逐个接口夹 `Depends(get_current_user)` ——
+# 后者会随新增接口而漏（这正是本次修复的由来）：
+# 此前本文件 16 个接口（岗位列表 / 详情 / 7 个统计 / 分析 / 薪资预测 /
+# 推荐 / 技能画像）**都没有认证依赖**，任何人无需登录即可读取。
+# 实测：无 token 请求 `POST /api/jobs/page` 返回 200 + 岗位数据，
+# `GET /api/jobs/predict-salary` 返回薪资区间数字。
+# 而同项目其它接口（如 `/api/system/version`、`/api/user/list`）都返回 401，
+# 说明这是遗漏而非有意公开。
+#
+# 注：前端全部经 axios 实例调用，拦截器会自动附带 Authorization，因此不受影响。
+router = APIRouter(
+    prefix="/api/jobs",
+    tags=["岗位"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 @router.post("/")

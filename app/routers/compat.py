@@ -424,7 +424,19 @@ async def compat_delete_user(
 
 @router.get("/api/auth/default-username", deprecated=True)
 async def compat_default_username():
-    """登录页表单预填用户名（仅用户名，不含密码）。"""
+    """登录页表单预填用户名（仅用户名，不含密码）。
+
+    **仅在非生产环境启用** —— 与相邻的 ``/api/auth/auto-login`` 同一个理由：
+    该接口**无条件**返回管理员用户名，等于把「用户名」这半个凭据递给任何
+    能访问到本服务的人（配合文档里公开的默认口令就是完整凭据）。
+    生产环境必须 403。
+
+    （此前漏了这个判断，而隔壁的 auto-login 有 —— 同一段代码里两个同类接口
+    安全策略不一致，本身就是它被漏掉的信号。）
+    """
+    if settings.app_env.lower() in {"production", "prod"}:
+        raise AppException("生产环境已禁用该接口", 403)
+
     return Result.success({"username": "admin"})
 
 
@@ -458,9 +470,19 @@ async def compat_auto_login(db: AsyncSession = Depends(get_db)):
 # ============================================================ 岗位分析补充接口
 
 
-@router.get("/api/jobs/analysis/top-titles", deprecated=True)
+@router.get(
+    "/api/jobs/analysis/top-titles",
+    deprecated=True,
+    dependencies=[Depends(get_current_user)],
+)
 async def compat_top_titles(db: AsyncSession = Depends(get_db)):
-    """热门岗位标题 TOP10（前端分析页图表使用）。"""
+    """热门岗位标题 TOP10（前端分析页图表使用）。
+
+    **必须要求登录**：岗位数据属业务数据。
+    注意本文件用完整路径注册（router 无 prefix），所以
+    `app/routers/jobs.py` 的 router 级依赖**覆盖不到这里** ——
+    挂在 `/api/jobs` 前缀下的兼容接口必须各自声明。
+    """
     stmt = (
         select(Job.title, func.count(Job.id).label("cnt"))
         .where(Job.title.isnot(None))
@@ -472,12 +494,20 @@ async def compat_top_titles(db: AsyncSession = Depends(get_db)):
     return Result.success([{"name": row[0], "count": row[1]} for row in rows])
 
 
-@router.get("/api/jobs/{job_id}/detail-html", deprecated=True)
+@router.get(
+    "/api/jobs/{job_id}/detail-html",
+    deprecated=True,
+    dependencies=[Depends(get_current_user)],
+)
 async def compat_job_detail_html(
     job_id: int,
     db: AsyncSession = Depends(get_db),
 ):
-    """返回岗位详情 HTML（前端「方案A：本地详情页」使用）。"""
+    """返回岗位详情 HTML（前端「方案A：本地详情页」使用）。
+
+    同 `compat_top_titles`：相容接口挂 `/api/jobs` 前缀但不受 jobs.py 的
+    router 级依赖保护，因此在这里单独声明登录要求。
+    """
     job = await db.get(Job, job_id)
     if not job:
         raise AppException("岗位不存在", 404)
