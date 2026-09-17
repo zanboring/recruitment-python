@@ -1,3 +1,4 @@
+import logging
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -34,13 +35,28 @@ async def lifespan(app: FastAPI):
     # 里也没有预置数据库），于是通用版在干净机器上启动时，下面的
     # init_default_admin 会先查 user 表 → no such table: user
     # → Application startup failed，绿色软件「拷过去就能用」的前提不成立。
-    # create_all 是幂等的：只创建缺失的表，不改动已存在表的结构
-    #（表结构升级仍按 README「表结构变更（升级须知）」手工处理）。
+    # create_all 是幂等的：只创建缺失的表，不改动已存在表的结构。
     from app.database import Base, engine
     import app.models  # noqa: F401  导入以把全部表注册进 Base.metadata
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+        # create_all **不会给已存在的表加列**（SQLAlchemy 既定语义）。
+        # 于是「给模型加一列」在旧库上不生效，且失败时机极晚：
+        # 启动一切正常，直到有人访问该表的接口才报 Unknown column → 500，
+        # 而且因为 SELECT 会列出模型全部列，**整个表的查询都会挂**而不只是用到新列的。
+        # 曾靠 README 的手工补列清单兜底，但清单已漏项（job.last_checked_at 从未入册），
+        # 说明这条路不可靠 → 改为启动时自动补齐「缺失的列」（只增列，见 schema_sync）。
+        from app.schema_sync import sync_missing_columns
+        sync_result = await sync_missing_columns(conn)
+
+    if sync_result.has_added or sync_result.skipped:
+        # 逐列的补齐/失败已在 schema_sync 内按级别记录，这里补一条汇总，
+        # 便于在启动日志里一眼确认「数据库结构是否落后于代码」。
+        logging.getLogger("app.startup").info(
+            "数据库结构自检：%s", sync_result.summary()
+        )
 
     from app.scheduler import start_scheduler
     start_scheduler()

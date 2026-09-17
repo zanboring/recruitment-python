@@ -709,18 +709,46 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 
 ### 表结构变更（升级须知）
 
-`user` 表新增 `enabled` 字段（账号启用/禁用，前端用户管理页依赖它）。
-全新部署执行 `python scripts/init_db.py` 会自动带上；**已有旧库**需手动补列：
+**加列与建表都不需要手动执行 SQL 了** —— 应用启动时会自动对齐：
 
-```sql
--- MySQL
-ALTER TABLE `user` ADD COLUMN `enabled` TINYINT(1) NOT NULL DEFAULT 1;
+| 场景 | 谁处理 | 行为 |
+|---|---|---|
+| 缺表 | `Base.metadata.create_all` | 只创建不存在的表 |
+| 缺列 | `app/schema_sync.py` | 自动 `ALTER TABLE ... ADD COLUMN` |
 
--- SQLite
-ALTER TABLE user ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT 1;
+**为什么改成自动**（这段值得读，它记录了一个真实缺陷）：
+
+`create_all` **不会给已存在的表加列** —— 这是 SQLAlchemy 的既定语义，不是 bug。
+于是「给模型加一列」这个动作在**旧库上静默不生效**，而失败时机极晚：
+
+1. 启动日志完全正常（`create_all` 无报错、默认管理员创建成功）；
+2. 直到有人访问该表的接口，才抛 `Unknown column` / `no such column` → HTTP 500；
+3. **影响面是该表的全部查询，而不是"用到新列的那一个"** ——
+   因为 SQLAlchemy 的 `SELECT` 会列出模型里的所有列。给 `job` 加一列，
+   会让岗位列表、统计图表、AI 工具查询**同时**挂掉。
+
+以往靠本节的「手工补列清单」兜底，但**那份清单已经漏项**：
+`job.last_checked_at` 是后加的列，其补列语句从未被写进 README。
+这说明「靠人记得同步文档」这条路径不可靠 ——
+文档是给人读的，而 schema 漂移会在**没人读文档时**爆发。
+
+**安全边界（刻意保守）**：
+
+- **只增列**，绝不删除列、绝不修改类型或约束 —— `ADD COLUMN` 对已有数据安全
+  （新列取 NULL 或服务端默认值）
+- 主键 / 唯一约束 / `NOT NULL` 且无服务端默认值的列**不自动处理**，
+  改为启动时明确报错并指出"该表的查询会持续返回 500" ——
+  这类改动不可能是"无感升级"，需要人工判断
+
+启动日志里能看到结果，例如：
+
+```
+检测到数据库缺列并已自动补齐：job.last_checked_at
+  （语句：ALTER TABLE job ADD COLUMN last_checked_at DATETIME）
 ```
 
-未补列时用户相关接口会因缺列报错。
+> 回归测试：`tests/test_schema_sync.py`（12 项），其中一条走**真实 lifespan**
+> 端到端验证「旧库启动后列真的被补上」—— 因为函数级测试测不到"接线"是否还在。
 
 **密码哈希方案已升级**（`sha256$` 前缀的「SHA-256 预哈希 + bcrypt」）：
 原实现直接 `pwd.encode()[:72]` 截断，而 schema 允许 128 字符，导致「100 个 A」
@@ -728,37 +756,21 @@ ALTER TABLE user ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT 1;
 **老哈希无需迁移**：校验时会识别前缀，无前缀的按原路径校验，因此老账号仍可登录；
 用户下次改密时会自动写入新格式。
 
-新增 `ai_usage` 表（AI 用量与成本统计）。全新部署执行 `python scripts/init_db.py`
-会自动建表；**已有旧库**需手动建表：
-
-```sql
--- MySQL
-CREATE TABLE `ai_usage` (
-  `id`                INT AUTO_INCREMENT PRIMARY KEY,
-  `user_id`           INT NULL,
-  `scene`             VARCHAR(32)  NOT NULL DEFAULT 'chat',
-  `provider`          VARCHAR(32)  NULL,
-  `model`             VARCHAR(64)  NULL,
-  `tier`              VARCHAR(16)  NULL,
-  `prompt_tokens`     INT DEFAULT 0,
-  `completion_tokens` INT DEFAULT 0,
-  `total_tokens`      INT DEFAULT 0,
-  `latency_ms`        INT DEFAULT 0,
-  `success`           INT DEFAULT 1,
-  `error_msg`         VARCHAR(255) NULL,
-  `cost`              DOUBLE DEFAULT 0,
-  `created_at`        DATETIME DEFAULT CURRENT_TIMESTAMP,
-  INDEX `ix_ai_usage_created_at` (`created_at`),
-  INDEX `ix_ai_usage_scene_created` (`scene`, `created_at`),
-  INDEX `ix_ai_usage_provider_model` (`provider`, `model`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
+新增 `ai_usage` 表（AI 用量与成本统计）—— **不需要手工建表**：
+"缺表"由 `create_all` 在启动时自动覆盖（新旧库都一样）。
 
 未建表时**不影响业务** —— 用量记录写入失败只记日志（见 `usage_service.record`），
 `GET /api/model/usage` 会返回空汇总。
 
 另外为三张高频查询表补了索引（`sys_log` / `knowledge_base` 此前完全没有索引，
-实测日志分页与**每一次 AI 对话的知识库检索**都是全表扫描）。旧库需手动补：
+实测日志分页与**每一次 AI 对话的知识库检索**都是全表扫描）。
+
+> **索引为什么不像加列那样自动补？** 因为两者代价差着数量级：
+> `ADD COLUMN` 在数据库里只是改元数据（毫秒级、不锁表），
+> 而 `CREATE INDEX` 在已有数据的表上是 **O(n) 操作，可能持续数十秒并锁表** ——
+> 放进启动流程会让服务卡住甚至启动超时。**"能自动"不等于"该自动"**：
+> 自动化的边界应画在"代价可忽略且语义安全"的操作上。
+> 所以索引保留手工执行，由使用者自己挑低峰时段：
 
 ```sql
 -- MySQL
