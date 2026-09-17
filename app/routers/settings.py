@@ -18,6 +18,7 @@ from pydantic import BaseModel, model_validator
 
 from app.config import RUNTIME_EDITABLE_KEYS, masked, settings, save_runtime_config
 from app.dependencies import get_current_user, require_admin
+from app.exceptions import AppException
 from app.models.user import User
 from app.schemas.common import Result
 
@@ -114,7 +115,8 @@ async def update_provider_config(
     try:
         result = save_runtime_config(pairs)
     except ValueError as e:
-        return Result.failed(str(e))
+        # 与项目其余接口一致的业务异常出口（400 + 可读 message）
+        raise AppException(str(e), 400)
 
     # 返回脱敏后的最新状态，前端据此刷新展示
     status = ProviderStatus(

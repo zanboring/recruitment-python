@@ -86,12 +86,17 @@ async def test_post_provider_rejects_newline(client, db_session, tmp_path):
     cfg.save_runtime_config.__globals__["runtime_env_file"] = fake_runtime_env_file
 
     c = await _admin_client(client, db_session)
-    await c.post("/api/settings/provider", json={
+    resp = await c.post("/api/settings/provider", json={
         "deepseekApiKey": "sk-abc\nJWT_SECRET=hacked",
     })
     # 核心断言：注入行没有写盘
     disk = fake_env.read_text(encoding="utf-8")
     assert "JWT_SECRET=hacked" not in disk
+    # 补充断言（回应 WorkBuddy 500 关切）：换行错误应返回业务错误而非 HTTP 500
+    assert resp.status_code != 500
+    body = resp.json()
+    assert body.get("code") != 0  # Result.failed
+    assert "换行" in (body.get("message") or "")
 
 
 @pytest.mark.asyncio
