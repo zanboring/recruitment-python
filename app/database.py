@@ -25,7 +25,6 @@ else:
             DATABASE_URL = f"sqlite+aiosqlite:///./{db_name}"
     else:
         DATABASE_URL = f"mysql+aiomysql://{settings.db_username}:{encoded_password}@{settings.db_host}:{settings.db_port}/{settings.db_name}?charset=utf8mb4"
-
 def engine_kwargs_for(url: str) -> dict:
     """按方言裁剪连接池参数。
 

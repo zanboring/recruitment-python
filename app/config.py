@@ -191,12 +191,27 @@ class Settings(BaseSettings):
     # ``production`` enables fail-fast checks at application startup.
     app_env: str = "development"
     db_url: str = ""
-    # 数据库类型：mysql（默认）| postgres | sqlite。
+    # 数据库类型：sqlite（打包版默认）| mysql | postgres。
     # 显式设置 DB_URL 时以 DB_URL 为准（优先级更高）。
-    db_type: str = "mysql"
+    #
+    # 为什么打包版的默认值必须是 sqlite（这是一个真实缺陷的修复）：
+    # 源码模式的默认值曾是 mysql —— 本地开发机上确实跑着 MySQL，所以看不出问题。
+    # 但「通用版」是给别人的绿色软件，`config.template.env` 里也明写 DB_TYPE=sqlite
+    # 「零依赖、不需要安装 MySQL」。一旦用户**还没放 config.env** 就双击 exe
+    # （这是新用户的第一个动作），默认值会指向 mysql+aiomysql://localhost:3306
+    # → 连不上 → 启动失败。而 SQLite 是内置的，永远连得上。
+    # 见 tests/test_packaging_integrity.py::test_打包版默认用零依赖数据库
+    db_type: str = "sqlite" if getattr(sys, "frozen", False) else "mysql"
     db_host: str = "localhost"
     db_port: int = 3306
-    db_name: str = "recruitment_db"
+    # 打包版把库文件落在 exe 同目录（绝对路径），这样「整个目录拷走即用」才成立 ——
+    # 相对路径会依赖启动时的 CWD：双击图标启动时 CWD 是 exe 目录（碰巧对），
+    # 但从命令行在别处执行、或被快捷方式改了「起始位置」时，库会落到别的地方。
+    db_name: str = (
+        str(Path(sys.executable).resolve().parent / "recsys.db")
+        if getattr(sys, "frozen", False)
+        else "recruitment_db"
+    )
     db_username: str = "root"
     db_password: str = ""
 

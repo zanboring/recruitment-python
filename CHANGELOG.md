@@ -13,6 +13,38 @@ GitHub Release 的 tag 必须与之一致（`v1.0.0`）—— 更新检查就是
 
 ## [Unreleased]
 
+### 修复（打包产物，均为「测试全绿但产物不可用」类缺陷）
+
+- **通用版 exe 在干净机器上启动即崩**：`ModuleNotFoundError: No module named 'aiomysql'`。
+  根因是打包环境残缺且无人校验 —— `app/database.py` 的方言驱动是 SQLAlchemy
+  **运行时动态 import** 的（驱动名拼在 URL 字符串里，文件里没有 `import aiomysql`），
+  所以 PyInstaller 静态分析看不到；`recsys.spec` 的 `hiddenimports` 虽已声明，
+  但 `hiddenimports` 只能「让打进去」，不能凭空变出**没安装**的包。
+  那次打包用的解释器只装了 `pyinstaller` + `aiosqlite`，于是静默打出缺驱动的产物。
+  → `build-exe.bat` 新增打包**前**（依赖可导入）与打包**后**（驱动确实在 `_internal/`）
+  两段校验，任一失败即 `exit /b 1` 中止，不再产出残缺 exe。
+- **通用版默认连 MySQL 而非内置 SQLite**：`config.py` 的 `db_type` 默认值是 `mysql`，
+  而 `config.template.env` 承诺「零依赖、不需要安装 MySQL」。
+  新用户下载后**还没放 config.env** 就双击 exe（第一个动作），
+  默认值会指向 `mysql+aiomysql://localhost:3306` → 目标机器没有 MySQL → 启动失败。
+  开发机上跑着 MySQL，源码模式连得上，**所有测试也都是源码模式跑的**，
+  所以这个区间从未被覆盖。
+  → 打包版（`sys.frozen`）默认 `db_type=sqlite`；源码模式行为不变。
+- **打包版数据库文件会随启动目录漂移**：SQLite 分支原用相对路径 `./recruitment_db`，
+  库落到哪取决于 CWD —— 双击图标时恰好是 exe 目录（碰巧对），
+  但从别处命令行启动、或快捷方式改了「起始位置」时就落到别处，
+  用户会以为「数据丢了」。绿色软件承诺「整个目录拷走即用」，必须是绝对路径。
+  → 打包版 `db_name` 固定为 exe 同目录下的绝对路径。
+
+### 新增
+
+- **打包完整性回归测试** `tests/test_packaging_integrity.py`（6 项）：
+  覆盖「依赖清单 / spec hiddenimports / 构建脚本自检 / 驱动动态导入」四个环节，
+  以及「打包版默认零依赖数据库 / 库文件落在 exe 同目录」。
+  每项都做过「撤掉修复必须失败」的验证，不是永远绿的假回归。
+  这类缺陷的共同特征是：**测试覆盖了代码逻辑，但没覆盖打包产物在陌生环境里的行为** ——
+  所以必须专门测「frozen 模式下的默认值」与「产物里确实有驱动」。
+
 ### 计划中
 
 - 浏览器扩展 / 油猴脚本采集通道：在真实登录态的浏览器里按人操作节奏采集，

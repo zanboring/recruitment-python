@@ -41,4 +41,8 @@ env/config.env
 # PyInstaller 打包产物（本地生成，发布走 GitHub Release 附件）
 build/
 dist/
+# 用 --distpath/--workpath 指定别的输出目录时（例如为了绕开被占用的 dist/）
+# 也必须忽略，否则构建产物会被误提交
+build_*/
+dist_*/
 *.spec.bak
