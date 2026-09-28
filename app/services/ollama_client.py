@@ -56,6 +56,22 @@ def _cfg(cfg=None):
     return cfg if cfg is not None else settings
 
 
+def _think_option(conf=None) -> dict:
+    """返回思考模式参数，供 payload 直接展开。
+
+    为什么必须**显式**发送 ``think: false`` 而不能省略该字段：
+    Qwen3 / Qwen3.5 这类混合推理模型的 chat_template 里默认进入思考段
+    （``<think>`` 无闭合即续写），省略该字段等于把决定权交给模型模板，
+    结果是正式回答之前先产出一整段 ``thinking``。本项目只消费
+    ``message.content``，思考段不但用不上，还会占掉 num_predict 预算，
+    表现为「首字延迟翻倍 + 回答中途截断」。
+
+    对不支持思考的模型（qwen2.5 系列等）传 ``false`` 是被接受的 ——
+    Ollama 只在传入 truthy 值时才回报 400，因此这里可以无条件下发。
+    """
+    return {"think": bool(getattr(_cfg(conf), "ollama_think", False))}
+
+
 def resolve_model(role: str = ROLE_CHAT, cfg=None) -> str:
     """按任务角色返回应使用的本地模型名。
 
@@ -215,7 +231,12 @@ async def chat_stream(
     target = model or resolve_model(role, conf)
     await ensure_model(target, conf)
 
-    payload: dict = {"model": target, "messages": messages, "stream": True}
+    payload: dict = {
+        "model": target,
+        "messages": messages,
+        "stream": True,
+        **_think_option(conf),
+    }
     merged = dict(options or {})
     if max_tokens:
         merged["num_predict"] = int(max_tokens)
@@ -272,7 +293,12 @@ async def chat_sync(
     target = model or resolve_model(role, conf)
     await ensure_model(target, conf)
 
-    payload: dict = {"model": target, "messages": messages, "stream": False}
+    payload: dict = {
+        "model": target,
+        "messages": messages,
+        "stream": False,
+        **_think_option(conf),
+    }
     if options:
         payload["options"] = options
     if tools:

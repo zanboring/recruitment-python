@@ -271,6 +271,16 @@ class Settings(BaseSettings):
     ollama_code_model: str = "qwen2.5-coder:7b"
     ollama_tool_model: str = ""
 
+    # 思考模式开关（Qwen3 / Qwen3.5 等「混合推理」模型必需）。
+    # 这类模型的 chat_template 默认进入思考段：正式回答前先输出一整段
+    # ``thinking``，且这段内容同样消耗 num_predict 预算。对本项目的影响是
+    # 「首字延迟成倍增加 + 回答被思考内容挤占而截断」—— 而代码只读
+    # ``message.content``，思考段完全不会被使用，纯属净损耗。
+    # 关闭方式必须走请求体的 ``think: false``（见 ollama_client._think_option），
+    # 改提示词或调 temperature 都无效。
+    # 置 true 可恢复思考链，此时调用方需自行读取 ``message.thinking``。
+    ollama_think: bool = False
+
     # ---- ReAct Agent ----
     # 多步推理 Agent 的最大步数上限。每步都是一次完整 LLM 调用（有成本、有延迟），
     # 必须给循环一个上界，防止模型反复调用工具造成死循环或成本失控。
