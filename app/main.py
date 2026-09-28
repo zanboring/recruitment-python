@@ -165,18 +165,24 @@ def create_app() -> FastAPI:
                 or path == "/docs"
                 or path == "/openapi.json"
                 or path == "/favicon.ico"
+                or path == "/"  # 根路径交给 @app.get("/") 处理，避免被本中间件劫持
             ):
                 return await call_next(request)
             # 非 API 的 GET 请求：交给 index.html（SPA 前端路由接管）
+            # 必须用 _resolve_frontend_index() 解析出的绝对路径：打包后工作
+            # 目录下不存在源码相对路径 frontend/dist/，写死会导致根路径 500。
             if request.method == "GET":
-                return FileResponse("frontend/dist/index.html")
+                return FileResponse(str(dist_index))
             return await call_next(request)
     else:
+        static_index = _resolve_static_index()
+        static_dir = str(static_index.parent) if static_index is not None else "app/static"
+
         @app.get("/")
         async def root_fallback():
-            return FileResponse("app/static/index.html")
+            return FileResponse(str(static_index) if static_index is not None else "app/static/index.html")
 
-        app.mount("/static", StaticFiles(directory="app/static"), name="static")
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     return app
 
@@ -194,6 +200,22 @@ def _resolve_frontend_index() -> Path:
             Path(__file__).resolve().parent.parent / "frontend" / "dist" / "index.html",
             Path(__file__).resolve().parent.parent / "frontend_dist" / "index.html",
         ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _resolve_static_index():
+    """解析 app/static 回退页面路径（兼容源码 / PyInstaller）。打包后
+    app/static 被打成 _MEIPASS/app_static，源码相对路径同样不可用。"""
+    if getattr(sys, "frozen", False):
+        candidates = [
+            Path(sys._MEIPASS) / "app_static" / "index.html",  # noqa: SLF001
+            Path(sys.executable).resolve().parent / "app_static" / "index.html",
+        ]
+    else:
+        candidates = [Path(__file__).resolve().parent / "static" / "index.html"]
     for c in candidates:
         if c.exists():
             return c
