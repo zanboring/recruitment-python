@@ -423,6 +423,18 @@ class Settings(BaseSettings):
     # 绿色版可能跑在内网/离网机器上，启动即联网只会带来无谓等待与失败日志。
     update_check_enabled: bool = True
 
+    # ================= Redis + Docker 架构硬化（CodeBuddy 区块） =================
+    # 限流计数后端：memory（默认，进程内滑动窗口）/ redis（跨副本共享计数）。
+    # 设为 redis 时需同时配置 REDIS_URL（如 redis://localhost:6379/0）；
+    # Redis 不可用（未配置 / 连接失败 / 脚本报错）时自动降级回内存并记 warning，
+    # 请求不中断 —— 延续 app/cache.py 已定下的原则「缓存是加速手段，不是正确性依赖」。
+    #
+    # 【为什么默认值必须是 memory】
+    # 单进程部署下内存实现完全正确且零依赖；新配置项的默认值不得改变现有单机行为
+    # （redis_url 为空时项目必须与改造前完全一致地跑起来）。
+    # 多副本部署时改为 redis —— 否则 N 个副本各算一份计数，登录防爆破配额会变成 N 倍。
+    rate_limit_backend: str = "memory"
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, v):

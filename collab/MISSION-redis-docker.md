@@ -297,6 +297,41 @@ git push origin dev-workbuddy dev-codebuddy
 
 <!-- 待 CodeBuddy 追加 -->
 
+## DELIVER 2026-10-10 13:37 P0-1 Redis 滑动窗口限流（Lua + ZSET，内存降级）
+
+**改了什么**
+
+| 文件 | 改动 | 与在飞改动是否重叠 |
+|---|---|---|
+| `app/middleware/rate_limit.py` | 新增 `RedisSlidingWindowLimiter` + `_SLIDING_WINDOW_LUA`；`RateLimitMiddleware` 新增 `_check()` 统一出口（Redis 优先、不可用降级内存）。**内存版 `SlidingWindowLimiter` 与 `default_limiter` 一行未改** | 无（该文件此前干净） |
+| `app/config.py` | `Settings` 类末尾新增「Redis + Docker 架构硬化（CodeBuddy 区块）」，加 `rate_limit_backend: str = "memory"` | **有** —— 已用 patch 方式只暂存本任务 12 行，未卷入他人改动 |
+| `tests/test_rate_limit_redis.py` | 新增 20 项用例（新建文件，不依赖真实 Redis） | 无 |
+
+**四条关键设计（面试可讲）**
+
+1. **为什么必须是 Lua 而非 INCR + EXPIRE**：INCR 是固定窗口，窗口边界会双倍突发（前后两窗口各放行 limit 个）。ZSET + 时间戳天然滑动，但「清理过期 → 计数 → 写入」三步必须原子，否则并发下两个请求会同时读到 `count = limit-1` 而都放行；Lua 在 Redis 单线程内执行，天然原子。
+2. **ZSET 的 member 必须唯一**：member 相同是覆盖而非累加。若拿毫秒时间戳当 member，同毫秒并发请求会互相覆盖 → 计数偏小 → 限流失效。实现用 `f"{now_ms}-{uuid4().hex[:12]}"`。
+3. **降级契约**：`RedisSlidingWindowLimiter.check()` 在 Redis 不可用时返回 `None`（**不抛异常**），中间件回退内存 —— 限流是保护手段，不能因 Redis 故障变成 5xx 来源。连接/脚本失败进 30s 冷却，避免每请求都白等一次连接超时。
+4. **默认值保持单机行为**：`rate_limit_backend` 默认 `memory`；`REDIS_URL` 为空时连惰性建连都不做 ——「不配 Redis 时项目与改造前完全一致」。
+
+**怎么验证 / 证据在哪**
+
+| # | 验证项 | 入口 / 命令 | 实测结果 |
+|---|---|---|---|
+| 1 | 全量测试 | `.venv/Scripts/python.exe -m pytest -q --tb=line -p no:warnings` | **717 passed / 0 failed**（697 → 717，+20） |
+| 2 | **A2 单机不回归** | TestClient 走完整 lifespan（不设 `REDIS_URL`） | `ROOT_STATUS=200`、`HAS_APP_DIV=True`、`/api/system/version=401`（预期） |
+| 3 | 默认后端限流仍生效 | 连打 12 次 `POST /api/auth/login`（limit=10） | `[401×10, 429, 429]` |
+| 4 | **跨副本共享计数** | `test_redis后端跨副本共享计数_总放行等于上限` | 2 实例共享同一 Redis → 总放行 **= limit** |
+| 5 | 对照组（证明 #4 不恒真） | `test_对照_内存后端双副本放行翻倍` | 内存后端 2 实例 → 总放行 **= 2 × limit** |
+
+**⚠️ 诚实局限（A3 需在有真实 Redis 的环境验收）**
+
+`tests/test_rate_limit_redis.py` 用自写替身 `FakeRedis`（符合约束「新用例不得依赖真实 Redis 进程」），
+代价是：**Lua 脚本本身的正确性无法在单测里被证明**（替身是 Python 版同一算法）。
+真实 Redis 下的 A3（起 2 worker 并发打登录接口、总放行 ≤ 配置上限）**本机无法实测** ——
+环境未安装 Docker / Redis（已确认 `docker` 命令不存在）。
+请验收方在有 Redis 的环境执行；如需 `fakeredis` 版本（需新增依赖），我未擅自引入，可另行授权。
+
 ---
 
 ## 8. 验收记录（WorkBuddy 填写）
