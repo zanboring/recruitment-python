@@ -469,6 +469,18 @@ class Settings(BaseSettings):
             return backend
         return "zhipu" if self.zhipuai_api_key else "ollama"
 
+    # ================= 多副本会话历史（Trae 区块） =================
+    # AI 对话会话历史后端：memory（默认，进程内）/ redis（跨副本共享）。
+    #
+    # 【为什么需要外置】会话历史是 AI 应用的核心状态。进程内实现在单进程下
+    # 完全正确，但多副本部署时同一 session_id 的请求会被负载均衡分到不同副本，
+    # 用户会看到「上一轮说过的话这一轮不见了」（历史分片 / 串台）。
+    # 设为 redis 后会话历史落 Redis，TTL 由 Redis EXPIRE 原生管理
+    # （替代内存后端手工的容量淘汰）；Redis 不可用（未配置 / 连接失败）时
+    # 自动降级回进程内实现，行为与改造前完全一致。
+    # 默认值必须是 memory —— 不得改变现有单机行为。
+    session_backend: str = "memory"
+
 
 _config_files = _candidate_env_files()
 # 两层来源语义不同：

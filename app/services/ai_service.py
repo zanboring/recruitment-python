@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -25,6 +26,76 @@ _history_lock = asyncio.Lock()
 # 进程内取消标记：记录被用户主动取消的会话。
 # 同样按「用户 + session」维度隔离，避免 A 用户取消掉 B 用户的流式请求。
 _cancelled_sessions: set = set()
+
+
+# ================= 会话历史后端（多副本：SESSION_BACKEND） =================
+#
+# 为什么需要外置：会话历史是 AI 应用的核心状态。上面的 conversation_history /
+# _session_touched_at 是**进程内**实现，单进程下完全正确；但扩到多副本后，同一
+# session_id 的请求会被负载均衡分到不同副本 —— 用户会看到「上一轮说过的话这一轮
+# 不见了」（历史分片），甚至两轮对话落在不同副本上互相读不到（串台）。
+#
+# 三条约束（延续 app/cache.py 与 RedisCircuitBreaker 的既定原则）：
+#   1. 默认 memory（SESSION_BACKEND），单机行为逐字节不变；
+#   2. SESSION_BACKEND=redis 且配置 REDIS_URL 时启用，Redis 不可用自动降级进程内；
+#   3. TTL 交给 Redis 原生 EXPIRE 管理，替代内存后端手工的 _evict_if_needed 淘汰。
+#
+# Redis 里用 LIST 存历史：追加走 RPUSH（单命令，天然支持多副本并发写，不做
+# 读-改-写，因此不会丢更新），读取走 LRANGE，过期由 EXPIRE 兜底。
+_SESSION_KEY_PREFIX = "recsys:chat:"
+_session_redis_client = None          # 连接单例；测试可注入替身（不依赖真实 Redis）
+_session_redis_cooldown_until = 0.0
+
+
+def _session_backend() -> str:
+    return str(getattr(settings, "session_backend", "memory") or "memory").strip().lower()
+
+
+def _redis_session_key(session_key: str) -> str:
+    return f"{_SESSION_KEY_PREFIX}{session_key}"
+
+
+def set_session_redis_client(client):
+    """注入 Redis 客户端替身（仅测试使用；传 None 清除）。
+
+    注入即视为启用 Redis 后端 —— 用例借此覆盖 Redis 路径而**不依赖真实 Redis 进程**。
+    """
+    global _session_redis_client
+    _session_redis_client = client
+
+
+def _session_redis_enabled() -> bool:
+    """是否应走 Redis 后端（同步判定，供无法 await 的 clear_session 使用）。"""
+    if _session_redis_client is not None:
+        return True
+    return _session_backend() == "redis" and bool(getattr(settings, "redis_url", ""))
+
+
+async def _get_session_redis():
+    """惰性建立 Redis 连接；未启用 / 连接失败时返回 None（调用方退回内存实现）。"""
+    global _session_redis_client, _session_redis_cooldown_until
+    if _session_redis_client is not None:
+        return _session_redis_client
+    if _session_backend() != "redis":
+        return None
+    url = getattr(settings, "redis_url", "")
+    if not url:
+        return None
+    now = time.monotonic()
+    if now < _session_redis_cooldown_until:
+        return None
+    try:
+        import redis.asyncio as aioredis
+
+        client = aioredis.from_url(url, decode_responses=True, socket_connect_timeout=2)
+        await client.ping()
+    except Exception as e:  # noqa: BLE001 - 连接失败一律降级，绝不影响对话
+        _session_redis_cooldown_until = now + 30.0
+        logger.warning("会话历史 Redis 不可用（30s 内降级进程内）：%s", e)
+        return None
+    _session_redis_client = client
+    logger.info("会话历史已启用 Redis 后端：%s", url)
+    return client
 
 
 def _session_key(session_id: str, user_id=None) -> str:
@@ -57,13 +128,44 @@ def clear_session(session_id: str, user_id=None):
     conversation_history.pop(key, None)
     _session_touched_at.pop(key, None)
     _cancelled_sessions.discard(key)
+    _schedule_session_delete(key)
+
+
+def _schedule_session_delete(key: str) -> None:
+    """Redis 后端下尽力删除会话键。
+
+    clear_session 是同步接口（多处同步调用），而 Redis 删除是异步的，故投递到当前
+    事件循环执行；没有运行中的事件循环时不做任何事 —— 该键仍由 Redis TTL 到期回收，
+    语义上不会留下可读到的历史。
+    """
+    if not _session_redis_enabled():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(_delete_redis_session(key))
+
+
+async def _delete_redis_session(key: str) -> None:
+    client = await _get_session_redis()
+    if client is None:
+        return
+    try:
+        await client.delete(_redis_session_key(key))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("会话历史 Redis 删除失败（忽略，由 TTL 回收）：%s", e)
 
 
 def reset_runtime_state():
     """清空全部进程内状态，仅供测试隔离使用。"""
+    global _session_redis_client, _session_redis_cooldown_until
     conversation_history.clear()
     _session_touched_at.clear()
     _cancelled_sessions.clear()
+    # 连 Redis 客户端（含测试注入的替身）一并复位，避免用例之间互相污染。
+    _session_redis_client = None
+    _session_redis_cooldown_until = 0.0
 
 
 def _evict_if_needed(now: float):
@@ -81,6 +183,13 @@ def _evict_if_needed(now: float):
 
 async def _get_conversation_history(session_id: str, user_id=None) -> list:
     key = _session_key(session_id, user_id)
+    client = await _get_session_redis()
+    if client is not None:
+        try:
+            raw = await client.lrange(_redis_session_key(key), 0, -1)
+            return [json.loads(item) for item in raw]
+        except Exception as e:  # noqa: BLE001 - 读失败退回内存，绝不打断对话
+            logger.warning("会话历史 Redis 读取失败，降级进程内：%s", e)
     async with _history_lock:
         now = time.monotonic()
         records = conversation_history.get(key)
@@ -95,6 +204,22 @@ async def _get_conversation_history(session_id: str, user_id=None) -> list:
 
 async def _update_conversation_history(session_id: str, user_message: str, ai_response: str, user_id=None):
     key = _session_key(session_id, user_id)
+    client = await _get_session_redis()
+    if client is not None:
+        try:
+            redis_key = _redis_session_key(key)
+            # 一次 RPUSH 写入两条记录（单命令原子），再 LTRIM 截断、EXPIRE 续期。
+            # 三步都不做读-改-写，多副本并发追加同一会话也不会丢消息。
+            await client.rpush(
+                redis_key,
+                json.dumps({"role": "user", "content": user_message}, ensure_ascii=False),
+                json.dumps({"role": "assistant", "content": ai_response}, ensure_ascii=False),
+            )
+            await client.ltrim(redis_key, -MAX_HISTORY_TURNS, -1)
+            await client.expire(redis_key, SESSION_TTL_SECONDS)
+            return
+        except Exception as e:  # noqa: BLE001 - 写失败退回内存，绝不打断对话
+            logger.warning("会话历史 Redis 写入失败，降级进程内：%s", e)
     async with _history_lock:
         now = time.monotonic()
         if key not in conversation_history:
