@@ -319,6 +319,61 @@ git -C D:\Dev\recruitment-python rev-parse --abbrev-ref HEAD   # 应输出 dev-c
 Docker Desktop 装的时候请让用户把 **Disk image location 指到 `G:\Work\docker`**
 （用户已在 G 盘预留了该目录），别吃 C 盘仅剩的 402 GB。
 
+---
+
+## MSG 2026-10-10 14:00 【⚠️ 待处理】`app/config.py` 里压着 108 行未提交改动，已造成实际阻塞
+
+### 现象（实测，非推测）
+
+我提交完验收记录后想 `git checkout dev-workbuddy`，被 git 拒绝：
+
+```
+error: Your local changes to the following files would be overwritten by checkout:
+	app/config.py
+	collab/MISSION-redis-docker.md
+```
+
+### 根因
+
+`app/config.py` 现在**同时**承载三层改动：
+
+| 层 | 行数 | 来源 | 状态 |
+|---|---|---|---|
+| 你的 Redis 配置项 | **13 行**（+） | `9b411d1`（你已提交） | ✅ 已入库 |
+| 早期会话的反爬护栏配置 | **108 行**（+） | **不属于任何人当前任务** —— 疑为 `CRAWL_DOMAIN_MIN_INTERVAL` / `CRAWL_DAILY_QUOTA_PER_PLATFORM` / `CRAWL_ROBOTS_CHECK_ENABLED` / `SCHEDULED_CRAWL_GAP_*` 那批，从未提交 | ⚠️ 悬空 |
+| 其余文件 | — | 工作树里另外 ~14 个文件同样悬空 | ⚠️ 悬空 |
+
+后果：**任何跨分支的 `git checkout` 都会被 git 拒绝**，因为切到 `dev-workbuddy` 需要把
+`app/config.py` 回退到不含你 13 行的版本，而那会覆盖 108 行未提交改动。
+
+**我已经做的处置**：`git branch -f dev-workbuddy dev-codebuddy`（确认过是快进，不丢历史），
+现在两个分支都停在 `8db828f`，暂时一致。**但这只是把症状绕开，根因还在。**
+
+### 为什么我没有自行处理
+
+那 108 行**不是我的、也不是你的**。直接提交会把它和你的 Redis 改动混成一个提交，
+之后无法分离「谁改了什么」——这正是任务书里反复强调要避免的事。
+**必须由了解那批改动的人（或用户）决定：提交、还原、还是单独成一个 commit。**
+
+### 请你配合两点
+
+1. **不要再往 `app/config.py` 追加东西**了，除非你也用「只暂存自己那几行」的 patch 方式。
+   这个文件现在很脆。
+2. **P0-2 我要动 `app/crawlers/throttle.py`（归我），但它需要新增 `QUOTA_BACKEND` 配置项** ——
+   而配置项要加在 `app/config.py`。在这 108 行悬空的情况下加配置风险很高。
+   **所以 P0-2 我暂时搁置，等 `app/config.py` 清干净再动。**
+   如果你觉得应该先清，请回复你的判断，我按你的意见执行。
+
+### 建议给用户的处置（供你参考，最终由用户拍板）
+
+```bash
+# 方案：把那 108 行单独提交成一个「历史遗留配置」提交，与任何人的当前任务分开
+git add -p app/config.py     # 逐块选择：只选反爬护栏那批，不选其他人的
+git commit -m "chore(config): 补提交历史遗留的反爬护栏配置项"
+```
+同理处理工作树里其余悬空文件。**在那之前，两个分支都不具备干净的切换条件。**
+
+
 
 
 
