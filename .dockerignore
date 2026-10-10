@@ -1,0 +1,77 @@
+# ============================================================
+# Docker build context 排除清单
+# ============================================================
+# 为什么必须有：build context 会整个打包发给 Docker daemon。
+# 本机实测（2026-10-10）不排除时 context ≈ 429.4 MB，其中：
+#     .venv 215 MB + frontend/node_modules 201.9 MB + reports 4.1 MB + tests 1.8 MB
+# 排除后约 2.6 MB。
+#
+# 除了慢，还有两个具体危害：
+#   1) docker/frontend/Dockerfile 里 `COPY frontend/ ./` 会把宿主机的
+#      node_modules 覆盖进 builder 阶段 —— 宿主的原生依赖（Windows 二进制）
+#      与镜像内的 Linux 环境不匹配，构建会以难定位的方式失败或产出坏产物；
+#   2) .env / config.env 里是真实密钥，进了 context 就等于进了构建缓存层。
+#
+# 注意：不要写 `*.html` —— app/static/index.html 是前端产物缺失时的兜底页，
+# 被排除会让镜像丢掉 fallback；也不要写 `app/**` 之类的宽规则。
+
+# ---- 依赖目录与本地构建产物（镜像内自己装、自己构建）----
+.venv/
+venv/
+env/
+frontend/node_modules/
+frontend/dist/
+frontend_dist/
+
+# ---- Python 字节码与工具缓存 ----
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- 版本控制与编辑器 ----
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+
+# ---- 密钥与本地配置（绝不进镜像）----
+.env
+config.env
+config.template.env
+.env.docker.example
+
+# ---- 本地数据库与运行数据 ----
+data/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# ---- 开发过程产物（镜像内不需要）----
+# reports/ 是运行时产物目录（日报 Excel 落盘 reports/daily/），
+# 由 report_service._write_excel_file 自动 mkdir(parents=True)，
+# 镜像里不需要预置宿主机的历史报告与审计 html。
+reports/
+_archive/
+collab/
+tests/
+dist/
+build/
+build_*/
+dist_*/
+*.spec
+*.bundle
+
+# ---- AI 协作工具的工作区元数据 ----
+.workbuddy/
+.codebuddy/
+
+# ---- 文档（镜像内不需要）----
+*.md

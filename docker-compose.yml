@@ -1,5 +1,8 @@
 # 全栈一键启动：docker compose up -d --build
 # 访问 http://localhost:8080（前端由 nginx 托管，/api 自动反代到后端）
+#
+# ⚠️ 首次部署前请先准备项目根 `.env`（模板见 `.env.docker.example`）——
+#    Compose 的变量插值只读 `.env`，**不读**源码模式使用的 `config.env`。
 name: recruitment-python
 
 services:
@@ -7,6 +10,11 @@ services:
     build:
       context: .
       dockerfile: docker/backend/Dockerfile
+    # 多副本（默认 2 worker）：这是 Redis 后端「真正承担职责」的前提 ——
+    # 单 worker 时进程内实现本就正确，Redis 不产生差别；2 worker 后
+    # 限流计数 / 爬虫日配额 / 熔断状态必须跨进程共享，否则配额翻倍（防爆破失效）。
+    # init_db 在 fork worker 之前只执行一次。
+    command: ["sh", "-c", "python scripts/init_db.py && exec uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers ${BACKEND_WORKERS:-2}"]
     environment:
       APP_ENV: production
       DB_TYPE: sqlite
@@ -19,10 +27,35 @@ services:
       OLLAMA_ENABLED: "false"
       AI_TOOL_PREFILTER_ENABLED: "true"
       CORS_ORIGINS: "http://localhost:8080"
+      # 限流计数走 Redis（多副本共享）。Redis 故障时自动降级内存并记 warning。
+      RATE_LIMIT_BACKEND: ${RATE_LIMIT_BACKEND:-redis}
+      # ⚠️ 多 worker 下进程内 APScheduler（定时爬取/日报）与 job_checker 会在
+      #    每个 worker 内各自启动 → 定时任务重复触发 N 次，对招聘站点的压力翻倍。
+      #    这是多副本的真实代价，两种处理方式：
+      #      a) 生产：关掉进程内调度，改由外部 cron 调 POST /api/crawler/start；
+      #      b) 后续任务：用 Redis 锁选主，只让一个 worker 启动调度器。
+      SCHEDULED_CRAWL_ENABLED: ${SCHEDULED_CRAWL_ENABLED:-true}
+      REPORT_ENABLED: ${REPORT_ENABLED:-true}
     volumes:
       - appdata:/app/data
     depends_on:
-      - redis
+      redis:
+        # 就绪依赖而非启动顺序：只保证「先启动」时，backend 可能在 Redis
+        # 尚未接受连接时就发起访问，启动早期刷一堆连接错误。
+        condition: service_healthy
+    healthcheck:
+      # 用 /openapi.json（无需鉴权；/api/system/version 返回 401，不适合探活）。
+      # 镜像内没有 curl，故用基础镜像自带的 python。
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/openapi.json', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
   frontend:
@@ -32,7 +65,21 @@ services:
     ports:
       - "8080:80"
     depends_on:
-      - backend
+      backend:
+        # 等 backend **就绪**（healthcheck 通过）再启动 nginx：
+        # 否则 nginx 先起时会代理到尚未监听的后端，前端首屏 502。
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
   redis:
@@ -40,6 +87,17 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
 volumes:

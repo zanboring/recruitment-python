@@ -22,7 +22,11 @@ RUN pip install -r requirements.txt \
 # 业务代码
 COPY app ./app
 COPY scripts ./scripts
-COPY reports ./reports 2>/dev/null || true
+# 注意：**不要** COPY reports/ —— 它是运行时产物目录（日报 Excel 落盘在
+# reports/daily/，由 report_service._write_excel_file 自动 mkdir），
+# 且已列入 .dockerignore。
+# 原写法 `COPY reports ./reports 2>/dev/null || true` 是无效的 Dockerfile 语法
+# （Dockerfile 不支持 shell 重定向与 `||`），Linux 下源目录不存在时会直接构建失败。
 
 # 非 root 运行（安全实践）
 RUN useradd -m appuser && chown -R appuser:appuser /app

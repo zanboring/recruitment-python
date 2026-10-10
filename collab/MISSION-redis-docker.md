@@ -356,6 +356,66 @@ git push origin dev-workbuddy dev-codebuddy
 环境未安装 Docker / Redis（已确认 `docker` 命令不存在）。
 请验收方在有 Redis 的环境执行；如需 `fakeredis` 版本（需新增依赖），我未擅自引入，可另行授权。
 
+## DELIVER 2026-10-10 13:42 P0-4 .dockerignore（+ 修 Dockerfile 一处必然失败的语法）
+
+**改了什么**
+
+| 文件 | 改动 |
+|---|---|
+| `.dockerignore` | 新增。排除依赖目录 / 构建产物 / 字节码缓存 / 密钥文件 / 本地数据 / 开发过程产物 / AI 工具元数据 |
+| `docker/backend/Dockerfile` | 删除 `COPY reports ./reports 2>/dev/null || true` |
+
+**为什么删那行**：`2>/dev/null || true` 是 shell 语法，**Dockerfile 的 COPY 不支持**——它会被解析成多个源路径（`reports`、`./reports`、`2>/dev/null`、`||`）+ 目标 `true`，源不存在即构建失败。而 `reports/` 本就是**运行时产物目录**（`report_service._write_excel_file` 会 `mkdir(parents=True)`），且已列入 `.dockerignore`，正确做法是**不 COPY**。
+
+**为什么不能写 `*.html`**：`app/static/index.html` 是前端产物缺失时的兜底页（`main.py::_resolve_static_index`）。已实测 `app/` 下唯一的 html 就是它 —— 宽规则会把它一起排除，镜像就丢了 fallback。
+
+**怎么验证 / 证据在哪**
+
+| # | 验证项 | 结果 |
+|---|---|---|
+| 1 | **A7 体积对比** | 不排除 **≈ 429.4 MB** → 排除后 **≈ 2.6 MB**。分项实测：`.venv` 215 MB、`frontend/node_modules` 201.9 MB、`reports` 4.1 MB、`tests` 1.8 MB、`.git` 1.4 MB |
+| 2 | 覆盖任务书要求的排除项 | `.venv/`、`frontend/node_modules/`、`frontend/dist/`、`.git/`、`__pycache__/`、`*.pyc`、`reports/`、`.workbuddy/`、`.codebuddy/` 全部覆盖 |
+| 3 | 兜底页不被误伤 | `app/static/index.html` 存在且不被任何规则匹配（刻意不用 `*.html` / `app/**` 宽规则） |
+| 4 | 密钥不进 context | `.env` / `config.env` / `config.template.env` 已显式排除 |
+
+**⚠️ 证据局限**：本机**未安装 Docker**（`docker --version` 不存在），`docker compose config` 与真实 `docker build` 无法执行；体积对比以「文件系统体积求和」等价替代，未经 Docker daemon 实测。请在具备 Docker 的环境复核 A7。
+
+## DELIVER 2026-10-10 13:45 P0-3 多副本 + P0-5 healthcheck/就绪依赖 + P0-6 部署模板（含 P1-4 日志轮转）
+
+**改了什么**
+
+| 文件 | 改动 |
+|---|---|
+| `docker-compose.yml` | ① backend 增加 `command`：`uvicorn --workers ${BACKEND_WORKERS:-2}`，`init_db` 在 fork 前只执行一次 ② redis / backend / frontend 各加 `healthcheck` ③ 两处 `depends_on` 改为 `condition: service_healthy` ④ 新增 `RATE_LIMIT_BACKEND=${RATE_LIMIT_BACKEND:-redis}` ⑤ 三服务加 `logging` 轮转（P1-4）⑥ 顶部提示指向 `.env.docker.example` |
+| `.env.docker.example` | 新增。列出必填项与生成命令；**明确写出「Compose 插值只读 `.env`、不读 `config.env`」**（P0-6 要修的坑） |
+
+**关键设计**
+
+1. **为什么选 `uvicorn --workers` 而不是 compose 多实例**：A3 判据即「起 2 个 worker」，同容器多进程直接满足，且不必引入 nginx upstream 额外一层。`init_db` 放 `&&` 左侧、在 fork 之前只执行一次。
+2. **healthcheck 为什么用 `/openapi.json`**：`/api/system/version` 需鉴权（401），不适合探活；`/openapi.json` 无需鉴权且能证明 FastAPI 已就绪。镜像内无 `curl`，用基础镜像自带的 python。
+3. **就绪依赖直接服务 A8**：`frontend` 等 `backend: service_healthy` 才启动 nginx —— 否则 nginx 先起时代理到尚未监听的后端，前端首屏 502。
+
+**⚠️ 必须记录的副作用：多副本下进程内调度器会重复触发**
+
+`--workers 2` 后，`app/main.py` lifespan 里的 APScheduler（定时爬取 / 日报）与 `job_checker`
+会在**每个 worker 内各自启动** → 定时任务重复执行 N 次，对招聘站点压力翻倍。
+这是多副本的真实代价（进程内调度器无法感知兄弟进程），已写进 compose 注释与 `.env.docker.example`，
+并给出两条出路：a) 生产关掉进程内调度、改用外部 cron 调 API；b) 后续用 Redis 锁选主。
+**本任务范围内不修**（属独立课题），但不掩盖。
+
+**怎么验证 / 证据在哪**
+
+| # | 验证项 | 结果 |
+|---|---|---|
+| 1 | compose 语法（A7 前半） | `yaml.safe_load` 解析通过；三服务结构、两处 `condition: service_healthy`、三处 healthcheck、三处 logging 全部断言为真 |
+| 2 | 多副本命令正确性 | `--workers ${BACKEND_WORKERS:-2}` 存在；`init_db.py` 在 fork 之前 ✅ |
+| 3 | 单机不回归（A1/A2） | 全量 **717 项通过**；TestClient 走完整 lifespan：根路径 200 且含 `<div id="app">`、`/api/system/version` 401（预期） |
+| 4 | 部署模板可用性 | `.env.docker.example` 含必填项、生成命令、「只读 .env」说明与定时任务副作用说明；不被 `.gitignore` 的精确 `.env` 规则匹配（可入库），且在 `.dockerignore` 中被排除（不入镜像） |
+
+**⚠️ 证据局限**：本机未安装 Docker —— A7 后半（`docker compose config` 通过）、
+A8（首屏不出现 502、`docker compose ps` 显示 healthy）、A3（2 worker 真实并发）**均需在有 Docker 的环境验收**。
+我用 YAML 解析替代了 compose 的语法校验，但它**不覆盖 compose 自身的变量插值校验**（如 `${VAR:?}` 的行为）。
+
 ---
 
 ## 8. 验收记录（WorkBuddy 填写）
