@@ -544,3 +544,79 @@ Trae 跑全量（2.5 分钟 ×2）期间，HEAD **再次被切走**，F5 改动�
 > **任何超过 1 分钟的操作（尤其全量测试）之前与之后，都要重新 `git rev-parse --abbrev-ref HEAD`。**
 
 根因是**单目录共享 HEAD** —— 这是两个 AI 并发时的**结构性风险**，不是个人纪律问题。
+
+---
+
+## 11. A7 / A8 验收（负责人，2026-10-10 23:16 ~ 次日 00:20）
+
+> 前置：用户完成 WSL 3.0.1 安装 + 重启 + Docker Desktop 安装与磁盘位置迁移。
+
+### 11.1 前置条件全部达成（已核验）
+
+| 检查项 | 实测 |
+|---|---|
+| `WslService` / `vmcompute` | Running（重启后 `CBS RebootPending` 已清零） |
+| Docker 引擎 | Docker Desktop **4.94.0**(241994)，Engine **29.8.2**，Compose **v5.5.1** |
+| **磁盘镜像位置** | ✅ 已迁至 **`G:\Work\docker`**（G 盘 1.7 GB；C 盘 Docker 目录仅 1.7 MB） |
+
+### 11.2 A7（compose 与镜像）—— ✅ 通过
+
+**前半：语法校验。** 裸 `docker compose config` **失败**（见 F6）；改用 compose 文件头部本就写明的
+`docker compose --env-file config.env config` → **退出码 0，解析出 119 行**。
+
+**后半：`.dockerignore` 生效前后对比（BuildKit 实测，非文件系统估算）**
+
+| | build context |
+|---|---|
+| 排除前（文件系统求和，见 `.dockerignore` 注释） | **429.4 MB** |
+| 排除后（BuildKit `transferring context` 实测） | 后端 **677.6 kB** + 前端 **492.2 kB** ≈ **1.17 MB** |
+
+→ 降幅约 **367 倍**。此前的「≈2.6 MB」是估算，实测更低。
+
+### 11.3 A8（就绪依赖）—— ✅ 通过
+
+```
+NAME                            STATUS                    PORTS
+recruitment-python-backend-1    Up (healthy)              8080/tcp
+recruitment-python-frontend-1   Up (healthy)              0.0.0.0:8080->80/tcp
+recruitment-python-redis-1      Up (healthy)              6379/tcp
+```
+
+| 判据 | 实测 |
+|---|---|
+| 前端首屏 | **HTTP 200**（非 502），428 字节，含 `<div id="app">` |
+| 502 专项（连测 5 次） | **5/5 = 200** |
+| 反代链路 `/api/system/version` | **401**（需鉴权，属预期 → 证明 nginx 已连通后端） |
+| `/openapi.json` | **200** |
+| 静态资源 `/assets/index-*.js` | **200** |
+| `backend` 启动方式 | 由 `depends_on: condition: service_healthy` 串起，redis → backend → frontend 逐级就绪 |
+
+### 11.4 本轮新发现
+
+| 编号 | 问题 | 状态 |
+|---|---|---|
+| **F6** | `.env` 用 Spring 风格 `${VAR:默认值}`（39 处），Compose 解析器不认（只认 `${VAR:-默认值}`）→ **裸 `docker compose config` 直接失败**。应用侧 `app/config.py` 的正则恰好就是按该语法写的，两边理解不一致。仓库模板（`.env.example` / `.env.docker.example`）都是干净的 `KEY=value`，**属本机 `.env`（gitignored）的本地缺陷**。⚠️ 不能只把 `:` 改成 `:-`——会让应用侧把 `-localhost` 当成默认值 | ⏳ 待修（见 §11.6） |
+| **F7** | **Docker Hub 不可达**（`registry-1.docker.io` 连接超时）→ 任何镜像都拉不下来 | ✅ 已修：`~/.docker/daemon.json` 写入 3 个可用加速源并验证拉取成功 |
+| **F8** | `docker-compose.yml` 把 `CORS_ORIGINS` 写成裸字符串，而字段声明为 `list[str]` → pydantic-settings 先 `json.loads` → `SettingsError`，backend 起不来 | ✅ 已修（`569883e`） |
+| **F9** | 镜像内无 `/app/data` → `appdata` 具名卷被建成 `root:root` → `appuser` 写 SQLite 报 `unable to open database file`，容器重启循环 | ✅ 已修（`569883e`） |
+| **F10** | Playwright 官方 CDN 国内约 100 KB/s（Chromium 187 MB 需 1.5 小时以上），且下载源不可覆盖 | ✅ 已修（`569883e`，新增 `ARG PLAYWRIGHT_DOWNLOAD_HOST`） |
+
+**修复提交**：`569883e fix(docker): 修复阻断 A7/A8 的三处构建与启动缺陷`（F8 / F9 / F10，2 文件）。
+
+### 11.5 一个必须承认的验收口径问题
+
+**项目自带的 `scripts/verify_redis_docker.py --docker` 目前会 FAIL**（A7、A8 两项），
+原因是它调用的是**裸 `docker compose`**，在 F6 修好前必然读到非法 `.env`。
+
+所以 A7/A8 本轮是通过 **`--env-file config.env`** 这条路径验出来的 —— 这是 compose 文件头部
+本来就写明的用法，不算绕过判据；但**脚本与真实调用路径不一致**这件事本身要修（见 §11.6）。
+
+### 11.6 待派工（建议给 CodeBuddy，含测试要求）
+
+1. **F6 根因修复**：`app/config.py` 的 `interpolate_env_vars()` 正则放宽为 `\$\{(\w+)(?::-?([^}]*))?\}`，
+   使 `${VAR:默认值}` 与 `${VAR:-默认值}` 都解析为「默认值」；配套 `.env` 统一改用标准 `:-` 写法。
+   要求：新增单测覆盖两种写法 + 未设置变量 + 设置了变量 + 无默认值四种情形。
+2. **F6 顺带修正**：`@field_validator("cors_origins", mode="before")` 的「逗号分隔」兜底**实际不可达**
+   （pydantic-settings 对复杂类型的 `json.loads` 在其之前执行）——要么改用 `NoDecode`，要么删掉误导性分支。
+3. **验收脚本对齐**：`scripts/verify_redis_docker.py` 的 compose 调用显式传 `--env-file`
+   （或读取一个 compose 专用 env 文件），使脚本路径与生产路径一致。

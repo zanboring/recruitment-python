@@ -544,6 +544,55 @@ Docker 一旦装好，你将作为 **A7/A8 验收的主要配合方**（compose 
 
 `git add -A` 禁令 ｜ commit 前后确认分支 ｜ **长任务（>1 分钟）前后也要重确认分支**。
 
+---
+
+## MSG 2026-10-11 00:20 【负责人】A7 / A8 首次真机验收：3 处已修（含你的 docker 域）+ 3 项待你处理
+
+Docker 环境已由用户装好（WSL 3.0.1 + Docker Desktop 4.94.0，引擎 29.8.2 / Compose v5.5.1，
+磁盘镜像已迁到 `G:\Work\docker`）。**A7 与 A8 均已验收通过**，证据见 `MISSION-phase2.md` §11。
+
+### ⚠️ 一、我在你的 docker 域内动了 2 个文件（`569883e`），请你 review
+
+这三处是**首次真机验收时暴露的阻断缺陷**，不修则容器起不来，所以我先修了再说 ——
+按「动他人文件先知会」的约定向你报备。**若你认为改法不对，直接改回去并回函说明即可。**
+
+| # | 文件 | 问题 | 改法 |
+|---|---|---|---|
+| **F8** | `docker-compose.yml` | `CORS_ORIGINS: "http://localhost:8080"` 是**裸字符串**，而 `cors_origins` 声明为 `list[str]`；pydantic-settings 对复杂类型**先做 `json.loads`** → `SettingsError` → backend 直接起不来 | 改为 `'["http://localhost:8080"]'` |
+| **F9** | `docker/backend/Dockerfile` | 镜像内**不存在 `/app/data`** → `appdata` 具名卷被建成 `root:root` → 非 root 的 `appuser` 写 SQLite 报 `unable to open database file`，容器**重启循环** 14 次 | 改为 `RUN mkdir -p /app/data && useradd -m appuser && chown -R appuser:appuser /app`（在 USER 之前） |
+| **F10** | `docker/backend/Dockerfile` + `docker-compose.yml` | Playwright 下载源**不可覆盖**。官方 `cdn.playwright.dev` 国内实测约 **100 KB/s**（Chromium 187 MB 需 1.5 小时以上） | 新增 `ARG PLAYWRIGHT_DOWNLOAD_HOST`（默认仍是官方 CDN，**向后兼容**），经 compose `build.args` 暴露为环境变量。换 npmmirror 实测 **10 MB/s**（187 MB 约 14 秒） |
+
+### 二、三项待你处理（F6 是根因，另外两项是它带出来的）
+
+**1. F6（根因）—— `.env` 插值语法与 Compose 不兼容**
+
+- 现象：**裸 `docker compose config` 退出码 1** → `Invalid template: "${DB_HOST:localhost}"`
+- 本机 `.env` 用了 **Spring 风格 `${VAR:默认值}`，共 39 处**
+- `app/config.py` 的 `interpolate_env_vars()` 正则 `\$\{(\w+)(?::([^}]*))?\}` **恰好就是按这个语法写的** → 应用侧正常
+- Compose 的 env 解析器只认 `${VAR:-默认值}`（冒号后必须是 `-` / `?` / `+`）→ **两边理解不一致**
+- ⚠️ **不能只把 `:` 改成 `:-`** —— 应用侧正则会把 `-localhost` 整个当成默认值，得到字面量 `"-localhost"`
+- 正确做法：正则放宽为 `\$\{(\w+)(?::-?([^}]*))?\}`，让两种写法都解析为「默认值」；`.env` 再统一用标准 `:-`
+- 仓库模板（`.env.example` / `.env.docker.example`）**都是干净的 `KEY=value`**，所以这**不是仓库缺陷，是本机 `.env` 的问题** —— 但**解析器应当兼容**，否则用户按直觉写 `:-` 就会静默出错
+- **要求**：新增单测覆盖四种情形 —— `${VAR:默认}` / `${VAR:-默认}` / 已设置变量 / 无默认值
+
+**2. `cors_origins` 的兜底分支实际不可达**
+
+`@field_validator("cors_origins", mode="before")` 里的 `except json.JSONDecodeError: 按逗号切分`
+**永远不会执行** —— pydantic-settings 对复杂类型的 `json.loads` 发生在字段校验器**之前**，
+JSON 解析失败会直接抛 `SettingsError`，轮不到校验器。
+要么改用 `NoDecode`（让校验器真正收到原始字符串），要么删掉这个误导性分支。**别留着让人误以为它有效。**
+
+**3. 验收脚本与真实调用路径不一致**
+
+`scripts/verify_redis_docker.py --docker` 现在**必然 FAIL**（A7、A8 两项都红），
+原因是它调用**裸 `docker compose`**，在 F6 修好前一定读到非法 `.env`。
+本轮 A7/A8 我是用 `docker compose --env-file config.env ...` 验出来的（compose 文件头部本就写明这条路径）。
+请让脚本显式传 `--env-file`（或读一个 compose 专用 env 文件），**让脚本路径与生产路径一致**。
+
+### 三、纪律（不变）
+
+`git add -A` 禁令 ｜ commit 前后确认分支 ｜ **长任务前后重确认分支** ｜ 动他人文件先知会
+
 
 
 
