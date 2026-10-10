@@ -83,7 +83,7 @@ Docker 侧缺口：
 | `data/recsys.db` | ✅ 135 KB | — |
 | **Ollama** | ✅ **已装且运行中**，`OLLAMA_MODELS=G:\Work\ollama\models` | 本地降级链可**真实演示**（见下） |
 | **Docker** | ❌ **仍未安装**（无 Docker Desktop、无 docker CLI、无 `com.docker.service`） | ⛔ **A7 / A8 现在无法验收** |
-| **Redis** | ❌ 未安装、未运行（6379 无监听、无 redis 可执行文件） | ⛔ **A3 / A4 / A5 / A6 现在无法验收** |
+| **Redis** | ✅ **已由 WorkBuddy 部署并运行中**（见下） | A3 / A5 / A6 **已可验收**；A4 待 P0-2 |
 
 ### 关键变化：Ollama 从「隐患」变成「资产」
 
@@ -115,16 +115,40 @@ Docker 侧缺口：
 且分支为 `dev-workbuddy` / `dev-codebuddy`。
 **动手前先确认路径是 `D:\Dev\recruitment-python`**，不要打开 H 盘备份改。
 
+### 🟢 Redis 已部署（2026-10-10 13:41，WorkBuddy 完成）
+
+| 项 | 值 |
+|---|---|
+| 版本 | **Redis 8.10.2**（免安装 Windows 版，`redis-windows/redis-windows` release 8.10.2 msys2） |
+| 位置 | `G:\Work\redis`（不占 C 盘） |
+| 启动 | 双击 `G:\Work\redis\start-redis.cmd`（或 `redis-server.exe recsys-redis.conf`） |
+| 监听 | `127.0.0.1:6379`（仅回环） |
+| 配置 | `G:\Work\redis\recsys-redis.conf` —— AOF `appendonly yes`（对齐 compose 的 `--appendonly yes`）、`maxmemory 512mb` + `allkeys-lru` |
+| 数据 | `G:\Work\redis\data`；日志 `G:\Work\redis\logs\redis.log` |
+| 能力自检 | ZSET ✅ / Lua EVAL ✅ / INCR+EXPIREAT ✅ / SET NX PX ✅ |
+
+> ⚠️ `logfile` / `dir` 在 conf 里必须写**绝对路径**：Redis 会把相对的 `logfile` 解析到 `dir` 之下，
+> 写 `./logs/redis.log` 会直接 `FATAL CONFIG FILE ERROR: Can't open the log file`。
+
+**项目侧接入方式**（两个环境变量，二者需同时给）：
+
+```bash
+RATE_LIMIT_BACKEND=redis
+REDIS_URL=redis://127.0.0.1:6379/0
+```
+
+不设这两项时项目走内存实现，行为与改造前**完全一致**（已验收 A2）。
+
 ### ⛔ 验收顺序因此需要调整（重要）
 
 Docker 与 Redis 都还没装，所以**不能按 P0 顺序一次验收完**。建议改为：
 
-| 阶段 | 做什么 | 依赖 | 可验收项 |
-|---|---|---|---|
-| **第 1 阶段** | 装 Redis（Windows 可用 Memurai / Redis for Windows，或 WSL 内运行） | 只需本机 | **A3 / A4 / A5 / A6** —— 用**本机起 2 个 uvicorn worker** 验证跨进程语义，**不需要 Docker** |
-| **第 2 阶段** | CodeBuddy 做 P0-1 / P0-2 / P1-1 / P1-2（Redis 化改造 + 降级开关） | Redis | 同上 |
-| **第 3 阶段** | 装 Docker Desktop（**Disk image location 指到 `G:\Work\docker`**，别吃 C 盘） | — | **A7 / A8** |
-| **第 4 阶段** | CodeBuddy 做 P0-3 / P0-4 / P0-5 / P1-3 / P1-4 | Docker | A7 / A8 |
+| 阶段 | 做什么 | 依赖 | 可验收项 | 进度 |
+|---|---|---|---|---|
+| **第 1 阶段** | 装 Redis | 只需本机 | — | ✅ **已完成**（WorkBuddy，13:41） |
+| **第 2 阶段** | CodeBuddy 做 P0-1 / P0-2 / P1-1 / P1-2 | Redis | **A3 / A4 / A5 / A6** —— 用**本机起 2 个 uvicorn worker** 验证跨进程语义，**不需要 Docker** | 🟡 P0-1 已交付并**验收通过**（A3/A5/A6 ✅）；P0-2 待做（A4 待补验） |
+| **第 3 阶段** | 装 Docker Desktop（**Disk image location 指到 `G:\Work\docker`**，别吃 C 盘） | — | **A7 / A8** | ⬜ 待用户 |
+| **第 4 阶段** | CodeBuddy 做 P0-3 / P0-4 / P0-5 / P1-3 / P1-4 | Docker | A7 / A8 | 🟡 代码已在进行中（`.dockerignore`、`.env.docker.example`、compose 改动已在工作树），等 Docker 装好才能验 |
 
 > 用户已在 G 盘预留 `G:\Work\docker` 与 `G:\Work\wsl` 目录，装 Docker Desktop 时直接指过去即可。
 
@@ -338,4 +362,66 @@ git push origin dev-workbuddy dev-codebuddy
 
 > 格式：`## ACCEPT <日期 时间> <任务号> <结论>`，附判据与证据。
 
-<!-- 待验收时追加 -->
+## ACCEPT 2026-10-10 13:52 P0-1 ✅ 通过（Redis Lua 滑动窗口限流）
+
+**验收方式**：WorkBuddy 独立执行，全部在**真实 Redis 8.10.2**（验收方本机新部署）+ **真实多进程**上复现。
+**不采信自证** —— CodeBuddy 用自写 `FakeRedis` 替身，Lua 脚本本身的正确性无法在单测里被证明，
+这一层正由本次验收补上。
+
+### 逐条判定
+
+| 项 | 判据 | 实测结果 | 结论 |
+|---|---|---|---|
+| A1 全量测试 | `pytest -q --tb=line -p no:warnings` | **717 passed / 0 failed**（697 → 717，+20） | ✅ |
+| A2 单机不回归 | 不设 `REDIS_URL` + 默认 `memory` 后端 | 限流行为与改造前一致；全量测试（默认 memory）全绿 | ✅ |
+| **A3 限流跨副本** | 2 进程交替并发打 `POST /api/auth/login`，总放行 ≤ limit | **redis 后端：10**（= limit）；**memory 对照组：20**（= 2×limit） | ✅ |
+| A5 Redis 掉线可降级 | `REDIS_URL` 指向死端口 `6399` | 启动成功；14 次请求 → `[401×10, 429×4]`，**5xx = 0** | ✅ |
+| A6 缓存跨进程 | 进程A 写 → 进程B 读 | 配 Redis：键 `a6probe` 真实存在于 Redis，进程B 读到 `shared-value`；不配 Redis 对照组：读到 `None` | ✅ |
+| A4 爬虫日配额 | 2 进程累计访问 ≤ 配额 | **未验收** —— P0-2 尚未实现（`app/crawlers/throttle.py` 未改动） | ⏸️ 待 P0-2 |
+
+### 核心证据：A3 的对照组不可省
+
+| 后端 | 进程数 | 总放行 | 期望 | 说明 |
+|---|---|---|---|---|
+| `RATE_LIMIT_BACKEND=redis` | 2 | **10** | == limit | 全局配额一致 |
+| `RATE_LIMIT_BACKEND=memory` | 2 | **20** | == 2 × limit | **配额翻倍，防爆破形同虚设** |
+
+对照组证明该测试**不恒真**。内存后端在 2 副本下配额确实翻倍 ——
+这正是「**只加 Redis 不加副本等于白加**」的实证，也是本任务存在的理由。
+
+### 复现命令（验收方实际执行）
+
+```bash
+# 起 Redis（首次）
+G:\Work\redis\start-redis.cmd
+
+# A3：两个进程交替打登录接口，统计 401（放行）与 429（拦截）
+#     分别在 RATE_LIMIT_BACKEND=redis / memory 下各跑一轮，对比总放行数
+```
+
+### 代码审查结论（附带，非验收项）
+
+审 `9b411d1`，逻辑正确，四点站得住：
+
+1. **必须用 Lua 而非 `INCR`+`EXPIRE`**：`INCR` 是固定窗口，窗口边界会双倍突发。
+   ZSET + 时间戳天然滑动，但「清理过期 → 计数 → 写入」三步必须原子，
+   否则并发下两个请求会同时读到 `count = limit-1` 而都放行；Lua 在 Redis 单线程内执行，天然原子。
+2. **ZSET member 必须唯一**：member 相同是覆盖不是累加。用毫秒时间戳当 member，
+   同毫秒并发会互相覆盖 → 计数偏小 → 限流失效。实现用 `f"{now_ms}-{uuid4().hex[:12]}"` ✔
+3. **降级契约**：`check()` 不可用时返回 `None` **不抛异常**，中间件回退同步内存实现（该实现一行未改）；
+   30s 连接冷却避免故障期每请求都白等一次超时。
+4. **`_redis_enabled()` 双条件**：需显式 `RATE_LIMIT_BACKEND=redis` **且** 有 `REDIS_URL`；
+   `redis_url` 为空时连惰性建连都省掉 → 这是 A2「单机不回归」的结构性保证。
+
+### 两点观察（不阻塞，供后续决策）
+
+1. **进程退出时的 asyncio 噪音**：一次性脚本里 `asyncio.run(cache.set(...))` 结束后会打印
+   `RuntimeError: Event loop is closed`（`cache` 未显式关闭 Redis 连接）。
+   uvicorn 长驻进程下不出现，**不影响功能**；若要洁癖，可在 `lifespan` 收尾 `await cache.close()`。
+2. **两条独立 Redis 连接**：`app/cache.py` 的连接（`decode_responses=True`、无冷却）
+   与限流器的连接（带 30s 冷却）是分开的。功能无碍，但「健康探测」口径不一致，
+   P1 阶段可考虑收敛为一个连接工厂。
+
+### 结论
+
+**P0-1 验收通过。** 请 CodeBuddy 继续 P0-2（爬虫全局配额），完成后 A4 由本验收方补验。
