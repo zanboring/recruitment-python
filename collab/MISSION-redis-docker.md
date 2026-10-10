@@ -56,6 +56,80 @@ Docker 侧缺口：
 
 ---
 
+## 1.5 环境实况（2026-10-10 盘符变更后实测）
+
+### 磁盘布局（已核实，与用户描述一致）
+
+| 盘符 | 物理盘 | 型号 | 接口 | 容量 | 可用 | 卷标 |
+|---|---|---|---|---|---|---|
+| **C** | Disk 1 | WD_BLACK **SN850X** 2000GB | NVMe | 500 GB | 402.6 GB | Win11ProW X64 |
+| **D** | Disk 1 | WD_BLACK **SN850X** 2000GB | NVMe | 1362.7 GB | 902.1 GB | Game |
+| **E** | Disk 2 | WD_BLACK **SN7100** 1TB | NVMe | 931.5 GB | 617 GB | Game |
+| **F** | Disk 3 | WDS100T1X0E-00AFY0（= WD_BLACK **SN850** 1TB） | NVMe | 501 GB | 337.3 GB | Game |
+| **G** | Disk 3 | WDS100T1X0E-00AFY0（同一块盘） | NVMe | 430.5 GB | 430 GB | Work |
+| **H** | Disk 0 | **ST2000DM001**-1ER164（希捷 2TB） | SATA | 1863 GB | 1680.9 GB | Repository |
+| I | Disk 4 | Kingston DataTraveler 3.0 | USB | 57.8 GB | 49.9 GB | BACKUP（exFAT） |
+
+- C 与 D 同属 **SN850X 2TB** 的两个分区 → 项目落在 D 盘，即**跑在最快的盘上**。
+- ⚠️ **I 盘是插着的 USB 优盘**（卷标 `BACKUP`），用户未提及。注意别当固定盘依赖。
+- 缓存位置都不在 C 盘：npm cache → `D:\Dev\caches\npm`；pip cache → `G:\Work\cache\pip`。
+
+### 工具链实况
+
+| 组件 | 状态 | 对验收的影响 |
+|---|---|---|
+| `.venv` | ✅ Python 3.14.7 | — |
+| `frontend/dist` + `node_modules` | ✅ 已恢复 | — |
+| `data/recsys.db` | ✅ 135 KB | — |
+| **Ollama** | ✅ **已装且运行中**，`OLLAMA_MODELS=G:\Work\ollama\models` | 本地降级链可**真实演示**（见下） |
+| **Docker** | ❌ **仍未安装**（无 Docker Desktop、无 docker CLI、无 `com.docker.service`） | ⛔ **A7 / A8 现在无法验收** |
+| **Redis** | ❌ 未安装、未运行（6379 无监听、无 redis 可执行文件） | ⛔ **A3 / A4 / A5 / A6 现在无法验收** |
+
+### 关键变化：Ollama 从「隐患」变成「资产」
+
+盘符变更前 `OLLAMA_ENABLED=true` 是个坑（没装 Ollama → 请求先超时再降级）。
+现在 Ollama 已装，且**模型与项目配置完全对齐**：
+
+| 项目 `.env` 配置项 | 值 | Ollama 是否已拉取 |
+|---|---|---|
+| `OLLAMA_MODEL` | `qwen3.5:4b` | ✅ 3.4 GB |
+| `OLLAMA_CODE_MODEL` | `qwen3.5:4b` | ✅ |
+| `OLLAMA_EMBEDDING_MODEL` | `qwen3-embedding:0.6b` | ✅ 639 MB |
+
+环境变量另有：`OLLAMA_MAX_LOADED_MODELS=2`、`OLLAMA_NUM_PARALLEL=1`、
+`OLLAMA_CONTEXT_LENGTH=8192`、`OLLAMA_FLASH_ATTENTION=1`。
+
+→ **「云端 DeepSeek/智谱 → 本地 Ollama → 规则引擎」三级降级链现在可以离线、零成本完整演示。**
+建议 CodeBuddy 在 P1 追加一项 **P1-6：提供「断网可用」演示路径说明**
+（拔网线 → 自动走本地 Ollama → AI 功能仍出结果），这是 AI 应用能力里很有说服力的一环。
+
+### ⚠️ 防误编辑：H 盘有 3 份旧副本，都不是活项目
+
+| 路径 | 最后修改 | 特征 |
+|---|---|---|
+| `H:\Backup\Dev\recruitment-python` | 2026-09-28 | `main` 分支，**无** `collab/MISSION-redis-docker.md` |
+| `H:\Backup\recruitment-python-workarea-20260928` | 2026-09-28 | 同上 |
+| `H:\Backup\C_Users_20260924\Desktop\recruitment-python` | 2026-09-23 | 同上 |
+
+**判定活项目**：`D:\Dev\recruitment-python` 有 `collab/MISSION-redis-docker.md`，
+且分支为 `dev-workbuddy` / `dev-codebuddy`。
+**动手前先确认路径是 `D:\Dev\recruitment-python`**，不要打开 H 盘备份改。
+
+### ⛔ 验收顺序因此需要调整（重要）
+
+Docker 与 Redis 都还没装，所以**不能按 P0 顺序一次验收完**。建议改为：
+
+| 阶段 | 做什么 | 依赖 | 可验收项 |
+|---|---|---|---|
+| **第 1 阶段** | 装 Redis（Windows 可用 Memurai / Redis for Windows，或 WSL 内运行） | 只需本机 | **A3 / A4 / A5 / A6** —— 用**本机起 2 个 uvicorn worker** 验证跨进程语义，**不需要 Docker** |
+| **第 2 阶段** | CodeBuddy 做 P0-1 / P0-2 / P1-1 / P1-2（Redis 化改造 + 降级开关） | Redis | 同上 |
+| **第 3 阶段** | 装 Docker Desktop（**Disk image location 指到 `G:\Work\docker`**，别吃 C 盘） | — | **A7 / A8** |
+| **第 4 阶段** | CodeBuddy 做 P0-3 / P0-4 / P0-5 / P1-3 / P1-4 | Docker | A7 / A8 |
+
+> 用户已在 G 盘预留 `G:\Work\docker` 与 `G:\Work\wsl` 目录，装 Docker Desktop 时直接指过去即可。
+
+---
+
 ## 2. 任务分解
 
 ### P0 —— 必做（缺一项则能力展示不成立）
