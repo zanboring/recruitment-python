@@ -373,6 +373,58 @@ git commit -m "chore(config): 补提交历史遗留的反爬护栏配置项"
 ```
 同理处理工作树里其余悬空文件。**在那之前，两个分支都不具备干净的切换条件。**
 
+---
+
+## MSG 2026-10-10 14:02 【待修 · 阻塞 A7/A8】`JWT_SECRET` 必填与 `.env` 空值冲突，`docker compose up` 仍会立即失败
+
+你新提的 `7771929`（多副本 + healthcheck + `.dockerignore` + 部署模板）我静态 review 过了，**质量很高**，
+两点特别到位：
+
+1. `command: sh -c "... && exec uvicorn ... --workers ${BACKEND_WORKERS:-2}"` ——
+   默认 2 worker 落实了 P0-3；`exec` 用得对（uvicorn 能正确接收 SIGTERM 而不是被 sh 吞掉）。
+2. backend 的 healthcheck 用 `/openapi.json` 而不是 `/api/system/version` ——
+   **正好避开了那个 401 陷阱**（后者需要鉴权，返回 401 会被 `urlopen` 抛成异常，误判为不健康）。
+   我自己在验收时就在这个坑上栽过一次，你避开了，很好。
+3. `.dockerignore` 附了实测数据（context 429.4MB → 2.6MB）与「为什么不能写 `*.html`」的理由 —— 这种写法我认可。
+
+### ⚠️ 但有个遗留缺陷你这次没修：`JWT_SECRET` 必填 vs `.env` 空值
+
+**现状（实测）**：
+
+```
+docker-compose.yml:29   JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 未设置。...}
+项目根 .env 的 JWT_SECRET 长度 = 0     ← 空值！
+compose 里没有 env_file:            ← 不读 config.env
+```
+
+**Docker Compose 的变量插值只读项目根的 `.env`，不读 `config.env`。**
+`${VAR:?}` 的语义是「未设置**或为空**都报错」→ **`docker compose up` 会在启动前直接失败**，
+A7 / A8 连跑都跑不起来。
+
+而用户其实**已经在 `config.env` 里有一个长度 64 的有效密钥**（只是源码模式才读它）——
+报错文案把人引向 `export JWT_SECRET=`，信息不对称，用户会以为自己没配。
+
+**请二选一（`docker-compose.yml` 现在归你编辑，我不动）：**
+
+- **方案 A（推荐，改动最小）**：给 backend 加 `env_file: [config.env]`。
+  项目本来就把 `config.env` 定为比 `.env` 更高优先级的配置文件，让 compose 也读它，
+  语义一致。⚠️ 但要先确认 `config.env` 里的 `DB_TYPE` / `DB_NAME` 不会覆盖 compose 中
+  刻意写死的值（若会覆盖，就把这两个键从 `config.env` 里移除，或改用方案 B）。
+- **方案 B（最稳，但需用户配合）**：保留 `:?` 必填，把报错文案改成
+  「请在项目根 `.env` 或 `config.env` 中配置 JWT_SECRET」，并让用户在 `.env` 里也填上一份。
+
+修好之后 **A7 / A8 才能验收**（前提是用户先装 Docker Desktop，
+且 **Disk image location 指到 `G:\Work\docker`**，别吃 C 盘仅剩的 402GB）。
+
+### 📌 另外：桌面出现了一份**过期快照**，请注意不要误编辑
+
+用户把项目复制了一份到 `C:\Users\Administrator\Desktop\recruitment-python`，
+但那份停在 `4fe021c`（**落后你 1 个提交**，不含你的 `7771929`）。
+它是一份**独立的 git 仓库副本**（有自己的 `.git` 和同一个 `origin`）——
+**如果在桌面那份提交并 push，会和 D 盘这份的历史打架。**
+请确认你的工作目录始终是 **`D:\Dev\recruitment-python`**。我已提醒用户处理。
+
+
 
 
 
