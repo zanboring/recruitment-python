@@ -15,6 +15,11 @@ services:
     build:
       context: .
       dockerfile: docker/backend/Dockerfile
+      # Playwright 浏览器下载源。默认官方 CDN；国内网络改成 npmmirror 可快约 100 倍
+      # （实测官方 ~100 KB/s vs npmmirror ~10 MB/s）：
+      #   PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright docker compose up -d --build
+      args:
+        PLAYWRIGHT_DOWNLOAD_HOST: ${PLAYWRIGHT_DOWNLOAD_HOST:-https://cdn.playwright.dev}
     # 多副本（默认 2 worker）：这是 Redis 后端「真正承担职责」的前提 ——
     # 单 worker 时进程内实现本就正确，Redis 不产生差别；2 worker 后
     # 限流计数 / 爬虫日配额 / 熔断状态必须跨进程共享，否则配额翻倍（防爆破失效）。
@@ -31,7 +36,11 @@ services:
       REDIS_URL: redis://redis:6379/0
       OLLAMA_ENABLED: "false"
       AI_TOOL_PREFILTER_ENABLED: "true"
-      CORS_ORIGINS: "http://localhost:8080"
+      # ⚠️ 必须是 JSON 数组。cors_origins 声明为 list[str]，pydantic-settings 对复杂类型
+      #    会先做 json.loads，裸字符串会直接抛 SettingsError、容器起不来。
+      #    （app/config.py 里 @field_validator("cors_origins", mode="before") 的
+      #      「逗号分隔」兜底在这一步之前就被绕过了，等于不可达。）
+      CORS_ORIGINS: '["http://localhost:8080"]'
       # 限流计数走 Redis（多副本共享）。Redis 故障时自动降级内存并记 warning。
       RATE_LIMIT_BACKEND: ${RATE_LIMIT_BACKEND:-redis}
       # 采集日配额 / 域名节流同样跨副本共享 —— 日配额是**对招聘站点的承诺**，

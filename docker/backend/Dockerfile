@@ -14,10 +14,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation libglib2.0-0 libx11-6 libxcb1 libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
+# Playwright 浏览器下载源。默认走官方 CDN；**国内网络务必覆盖**：
+# 官方 cdn.playwright.dev 实测约 100 KB/s（Chromium 187 MB 需 1.5 小时以上），
+# 换 npmmirror 实测约 10 MB/s（约 18 秒），相差约 100 倍。
+#   PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright docker compose up -d --build
+ARG PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.playwright.dev
+
 # 先装依赖（利用 Docker 层缓存，代码变更不需要重装系统依赖）
 COPY requirements.txt .
 RUN pip install -r requirements.txt \
-    && playwright install chromium --with-deps || playwright install chromium
+    && PLAYWRIGHT_DOWNLOAD_HOST="${PLAYWRIGHT_DOWNLOAD_HOST}" playwright install chromium --with-deps \
+    || PLAYWRIGHT_DOWNLOAD_HOST="${PLAYWRIGHT_DOWNLOAD_HOST}" playwright install chromium
 
 # 业务代码
 COPY app ./app
@@ -29,7 +36,12 @@ COPY scripts ./scripts
 # （Dockerfile 不支持 shell 重定向与 `||`），Linux 下源目录不存在时会直接构建失败。
 
 # 非 root 运行（安全实践）
-RUN useradd -m appuser && chown -R appuser:appuser /app
+# ⚠️ 运行时数据目录 /app/data 必须在这一步就建好并归属 appuser：
+#    compose 的 `appdata` 具名卷挂载到该路径，而 Docker 初始化**空的具名卷**时，
+#    只会继承「镜像内该路径已存在的目录」的内容与属主。
+#    镜像里没有这个目录 → 卷被建成 root:root → 非 root 的 appuser 写 SQLite
+#    时报 (sqlite3.OperationalError) unable to open database file，容器起不来。
+RUN mkdir -p /app/data && useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8080
