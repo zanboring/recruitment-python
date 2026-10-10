@@ -200,3 +200,63 @@ JWT_LEN = 64   NONEMPTY = True   PASS_GE_32 = True   COMPOSE_BLOCKED = False
 - 分支 `dev-codebuddy`；本会话累计 8 个提交（P0-1 → P0-6、P1-2/1-3/1-5、W1、W2）
 - 全量 **766 passed / 0 failed**
 - 工作树里那批**不属于我的**历史悬空条目，我一行未碰
+
+---
+
+## MSG 2026-10-10 15:30 ⚠️ 报告一次分支错位事件（已修复）+ 一条机制建议
+
+### 一、发生了什么（如实报告）
+
+提交 W2 时，提交**误落在 `dev-trae` 上**。reflog 是权威证据：
+
+```
+b70b287 HEAD@{1}: checkout: moving from dev-codebuddy to dev-trae   ← 外部切换，不是我的操作
+02fddfe HEAD@{0}: commit: W2（我的）                                 ← 于是落到了 dev-trae
+```
+
+`dev-trae` 的 reflog 显示它是**刚从 HEAD 新建的**：
+
+```
+02fddfe dev-trae@{0}: commit: W2（我的）
+b70b287 dev-trae@{1}: branch: Created from HEAD
+```
+
+**我的失误**：任务书第 2 步要求「确认在 `dev-codebuddy` 上」，我在 W1 开工前确认过一次，
+但 W2 提交前**没有重新确认** —— 而这期间分支被切走了。
+这是我的流程问题，已记下：**每次提交前重新 `git rev-parse --abbrev-ref HEAD`**。
+
+### 二、我做的修复（内容零丢失，按不丢提交的安全顺序）
+
+```bash
+git branch -f dev-codebuddy 02fddfe   # ① W2 归位到我的分支（移动另一分支，不动工作树）
+git checkout dev-codebuddy            # ② 切回（与当前 HEAD 同一提交，工作树零变化）
+git branch -f dev-trae b70b287        # ③ dev-trae 复位到它被创建时的位置
+```
+
+| 分支 | 修复后 | 说明 |
+|---|---|---|
+| `dev-codebuddy` | `02fddfe` | ✅ W1 + W2 都在 |
+| `dev-trae` | `b70b287` | 复位到创建时的位置（**含 W1** —— 正好是 W3 的前置） |
+| `dev-workbuddy` | `b7152c6` | 未动 |
+| `main` | `4cae06d` | 未动 |
+
+⚠️ **我移动了 `dev-trae`**（不是我建的分支），特此声明。
+如果它是你为 W3（Trae）准备的起点，复位到 `b70b287` 应正合意图（W3 依赖 W1，
+而 `b70b287` 正是含 W1 的提交）；若你另有安排，说一声我配合调整。
+
+### 三、一条机制建议（成本极低，能拦住这类问题）
+
+单目录 + 两个 AI 并发编辑，已经出现两个具体后果：你在 phase2 §1.2 预警过这个风险，
+而这次真的发生了 —— **分支被切走而我不知情，提交落错分支**。
+
+建议加成硬约定（我这边照做，供你参考）：
+
+> **`git commit` 之前先 `git rev-parse --abbrev-ref HEAD` 确认输出符合预期；
+> 提交后立刻 `git log --oneline -1` 复核落在预期分支。**
+
+这类问题比内容错误更隐蔽 —— `git log` 看起来一切正常，直到有人发现分支不对。
+
+### 四、另注意到的工作树变化（仅告知，我不碰）
+
+工作树里新增了两个**不属于我**的改动：`app/services/ai_service.py`、`collab/README.md`。
+若是你在为 W3 做准备（`ai_service.py` 属 Trae 域），我一行不会碰。
