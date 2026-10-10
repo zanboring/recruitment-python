@@ -143,6 +143,63 @@ Docker 侧缺口：
 
 ---
 
+## 5.5 分支约定（2026-10-10 起生效 · 用户要求）
+
+> **用户明确要求：WorkBuddy 与 CodeBuddy 都写自己的分支，不再向 `main` 直接提交。**
+
+| 分支 | 谁写 | 基点 | 现状 |
+|---|---|---|---|
+| `dev-workbuddy` | **WorkBuddy** | `main` @ `4cae06d` | 已建，含任务书与协作信道提交 `4bdfa97` |
+| `dev-codebuddy` | **CodeBuddy** | `dev-workbuddy` @ `4bdfa97` | 已建（**含任务书，开箱即可读**） |
+| `main` | 用户拍板后合并 | — | 停在 `4cae06d`，**未被污染** |
+
+### CodeBuddy 开工三步
+
+```bash
+# 1) 切到自己的分支
+git -C D:\Dev\recruitment-python checkout dev-codebuddy
+
+# 2) 确认（应输出 dev-codebuddy）
+git -C D:\Dev\recruitment-python rev-parse --abbrev-ref HEAD
+
+# 3) 提交时逐个列出自己的文件（见下方警告，禁止 git add -A）
+git add app/middleware/rate_limit.py tests/test_rate_limit_redis.py
+git commit -m "feat(ratelimit): Redis Lua 滑动窗口限流 + 内存降级"
+```
+
+### ⚠️ 工作树里有 23 个「非本任务」的未提交改动 —— 不要碰
+
+**已修改（15 个）**：`app/config.py`、`app/crawlers/base.py`、`app/crawlers/boss.py`、
+`app/dependencies.py`、`app/evaluation/runner.py`、`app/init_data.py`、`app/routers/compat.py`、
+`app/services/crawler_service.py`、`app/services/knowledge_service.py`、`app/services/llm_client.py`、
+`app/utils/circuit_breaker.py`、`docker-compose.yml`、`reports/rag_evaluation.md`、
+`userscript/recsys-collector.user.js`、`frontend/package-lock.json`
+
+**未跟踪（8 个）**：`.codebuddy/`、`ENV_MIGRATION_CHECKLIST.md`、`LEARNING_PATH.md`、
+`PROJECT_SHOWCASE.md`、`reports/Windows.old*.html`（2 个）、`reports/audit_2026-10-0*.html`（2 个）
+
+**处理原则**：**不要提交、不要还原、不要 stash。** 这些是别人（或历史会话）在飞的活。
+提交时**逐个列出自己的文件路径**，**严禁 `git add -A` / `git add .`**，
+否则会把不相干的半成品一起卷进提交，之后无法分离。
+
+> 注：`frontend/package-lock.json` 的改动是 **WorkBuddy 本轮 `npm install` 的副产物**
+> （为恢复 `frontend/dist` 而安装依赖）。已单独披露，未提交，由用户决定去留。
+
+### 分支同步与一个历史遗留问题
+
+`git push` 在当前沙箱被网络拦（见 `COLLAB.md` §5），两个新分支**目前只在本地**。
+需要推远端时由用户执行：
+
+```bash
+git push origin dev-workbuddy dev-codebuddy
+```
+
+> ⚠️ **远端已存在一个旧的 `origin/dev-workbuddy`，与本地新分支已分叉**
+> （`main` 领先它 7 个提交，它领先 `main` 3 个）。首次推送本地 `dev-workbuddy` **会被拒绝**。
+> 这是历史遗留问题，**请单独决策，不要在本任务里顺手处理**（避免把两件事混在一起）。
+
+---
+
 ## 6. 协作流程（三方）
 
 ```

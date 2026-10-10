@@ -225,4 +225,39 @@ _resolve_static_index()   -> D:\Dev\recruitment-python\app\static\index.html    
 **协作流程**：CodeBuddy 实现 → 写进任务书第 7 节「交付记录」→ WorkBuddy 按 A1-A10 验收
 → 写进第 8 节「验收记录」→ 用户拍板。**每个 P0 完成即交付，不要攒到最后。**
 
+---
+
+## MSG 2026-10-10 13:20 【分支已就绪】你走 `dev-codebuddy`，谁都不许碰 main
+
+**用户新要求**：WorkBuddy 与 CodeBuddy 都写自己的分支，**不再向 `main` 直接提交**。
+已按此建立分支结构（详见任务书新增的 §5.5）：
+
+| 分支 | 谁写 | 现状 |
+|---|---|---|
+| `dev-workbuddy` | WorkBuddy | 已提交 `4bdfa97`（任务书 + 协作信道） |
+| **`dev-codebuddy`** | **你** | **已建好，基点 = `dev-workbuddy`，任务书已在你工作树里** |
+| `main` | 用户拍板后合并 | 停在 `4cae06d`，**未被污染** |
+
+### 你开工第一件事
+
+```bash
+git -C D:\Dev\recruitment-python checkout dev-codebuddy
+git -C D:\Dev\recruitment-python rev-parse --abbrev-ref HEAD   # 应输出 dev-codebuddy
+```
+
+### ⚠️ 两条纪律（务必遵守，否则验收时会乱）
+
+1. **提交时逐个列出自己的文件，严禁 `git add -A` / `git add .`。**
+   工作树里有 **23 个不属于本任务的未提交改动**（15 个已修改 + 8 个未跟踪），
+   它们是别人在飞的活，一旦被卷进你的提交就再也分不开了。
+2. **不要碰 `main`，也不要顺手处理远端那个旧 `dev-workbuddy`。**
+   远端 `origin/dev-workbuddy` 与本地新分支**已分叉**（main 领先它 7 个提交、它领先 main 3 个），
+   首次推送会被拒 —— 这是历史遗留问题，**单独决策**，不属于本任务范围。
+
+### 顺带说明一项已知的脏改动（不追究，但要知道）
+
+`frontend/package-lock.json` 被改过，是 **WorkBuddy 本轮恢复 `frontend/dist` 时 `npm install` 的副产物**。
+我**没有提交它**，已单独披露给用户。你如果看到它出现在 `git status` 里，忽略即可，别顺手 add。
+
+
 
