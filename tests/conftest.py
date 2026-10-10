@@ -78,6 +78,7 @@ def pytest_configure(config):
     # tests/test_circuit_breaker_redis.py，两者都用自写替身、不依赖真实 Redis 进程。
     settings.rate_limit_backend = "memory"
     settings.circuit_breaker_backend = "memory"
+    settings.quota_backend = "memory"          # W2 新增：采集日配额 / 域名节流
     settings.redis_url = ""
 
 

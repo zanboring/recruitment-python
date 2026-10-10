@@ -34,6 +34,9 @@ services:
       CORS_ORIGINS: "http://localhost:8080"
       # 限流计数走 Redis（多副本共享）。Redis 故障时自动降级内存并记 warning。
       RATE_LIMIT_BACKEND: ${RATE_LIMIT_BACKEND:-redis}
+      # 采集日配额 / 域名节流同样跨副本共享 —— 日配额是**对招聘站点的承诺**，
+      # 内存实现下 2 副本会让实际访问量翻倍，承诺不成立。
+      QUOTA_BACKEND: ${QUOTA_BACKEND:-redis}
       # ⚠️ 多 worker 下进程内 APScheduler（定时爬取/日报）与 job_checker 会在
       #    每个 worker 内各自启动 → 定时任务重复触发 N 次，对招聘站点的压力翻倍。
       #    这是多副本的真实代价，两种处理方式：

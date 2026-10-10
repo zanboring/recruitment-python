@@ -441,6 +441,12 @@ class Settings(BaseSettings):
     # 设为 redis 后「一次熔断、全局生效」；Redis 不可用时自动降级进程内状态。
     circuit_breaker_backend: str = "memory"
 
+    # 采集节流 / 日配额后端：memory（默认，进程内）/ redis（跨副本共享）。
+    # 多副本下进程内日配额各算一份（实际访问量 × N，对招聘站点的合规承诺
+    # 不成立）；域名节流也只能约束本进程的请求。设为 redis 后两者全局共享。
+    # Redis 不可用时自动降级进程内实现（行为与改造前一致）。
+    quota_backend: str = "memory"
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, v):

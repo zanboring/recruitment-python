@@ -36,6 +36,14 @@ class TestBackendIsolation:
             "conftest 未隔离 circuit_breaker_backend：熔断状态会跨用例共享"
         )
 
+    def test_采集配额后端在测试环境固定为内存(self):
+        from app.config import settings
+
+        assert settings.quota_backend == "memory", (
+            "conftest 未隔离 quota_backend：运行时启用 Redis 后，"
+            "采集日配额会跨用例累积，后续采集类用例会被配额莫名拦下"
+        )
+
     def test_redis_url在测试环境为空(self):
         """地址为空 ⇒ 限流 / 熔断 / 缓存的 Redis 路径都不会被启用。"""
         from app.config import settings
