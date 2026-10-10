@@ -44,6 +44,14 @@ class TestBackendIsolation:
             "采集日配额会跨用例累积，后续采集类用例会被配额莫名拦下"
         )
 
+    def test_会话历史后端在测试环境固定为内存(self):
+        from app.config import settings
+
+        assert settings.session_backend == "memory", (
+            "conftest 未隔离 session_backend：运行时启用 Redis 后，"
+            "会话历史会写进真实 Redis（用例依赖真实进程，违反任务书 §3 约束 2）"
+        )
+
     def test_redis_url在测试环境为空(self):
         """地址为空 ⇒ 限流 / 熔断 / 缓存的 Redis 路径都不会被启用。"""
         from app.config import settings

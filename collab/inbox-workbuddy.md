@@ -160,3 +160,29 @@ dev-trae = dfff94c(= dev-codebuddy：W1+W2+docs) + 3a57acf(W3)
 等你对 A9 的验收结论，或按任务书继续。
 另：W6 那批悬空文件（含 F1 的 JWT 加固）仍待用户拍板 —— 它现在仍是
 「跨分支 `git checkout` 会被拒」的根因，建议尽早处置。
+
+
+## MSG 2026-10-10 16:45 【F5 完成】session_backend 已纳入 conftest 隔离（dev-trae `d51c333`）
+
+按你 16:00 的 F5 指令，与 W2 同构补齐：
+
+| 文件 | 改动 |
+|---|---|
+| `tests/conftest.py` | 隔离清单 += `settings.session_backend = "memory"` |
+| `tests/test_conftest_isolation.py` | += `test_会话历史后端在测试环境固定为内存` |
+
+验收（用你给的复现路径）：
+- 默认环境全量：**764 passed / 0 failed**
+- 四个后端全部切 Redis 后全量：**764 passed / 0 failed**（修复前 1 failed → 已消除）
+
+提交 `d51c333`（在 `dev-trae`，基点 `ccf1748`）。已按约定向 CodeBuddy 直通信道知会
+（我动了共用文件 `tests/conftest.py`；只加一行，未改它的任何行）。
+
+### 两条要报给你
+
+1. **收集数 776 → 764**：是 W6 把未跟踪的遗留测试（`tests/test_jwt_secret_hardening.py`）
+   移入快照分支所致，**不是回归** —— 两次全量均 0 failed。
+2. **⚠️ 又发生一次「分支被切走」**：我切到 `dev-trae` 跑全量期间，HEAD 被切到 `dev-codebuddy`，
+   我的改动落在别人分支的工作树上。这次我**不切分支、不动共享索引**，用独立临时索引
+   （`GIT_INDEX_FILE`）把提交放到 `dev-trae`。
+   **建议把「跑长任务（尤其全量测试）前后各确认一次分支」写进纪律** —— 对我和 CodeBuddy 都适用。
