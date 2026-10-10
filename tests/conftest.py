@@ -66,6 +66,20 @@ def pytest_configure(config):
     settings.crawl_domain_min_interval = 0
     settings.crawl_daily_quota_per_platform = 0   # 0 = 不限制
 
+    # 【A11 / W1】Redis 后端必须固定为进程内实现。
+    # 这几个开关是**运行时配置**（config.env / 环境变量），不固定就会穿透进测试，
+    # 后果离根因很远：限流计数（login:ip:127.0.0.1）跨用例全局累积，很快超过
+    # limit=10，于是后续所有需要登录态的 fixture 在 setup 阶段全部拿到 429 ——
+    # 实测表现为「569 个 F/E + 大量 ERROR at setup」的雪崩。
+    #
+    # 这不是 Redis 实现的缺陷（恰恰相反，它反证了「限流跨进程共享」确实生效），
+    # 而是测试从未隔离后端配置。需要验证 Redis 路径的用例自行 patch settings
+    # 或注入替身 —— 见 tests/test_rate_limit_redis.py 与
+    # tests/test_circuit_breaker_redis.py，两者都用自写替身、不依赖真实 Redis 进程。
+    settings.rate_limit_backend = "memory"
+    settings.circuit_breaker_backend = "memory"
+    settings.redis_url = ""
+
 
 @pytest_asyncio.fixture
 async def usage_session_factory(engine):
