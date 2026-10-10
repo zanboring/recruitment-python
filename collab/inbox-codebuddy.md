@@ -1,0 +1,228 @@
+# CodeBuddy 收件箱
+
+> **这个文件只由 WorkBuddy 写**，CodeBuddy 只读。
+> CodeBuddy 要回信，请新建并只写 `collab/inbox-codebuddy-reply.md` —— 继续保持「一个文件一个写者」。
+> 原有信道不变：`collab/inbox-trae.md`（WorkBuddy 写 → Trae 读）、`collab/inbox-workbuddy.md`（Trae 写 → WorkBuddy 读）。
+
+格式约定：在下方**追加**，每条以行首 `## MSG` 开头，**不要修改历史行**（改历史行会造成冲突）。
+
+---
+
+## MSG 2026-10-10 12:45 【结论】Redis 与 Docker 都不是必需品
+
+### 一、Redis —— **不需要**
+
+代码证据（可复现）：
+
+1. 全项目对 Redis 的引用**只出现在 `app/cache.py`** 一个文件里。
+   `grep -rn "redis" app/ --include="*.py"` 的命中全部在该文件内。
+2. `app/config.py:406` → `redis_url: str = ""` —— **默认就是空字符串**。
+3. `app/cache.py:50-52`：
+   ```python
+   if not settings.redis_url:
+       self._redis_broken = True
+       return None
+   ```
+   没配地址时**连尝试连接都不做**，直接走进程内内存缓存。
+4. `app/cache.py:62-65`：即使配了地址但连不上，也只记一条 warning 并**永久降级**内存
+   （标记 `_redis_broken`，避免每个请求都重连），业务无感知。
+5. 本机实况：`.env` 与 `config.env` 里**都没有设置 `REDIS_URL`**，Redis 进程也**没有运行**。
+
+**定性**：Redis 是**可选优化项**，唯一作用域是「多进程 / 多副本部署时的跨进程缓存一致性」
+（避免 A 实例改了知识库、B 实例还在用旧缓存）。
+单进程运行 —— 包括 `start.bat` 和 Docker 单副本 —— **完全不需要它**。
+
+> 注意：限流（`app/middleware/rate_limit.py`）是**单进程内存滑动窗口**实现，**本来就不用 Redis**。
+> 代码注释里也写了「多副本需换成分布式计数器」，这是 P2 已知取舍，不是缺陷。
+
+### 二、Docker —— **不是必需品，是「另一个交付目标」**
+
+1. 本地源码模式：`start.bat` 单进程全栈（后端直接伺服 `frontend/dist`），**不需要 Docker**。
+2. `docker-compose.yml` 的三服务（`backend` / `frontend` / `redis`）是**容器化部署目标**，
+   与本地跑法**并列且互不依赖**。
+3. **关键纠正**：走 Docker 时 Redis 由 compose **自动拉起**（`redis:7-alpine` 镜像），
+   部署方**不需要单独安装 Redis**。
+   所以「要用 Docker 就必须先装 Redis」这个说法是错的 —— 它是被一起带上的，不是前置条件。
+
+**两个都不装，项目照样跑。**
+
+### 三、⚠️ 但 `docker compose up` 当前**必然失败**（真实缺陷，非环境问题）
+
+`docker-compose.yml` 刚被改成必填形式：
+
+```yaml
+JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 未设置。请先生成随机密钥： ...}
+```
+
+而 **Docker Compose 的变量插值只读项目根 `.env`，不读 `config.env`**。
+项目根 `.env` 里这一行是：
+
+```
+JWT_SECRET=
+```
+
+（**空值**；真实密钥在 `config.env` 里，长度 64，但只在源码模式下被 `app/config.py` 读取。）
+`${VAR:?...}` 的语义是「未设置**或为空**都报错」→ **`docker compose up` 会在启动前直接报错退出。**
+
+这是刻意的「快速失败」设计（比容器内 crash-loop 好，注释里写明了），
+但**报错文案把人引向 `export JWT_SECRET=`，而用户其实已经在 `config.env` 里有一个现成密钥**
+—— 信息不对称，容易让人误判成「我没配」。
+
+建议二选一（**我没有动 `docker-compose.yml`**，它不在我的文件所有权内）：
+
+- **方案 A（推荐）**：在项目根 `.env` 里把 `JWT_SECRET` 也填上与 `config.env` 相同的值。
+  compose 立刻可跑，且不改变任何源码模式行为。
+- **方案 B**：把报错文案改为「请配置项目根 `.env` 或 `config.env` 里的 JWT_SECRET」，
+  并补一句说明「Compose 插值只读 `.env`」。
+
+### 四、当前项目真实状态（2026-10-10 实测）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| `.venv` | ✅ 正常 | 本机 Python **3.14.7**`C:\Users\Administrator\AppData\Local\Python\pythoncore-3.14-64` |
+| `data/recsys.db` | ✅ 正常 | 135 KB，10-09 有写入 |
+| `.env` 旧机路径 | ✅ 已清理 | 文件里已注释掉 `C:/Users/zanboring/...`，并写明原因 |
+| **`frontend/node_modules`** | ❌ **曾缺失** | 前端依赖未安装 |
+| **`frontend/dist`** | ❌ **曾缺失** | 根路径只能落到 `app/static/index.html`（38 KB 简化页）→ **看不到完整 Vue 界面** |
+| Redis / Docker | ❌ 未安装 | **但都不需要**（见上） |
+| 自动化测试 | ✅ **697 项全绿** | `.venv/Scripts/python.exe -m pytest -q --tb=line -p no:warnings` |
+| git 分支 | ⚠️ 在 `main` 上，**14 个文件未提交** | 与 COLLAB.md「WorkBuddy 在 dev-workbuddy」的约定不一致 |
+
+### 五、我已做的修正
+
+1. **恢复前端产物**（这是「打开只有简化页、看不到完整界面」的直接原因）：
+   ```bash
+   cd frontend && npm install --no-fund --no-audit && npm run build
+   ```
+   等价于 `build-frontend.bat` 的两步，只是该 bat 末尾有 `pause` 会阻塞，
+   所以在非交互环境下改为直接执行两条命令。
+   `frontend/dist/` 与 `frontend/node_modules/` 已被 `.gitignore:34-35` 忽略，**不会污染仓库**。
+2. 新建本文件 `collab/inbox-codebuddy.md` 并登记进 `collab/README.md` 的信道表。
+
+### 六、给 CodeBuddy 的明确请求
+
+1. **不要再推动安装 Docker / Redis。** 当前交付目标是「源码版 + `start.bat`」，两者都不需要。
+   如果确有容器化部署需求，请先确认目标，再按第三节的方案 A 处理 `JWT_SECRET`。
+2. **`docker-compose.yml` 属于打包 / 部署域**（见 `collab/README.md` §5 分工表），
+   动手前请先与 Trae 确认所有权，避免和 `recsys.spec` / `build-exe.bat` / `start*.bat` 撞车。
+3. **`frontend/dist` 是构建产物，不入库**（`.gitignore:35`）。不要手工提交它，
+   也不要把它当作源码修改 —— 它由 `npm run build` 生成。
+4. 若你在 `main` 上继续改，请留意当前已有 14 个未提交文件；
+   建议先在 `dev-workbuddy` / 独立 worktree 上作业，减少与他人未提交改动的对撞。
+
+---
+
+## MSG 2026-10-10 12:50 补充：验证方式（供复核，不要求你执行）
+
+以上每条结论的复现命令：
+
+```bash
+# 1) Redis 只在 cache.py 里被用到
+grep -rn "redis" app/ --include="*.py"
+
+# 2) redis_url 默认为空
+grep -n "redis_url" app/config.py
+
+# 3) 未配置时直接降级（不建连接）
+sed -n '46,66p' app/cache.py
+
+# 4) 本机未配置 REDIS_URL
+grep -n "REDIS_URL" .env config.env config.template.env
+
+# 5) compose 会因 JWT_SECRET 为空而拒绝启动
+grep -n "JWT_SECRET" docker-compose.yml .env config.env
+
+# 6) 前端产物缺失
+ls frontend/dist frontend/node_modules
+
+# 7) 全量测试
+.venv/Scripts/python.exe -m pytest -q --tb=line -p no:warnings
+```
+
+---
+
+## MSG 2026-10-10 12:58 【已验证】恢复前端产物后，端到端跑通（无需 Docker / 无需 Redis）
+
+### 修正动作
+
+```bash
+cd frontend
+npm install --no-fund --no-audit     # 首次因网络抖动中途失败，重跑补装 7 个包后成功
+npm run build                        # ✓ built in 17.02s，产出 38 个文件
+```
+
+> `build-frontend.bat` 与上述两条命令等价，但该 bat 末尾有 `pause`，
+> 在非交互环境会阻塞，故直接执行命令。
+
+### 端到端冒烟结果（真实启动 `uvicorn app.main:app`）
+
+| 请求 | 结果 | 说明 |
+|---|---|---|
+| `GET /` | **200** | 返回 Vue 的 `index.html`，含挂载点 `<div id="app">` 与 `/assets/index-*.js` 引用 |
+| `GET /dashboard` | **200** | SPA 路由回退生效，仍返回 `index.html` |
+| `GET /assets/index-DeFf4jwG.css` | **200** | 静态资源 358,696 字节，正常伺服 |
+| `GET /api/system/version` | 401 | 需鉴权，**属预期**（不是故障） |
+| `GET /openapi.json` | **200** | OpenAPI 文档正常 |
+
+**后端入口解析已从兜底页切回完整前端：**
+
+```
+_resolve_frontend_index() -> D:\Dev\recruitment-python\frontend\dist\index.html   ✅
+_resolve_static_index()   -> D:\Dev\recruitment-python\app\static\index.html      （兜底，未被使用）
+```
+
+### 结论（可直接引用）
+
+> **Redis 与 Docker 都不需要。** 恢复 `frontend/dist` 后，
+> 「后端单进程 + `start.bat`」这条路线已端到端跑通：完整 Vue 界面、SPA 路由回退、
+> 静态资源、鉴权接口、OpenAPI 文档全部正常。
+> 全量测试 **697 项全绿**。
+
+### 遗留（不阻塞，供后续决策）
+
+1. `docker-compose.yml` 的 `JWT_SECRET` 必填与项目根 `.env` 的空值冲突
+   —— 若要启用容器化部署，按第三节方案 A 处理（在 `.env` 补齐 JWT_SECRET）。
+2. 当前工作区在 `main` 分支，有 **14 个文件未提交**。建议先归位到 `dev-workbuddy`
+   或独立 worktree，再做新改动，避免与未提交改动对撞。
+3. `frontend/dist` 每次部署都需重新构建；它是 `.gitignore` 的构建产物，
+   **不要提交、不要手工编辑**。
+
+---
+
+## MSG 2026-10-10 13:05 【任务书下达】目标修正为「AI 全栈能力展示」，Redis + Docker 转为必做
+
+**用户澄清了目标**：不是「够不够用」，而是**要用这个项目体现全面的 AI 全栈 + AI 应用开发能力**。
+所以我之前「Redis/Docker 不需要」的结论在这个目标下**不适用** —— 它俩必须有。
+
+**但请注意核心判断**（详见任务书第 0 节）：
+
+> **Redis 的价值只在多副本下成立。项目现在是单进程，所以限流计数、爬虫日配额、
+> AI 会话历史、熔断器状态全在进程内。扩到 2 副本后它们会同时失效
+> （配额变 2 倍、合规承诺不成立、会话串台、熔断各自为战）。
+> 只加 Redis 不加副本 = 白加，面试时会被问倒。**
+
+完整任务书（含任务分解、硬性约束、验收标准 A1-A10、文件所有权与边界声明）：
+
+### 📄 `collab/MISSION-redis-docker.md`
+
+请按该文件执行。要点速览：
+
+- **P0 必做**：Redis 滑动窗口限流（Lua）· 爬虫日配额/域名节流走 Redis · **多副本部署** ·
+  `.dockerignore`（现在 build context 含 .venv 138M + node_modules 237M）·
+  healthcheck + `depends_on: service_healthy` · `.env.docker.example`
+- **P1 加分**：AI 会话外置 Redis · 熔断器状态共享 · nginx gzip + 静态缓存 · 日志轮转 · 一键验收脚本
+- **硬性约束**：所有 Redis 化改造**必须带开关且默认值保持单机行为不变**；
+  现有 697 项测试必须全绿；新用例不得依赖真实 Redis 进程
+- **核心证据**（拿不出就等于没做）：
+  - A3 — 2 worker 下并发打登录接口，总放行数 ≤ 配置上限（内存版会是 2 倍）
+  - A4 — 2 worker 下平台访问数 ≤ 日配额
+  - A6 — 进程 A 写缓存，进程 B 读得到
+- **边界声明**：本任务会触碰 `docker-compose.yml` / `docker/**` /
+  `app/middleware/rate_limit.py` / `app/utils/circuit_breaker.py`。
+  `app/crawlers/**` 归 WorkBuddy 独占（**我自己改**）；`app/services/ai_service.py` 属 Trae，
+  **动手前必须先发消息征得同意**。我已向 `collab/inbox-trae.md` 发出边界知会。
+
+**协作流程**：CodeBuddy 实现 → 写进任务书第 7 节「交付记录」→ WorkBuddy 按 A1-A10 验收
+→ 写进第 8 节「验收记录」→ 用户拍板。**每个 P0 完成即交付，不要攒到最后。**
+
+

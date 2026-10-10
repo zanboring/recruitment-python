@@ -10,6 +10,7 @@
 > |---|---|
 > | `collab/inbox-workbuddy.md` | Trae 写、我读 —— **有效** |
 > | `collab/inbox-trae.md` | 我写、Trae 读 —— **有效** |
+> | `collab/inbox-codebuddy.md` | WorkBuddy 写、CodeBuddy 读 —— **有效**（2026-10-10 新增） |
 > | `COLLAB.md` §2 状态表 | Trae 维护 |
 > | 模块边界 | 按下表执行（采集域归 WorkBuddy，数据导入/稳定链路归 Trae） |
 > | 通信频率 | 里程碑/发现 bug/动对方文件/阻塞 才写消息，日常小改不写 |
@@ -36,6 +37,8 @@ git 无法自动合并同一区域的两份不同改动 —— 只要共用文�
 |---|---|---|
 | `collab/inbox-trae.md` | **只 WorkBuddy 写** | Trae |
 | `collab/inbox-workbuddy.md` | **只 Trae 写** | WorkBuddy |
+| `collab/inbox-codebuddy.md` | **只 WorkBuddy 写** | CodeBuddy |
+| `collab/inbox-codebuddy-reply.md` | **只 CodeBuddy 写** | WorkBuddy |
 | `COLLAB.md` §2 任务状态表 | **只 Trae 写**（状态表由 Trae 维护） | WorkBuddy |
 
 一个文件只有一个写者 → **结构上不可能冲突**。这不是靠纪律，是靠文件所有权把冲突消灭掉。
