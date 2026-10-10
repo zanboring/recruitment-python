@@ -146,20 +146,39 @@ git 无法自动合并同一区域的两份不同改动 —— 只要共用文�
 
 ---
 
-## 六、工作区布局（当前实际状态）
+## 六、工作区布局（2026-10-10 起：**已统一为单目录**）
+
+> ⚠️ **本节原内容（三目录 worktree 方案）已作废。** 保留下方历史说明仅供追溯。
+
+**用户 2026-10-10 14:01 明确要求：「以后统一一下，工作文件夹在 D 盘那个」。**
 
 ```
-C:\Users\...\Desktop\recruitment-python      [main]          总版 / 验收版
-C:\Users\zanboring\recruitment-python-wb     [dev-workbuddy] WorkBuddy
-C:\Users\zanboring\recruitment-python-trae   [dev-trae]      Trae
+D:\Dev\recruitment-python        ← 唯一工作副本（所有分支都在这个仓库里）
+   ├── dev-workbuddy   WorkBuddy
+   ├── dev-codebuddy   CodeBuddy
+   └── main            用户拍板后合并，当前停在 4cae06d
 ```
 
-三个目录共享同一个 `.git`（`git worktree` 机制），所以：
+- **只有一个目录**，不再用 `git worktree` 开多目录 → 也就不会再有"两个目录各自持有未提交改动"的麻烦
+- 换分支用普通 `git checkout <branch>`；两个 AI **不要同时**改同一批文件（按 §5 分工表的文件所有权来）
+- 互读对方分支：`git show dev-codebuddy:文件` / `git log dev-codebuddy`
+- 只有 `git push` 到 GitHub 需要用户执行（AI 沙箱网络被拦，见 `COLLAB.md` §5）
 
-- **不需要 push 就能互读对方分支**：`git show dev-trae:文件` / `git log dev-trae`
-- 各自改各自目录里的文件，**不会再互相冲掉未提交的改动**
-- 只有 `git push` 到 GitHub 需要用户执行（AI 沙箱网络被拦）
+### ⛔ 禁止使用的目录（都是过期副本）
 
-> 关于 OneDrive：`.git` 仍然在 OneDrive 里的桌面目录下，两个 C 盘工作区通过它连接。
-> 本会话没有出现问题，但 OneDrive 同步 `.git` 理论上可能损坏仓库 ——
-> **保持推送到 GitHub 作为备份**即可（这也是发布流程本来就要做的）。
+| 路径 | 状态 |
+|---|---|
+| `C:\Users\Administrator\Desktop\recruitment-python` | ❌ **过期快照**（2026-10-10 用户复制，**带独立 `.git` 与同一 `origin`**） |
+| `H:\Backup\Dev\recruitment-python` | ❌ 旧备份（09-28） |
+| `H:\Backup\recruitment-python-workarea-20260928` | ❌ 旧备份 |
+| `H:\Backup\C_Users_20260924\Desktop\recruitment-python` | ❌ 旧备份（09-23） |
+
+**判定活副本**：有 `collab/MISSION-redis-docker.md`，且分支为 `dev-workbuddy` / `dev-codebuddy`。
+**动手前先 `cd` 到 `D:\Dev\recruitment-python` 再操作。**
+
+### 历史说明（已作废，仅供追溯）
+
+原先的布局是三个目录共享同一个 `.git`（`git worktree`），
+配套 `C:\Users\zanboring\recruitment-python-wb` / `-trae` 两个 worktree。
+该方案在 2026-10-10 换盘后废弃：worktree 目录已不存在，且它带来的
+「一个仓库多份工作树」复杂度在当前双 AI 串行协作下没有收益。
