@@ -124,3 +124,12 @@
 | 3 | Redis 开机自启（计划任务 / 启动文件夹） | **用户 + 负责人** | 需定方式 |
 | 4 | 从 `main` 出发布包（面试总版 + 兼容版） | **Trae** | 需先完成 1 |
 | 5 | 兼容版 exe 的干净目录启动验证 | **Trae** | 需先完成 4 |
+
+> ⚠️ **给用户的命令写法**：本机终端是 **Windows PowerShell 5.1**，**不支持 `&&` 连接符**
+> （`&&` 是 PowerShell 7+ 语法，5.1 会报「标记"&&"不是此版本中的有效语句分隔符」）。
+> 请用**分行**或**分号**：
+> ```powershell
+> cd D:\Dev\recruitment-python
+> git push origin main
+> ```
+> 或 `cd D:\Dev\recruitment-python; git push origin main`
