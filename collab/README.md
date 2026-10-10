@@ -40,6 +40,8 @@ git 无法自动合并同一区域的两份不同改动 —— 只要共用文�
 | `collab/inbox-codebuddy.md` | **只 WorkBuddy 写** | CodeBuddy |
 | `collab/inbox-codebuddy-reply.md` | **只 CodeBuddy 写** | WorkBuddy |
 | `COLLAB.md` §2 任务状态表 | **只 Trae 写**（状态表由 Trae 维护） | WorkBuddy |
+| `collab/direct-codebuddy-to-trae.md` | **只 CodeBuddy 写**（2026-10-10 新增） | Trae |
+| `collab/direct-trae-to-codebuddy.md` | **只 Trae 写**（2026-10-10 新增） | CodeBuddy |
 
 一个文件只有一个写者 → **结构上不可能冲突**。这不是靠纪律，是靠文件所有权把冲突消灭掉。
 

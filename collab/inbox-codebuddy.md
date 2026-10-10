@@ -457,6 +457,57 @@ worktree 目录已不存在。**我已把 §6 改写为单目录布局**，原�
 这是 P1-2 / P1-3 / P1-5。**我接下来会验收它**（熔断器的 Redis 共享同样是"只在多副本下成立"，
 我会用和 A3 相同的手法验：双进程看一个 worker 熔断后另一个是否也进入熔断态）。
 
+---
+
+## MSG 2026-10-10 16:00 【负责人】阻塞已解除 + 任务下达 + 新增直通信道
+
+### 一、W6 已处置 → 阻塞解除 ✅（你现在可以对齐分支了）
+
+工作树里那批历史遗留改动（`config.py` 的 107 行 JWT 加固等 22 个文件）已**独立保存到快照分支
+`chore/legacy-worktree-snapshot`**，**工作树现已干净**。
+
+→ 此前被挡住的这一步现在可以做了：
+
+```bash
+git rev-parse --abbrev-ref HEAD    # 先确认在 dev-codebuddy
+git merge main                      # 应为快进（main 已含你的 W1/W2 + Trae 的 W3）
+```
+
+### 二、你的任务：W8 / W9 —— 修复 F4 flaky
+
+`tests/test_anticrawl.py::test_adaptive_delay_larger_after_blocked` 约 **3.94% 失败率**。
+根因（见 `MISSION-phase2.md` §1.2 F4）：断言比较的是**两次随机采样**，
+取值区间 `[8,32]` 与 `[16,64]` 重叠于 `[16,32]` —— 第 1 次采上端、第 2 次采下端即失败。
+
+**建议**：断言设计意图（放大级别随信号数递增），或注入固定随机种子。
+**验收**：该用例连跑 200 次 0 失败；全量连跑 5 次全绿。
+
+### 三、你的验收结论（已出）
+
+| 项 | 结论 |
+|---|---|
+| W1（`b70b287`） | ✅ 提交干净（只动 tests/，未误带他人 30+ 条目） |
+| W2（`02fddfe`） | ✅ 提交干净（`config.py` **仅 +6 行**，未混入那 107 行 JWT 加固） |
+| A10 熔断跨副本 | ✅ 通过（redis 下 A 熔断 → B 被拦；memory 对照组 B 仍放行） |
+| A4 日配额跨副本 | ✅ 通过（redis 总消耗 5 = limit；memory 10 = 2×limit） |
+
+**两次提交都干净** —— 这是本任务最容易翻车的地方，你两次都过关。
+
+### 四、新增：你可以直接与 Trae 通信
+
+用户要求你们两个**能自己交流**，不必都经过我。新增信道：
+
+| 文件 | 谁写 | 谁读 |
+|---|---|---|
+| `collab/direct-codebuddy-to-trae.md` | **你** | Trae |
+| `collab/direct-trae-to-codebuddy.md` | Trae | **你** |
+
+### 五、纪律（重申）
+
+1. commit 前 `git rev-parse --abbrev-ref HEAD`；commit 后 `git log --oneline -1` 复核
+2. **禁止 `git add -A`**
+3. 与 Trae **不要同时**改同一批文件（单目录共享工作树）
+
 
 
 

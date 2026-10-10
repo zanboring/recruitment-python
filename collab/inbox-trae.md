@@ -980,3 +980,54 @@ P1-1「AI 会话外置 Redis」需要改它 —— **你不点头我不做。**
 `D:\Dev\recruitment-python` 当前在 **`main` 分支**，有 **14 个文件未提交**
 （含 `app/config.py`、`app/crawlers/base.py`、`docker-compose.yml`、`app/services/llm_client.py` 等）。
 动手前建议先归位，否则新改动会与未提交内容混在一起，很难分离。
+
+---
+
+## MSG 2026-10-10 16:00 【负责人】阻塞已解除 + 任务下达 + 新增直通信道
+
+### 一、W6 已处置 → 阻塞解除 ✅
+
+工作树里那批历史遗留改动（含 `config.py` 的 JWT 加固）已**独立保存到快照分支
+`chore/legacy-worktree-snapshot`**，工作树现已干净，三个分支可自由切换。
+（你的 `dev-trae` 本就与 `main` 同点，不受影响。）
+
+### 二、你的任务：F5 —— 补 `session_backend` 的测试隔离
+
+**复现**（Redis 需运行）：
+
+```bash
+cd D:\Dev\recruitment-python
+SESSION_BACKEND=redis RATE_LIMIT_BACKEND=redis CIRCUIT_BREAKER_BACKEND=redis \
+  QUOTA_BACKEND=redis REDIS_URL=redis://127.0.0.1:6379/0 \
+  .venv/Scripts/python.exe -m pytest -p no:warnings
+```
+
+**结果**：`1 failed, 775 passed`
+（`test_ai_session_redis.py::TestBackendSelection::test_默认内存后端不启用Redis`）
+
+**性质**：与 F3 **同类** —— 新增的 `*_BACKEND` 开关未纳入 conftest 隔离清单。
+W1 建了机制、W2 补了 `quota_backend`，W3 漏了 `session_backend`。
+
+**修法**（与 W2 完全一致）：
+- `tests/conftest.py` 补 `settings.session_backend = "memory"`
+- `tests/test_conftest_isolation.py` 补对应断言
+
+**验收**：带 `SESSION_BACKEND=redis` 跑全量不再新增失败。
+
+> W3 的 A9 我已验收通过（双进程实测：redis 下 B 进程读到 6 条；memory 对照读到 0 条）。**做得很好。**
+> 你 W3 的 `app/config.py` +12 行也确认干净（在「Trae 区块」内，未混入他人 hunk）。
+
+### 三、新增：你可以直接与 CodeBuddy 通信
+
+用户要求你们两个**能自己交流**，不必都经过我。新增信道：
+
+| 文件 | 谁写 | 谁读 |
+|---|---|---|
+| `collab/direct-codebuddy-to-trae.md` | CodeBuddy | **你** |
+| `collab/direct-trae-to-codebuddy.md` | **你** | CodeBuddy |
+
+### 四、纪律（重申）
+
+1. commit 前 `git rev-parse --abbrev-ref HEAD`；commit 后 `git log --oneline -1` 复核
+2. **禁止 `git add -A`**
+3. 与 CodeBuddy **不要同时**改同一批文件（单目录共享工作树）
