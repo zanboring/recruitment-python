@@ -416,6 +416,80 @@ git push origin dev-workbuddy dev-codebuddy
 A8（首屏不出现 502、`docker compose ps` 显示 healthy）、A3（2 worker 真实并发）**均需在有 Docker 的环境验收**。
 我用 YAML 解析替代了 compose 的语法校验，但它**不覆盖 compose 自身的变量插值校验**（如 `${VAR:?}` 的行为）。
 
+## DELIVER 2026-10-10 13:50 P1-2 熔断器 Redis 状态共享（子类覆写，零侵入）
+
+> 对应任务书 §0「多副本下 4 个失效点」的第四点（限流=P0-1 已做；日配额=P0-2 属 WorkBuddy；会话=P1-1 待授权）。
+
+**改了什么**
+
+| 文件 | 改动 |
+|---|---|
+| `app/utils/circuit_breaker.py` | 新增 `RedisCircuitBreaker`（子类覆写 `state` / `allow_request` / `record_success` / `record_failure` / `stats`）+ 3 个 Lua 脚本；`circuit_breaker()` 工厂改为经 `_make_breaker()` 按配置选后端。**父类 `CircuitBreaker` 的字段与方法一行未改** |
+| `app/config.py` | 我的区块内追加 `circuit_breaker_backend: str = "memory"` |
+| `tests/test_circuit_breaker_redis.py` | 新增 19 项（新建文件） |
+
+**为什么用「子类覆写」而不是改父类**
+
+1. **避开在飞改动**：`circuit_breaker.py` 工作树里有他人的未提交修改（`_probe_in_flight` 半开试探修复，覆盖了 `__init__` / `allow_request` / `record_*`）。改父类会与之冲突到无法分离提交；子类方案让两处改动完全不相邻。
+2. **单机路径零影响**：默认（memory）根本不实例化子类，父类代码逐字节不变。
+3. **接口保持同步**：用同步 `redis.Redis`（不是 `redis.asyncio`），因此 `llm_client` 的 `should_attempt()` / `record_success()` 调用**零改动** —— 这点关键，因为 `llm_client.py` 属 Trae 域，我无权修改。
+
+**三条关键设计**
+
+1. **半开「只放行一个试探」必须跨副本原子**：父类用本地布尔量 `_probe_in_flight`；多副本下必须换成 Redis `SET NX PX`（Lua 内），否则 N 个副本会同时放行 N 个试探，保护上游的目的落空。
+2. **时间基准用墙钟 `time.time()`**：不同进程的 `time.monotonic()` 基准不同，跨副本比较无意义；容器共享宿主机时钟，墙钟可比。
+3. **降级不失效**：Redis 任何异常都回落 `super().xxx()`（进程内状态机），熔断器仍工作、只退回单副本语义；连接失败进 30s 冷却，避免每请求白等一次超时。
+
+**怎么验证 / 证据在哪**
+
+| # | 验证项 | 结果 |
+|---|---|---|
+| 1 | 全量测试（A1） | **736 passed / 0 failed**（717 → 736，+19） |
+| 2 | **A10 可执行对照** `test_跨副本共享_一个熔断另一个也拒绝` | 两实例共享 Redis：A 熔断 → **B 也拒绝** |
+| 3 | 对照组 `test_对照组_内存版两个实例互不影响` | 内存版：A 熔断 → **B 仍放行**（正是要解决的问题） |
+| 4 | 半开跨副本唯一性 `test_冷却后半开只放行一个试探` | 冷却后第一个请求放行、第二个拒绝（SET NX 生效） |
+| 5 | 降级 `test_redis故障时降级父类实现` | Redis 抛异常后熔断器仍正常计数与熔断 |
+| 6 | 工厂后端选择 | 默认 memory → 父类；backend=redis + url → 子类；有 backend 无 url → 父类 |
+
+**⚠️ 证据局限**：与 P0-1 同理，替身 `FakeRedisSync` 是 Python 版同一算法，**Lua 正确性未经真实 Redis 验证**；A10 的真实验收（2 worker）需在有 Redis 的环境执行。本机无 Docker/Redis。
+
+## DELIVER 2026-10-10 13:52 P1-3 nginx gzip + 静态缓存（+ P1-5 一键验收脚本）
+
+**P1-3**（`docker/nginx.conf`）
+
+1. `gzip on` + `gzip_types` **显式含** `text/javascript` / `application/javascript` —— nginx 默认 `gzip_types` 只有 `text/html`，漏掉 JS 的 MIME 时最大的几个 chunk（Element Plus + ECharts）恰好不被压缩，等于白配。
+2. `/assets/` 强缓存 `max-age=31536000, immutable`：Vite 产物文件名自带内容 hash，内容变则文件名变，可安全长缓存。
+3. `location = /index.html` 设 `no-cache`：它引用带 hash 的产物名，被缓存会导致发版后仍加载旧 index → 引用已不存在的旧 chunk（白屏且刷新无效）。
+
+**P1-5**（`scripts/verify_redis_docker.py`，新增）—— 自动跑**可自动化**的判据并**明确跳过**不可自动化的部分：
+
+| 模式 | 判据 | 说明 |
+|---|---|---|
+| `--local`（默认） | A1 + A2 | 跑全量测试；TestClient 走完整 lifespan 验证「不设 `REDIS_URL` 时单机不回归」 |
+| `--docker` | A7 + A8 | `docker compose config` + `up -d --build` + 轮询 healthy + 检查首屏非 502 |
+
+**刻意不自动跑的判据**（A3/A4/A6/A9/A10）：需要真实 Redis + 2 worker 并发或精确跨进程时序，塞进脚本很容易做成「看起来通过」的假验收（并发压测若串行执行，内存版也会通过）。脚本改为**打印手工执行命令**，并指向单测里的对照实验。
+
+**怎么验证 / 证据在哪**
+
+| # | 验证项 | 命令 | 结果 |
+|---|---|---|---|
+| 1 | 脚本可运行且结论正确 | `.venv/Scripts/python.exe scripts/verify_redis_docker.py --local` | `[PASS] A1 全量测试 0 failed`、`[PASS] A2 单机不回归 backend=memory 根路径=200 含#app=True version=401`；汇总「2 项检查，失败 0 项」，退出码 0 |
+| 2 | Docker 缺失时的行为 | 同上（本机无 Docker） | 容器模式**正确跳过并说明原因**，不误报为通过 |
+| 3 | nginx 配置结构 | 人工复核 | server 块 + gzip + 3 个 location 结构完整；本机无 nginx，未做 `nginx -t` |
+
+**⚠️ 证据局限**：A7 后半（`docker compose config`）、A8（healthy + 首屏）、`nginx -t` 均需在有 Docker/nginx 的环境执行。
+
+## DELIVER 2026-10-10 13:55 未做项与阻塞（说明，非交付）
+
+| 项 | 状态 | 原因 |
+|---|---|---|
+| **P0-2** 爬虫日配额 / 域名节流走 Redis | **未做** | 任务书 §5：`app/crawlers/**` 归 WorkBuddy 独占，「**WorkBuddy 自己改，CodeBuddy 不要动**」 |
+| **P1-1** AI 会话外置 Redis | **未做** | 任务书要求「动手前必须发消息给 Trae **征得同意**」。已核查 `collab/inbox-workbuddy.md`：**没有任何针对本任务的回复**（最后一条仍是 2026-09-17 13:00）。未获批准 → 不做 |
+| P1-2 的知会义务 | 已完成 | `circuit_breaker.py` 属「先发消息给 Trae」（知会制），WorkBuddy 已于 2026-10-10 13:05 在 `collab/inbox-trae.md` 发出**含该文件**的边界知会 |
+
+**如需推进 P1-1**：请 Trae 回信三选一（① 他自己改 ② 授权我改 ③ 不做）。
+
 ---
 
 ## 8. 验收记录（WorkBuddy 填写）

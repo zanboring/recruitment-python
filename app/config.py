@@ -435,6 +435,12 @@ class Settings(BaseSettings):
     # 多副本部署时改为 redis —— 否则 N 个副本各算一份计数，登录防爆破配额会变成 N 倍。
     rate_limit_backend: str = "memory"
 
+    # 熔断器状态后端：memory（默认，进程内）/ redis（跨副本共享）。
+    # 多副本下进程内熔断器各自为战：副本 A 熔断了，副本 B 仍继续向已挂的上游
+    # 发请求（每个都要等满超时）—— 故障被放大而不是被抑制。
+    # 设为 redis 后「一次熔断、全局生效」；Redis 不可用时自动降级进程内状态。
+    circuit_breaker_backend: str = "memory"
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, v):
