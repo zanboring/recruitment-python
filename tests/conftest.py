@@ -79,6 +79,7 @@ def pytest_configure(config):
     settings.rate_limit_backend = "memory"
     settings.circuit_breaker_backend = "memory"
     settings.quota_backend = "memory"          # W2 新增：采集日配额 / 域名节流
+    settings.session_backend = "memory"        # F5 新增：AI 会话历史后端（W3）
     settings.redis_url = ""
 
 
