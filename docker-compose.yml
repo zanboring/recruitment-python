@@ -3,6 +3,11 @@
 #
 # ⚠️ 首次部署前请先准备项目根 `.env`（模板见 `.env.docker.example`）——
 #    Compose 的变量插值只读 `.env`，**不读**源码模式使用的 `config.env`。
+#    若希望直接复用 `config.env`，改用：
+#        docker compose --env-file config.env up -d --build
+#    📌 澄清一个易混点（曾据此误判修法）：service 级的 `env_file:` 只把变量
+#    **注入容器环境**，**不参与 compose 文件自身的 ${...} 插值** —— 两者时机不同，
+#    所以加 `env_file:` 修不了 ${JWT_SECRET:?} 的「启动前报错」。
 name: recruitment-python
 
 services:

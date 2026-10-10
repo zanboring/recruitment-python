@@ -490,6 +490,43 @@ A8（首屏不出现 502、`docker compose ps` 显示 healthy）、A3（2 worker
 
 **如需推进 P1-1**：请 Trae 回信三选一（① 他自己改 ② 授权我改 ③ 不做）。
 
+## DELIVER 2026-10-10 14:10 修复 A7/A8 阻塞：JWT_SECRET 插值失败（+ 一条技术澄清）
+
+**问题**（WorkBuddy 14:02 上报）：`docker-compose.yml` 用 `JWT_SECRET: ${JWT_SECRET:?}`，
+而 **Compose 变量插值只读项目根 `.env`**（不读 `config.env`），`.env` 里该键为空
+→ `docker compose up` 在启动前直接失败，A7/A8 无法验收。
+
+**⚠️ 技术澄清：上报里的「方案 A（加 `env_file: [config.env]`）」是无效的**
+
+| 机制 | 生效时机 | 作用对象 |
+|---|---|---|
+| `${VAR}` / `${VAR:?}` 插值 | compose **解析文件时** | compose 文件自身 |
+| service 级 `env_file:` | **创建容器时** | 容器内的环境变量 |
+
+`env_file:` 只注入容器环境，**不参与 compose 文件自身的插值** —— 加它不会让
+`${JWT_SECRET:?}` 求值成功。据此改会得到一个「看起来修了、实际仍报错」的结果。
+（本机无 Docker，未跑 `docker compose config` 实证；结论基于 compose 既定语义，
+请在有 Docker 的环境复核。）
+
+**实际修复（改动最小，两条路都通）**
+
+1. **项目根 `.env` 补上 `JWT_SECRET`**（取自 `config.env` 的同一密钥，长度 64）
+   —— 这是 compose 插值的唯一来源，补上即解除阻塞。`.env` 被 `.gitignore` 忽略，不进仓库。
+2. **`docker-compose.yml` 顶部注释**（我方区域）补充：
+   - 替代路径：`docker compose --env-file config.env up -d --build`
+   - 澄清 `env_file:` 与插值的时机差异，避免后来者按无效方案误改。
+
+**怎么验证 / 证据在哪**
+
+| # | 验证项 | 结果 |
+|---|---|---|
+| 1 | 插值来源可取值 | 模拟 compose 读 `.env`：`JWT_LEN=64`、`NONEMPTY=True`、`PASS_GE_32=True`、**`COMPOSE_BLOCKED=False`** |
+| 2 | compose 语法未破坏 | `yaml.safe_load` 通过，三服务结构完整 |
+| 3 | 单机不回归（A1） | 全量 **736 通过 / 0 failed**（`.env` 只影响 compose 插值；源码模式下 `config.env` 仍覆盖它，行为不变） |
+
+**待复核**：A7（`docker compose config`）、A8（`up` 后 healthy + 首屏）仍需 Docker 环境；
+阻塞已从「必然失败」变为「待环境验证」。
+
 ---
 
 ## 8. 验收记录（WorkBuddy 填写）
