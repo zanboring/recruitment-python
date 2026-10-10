@@ -260,3 +260,93 @@ git branch -f dev-trae b70b287        # ③ dev-trae 复位到它被创建时的
 
 工作树里新增了两个**不属于我**的改动：`app/services/ai_service.py`、`collab/README.md`。
 若是你在为 W3 做准备（`ai_service.py` 属 Trae 域），我一行不会碰。
+
+---
+
+## MSG 2026-10-10 16:40 W8 + W9 完成（F4 flaky 已根除，附四组证据）
+
+### 一、W8：F4 已修复 —— **只改测试，不动 `app/crawlers/base.py`**
+
+`_adaptive_delay()` 的实现（`base=uniform(min,max)`；`factor=uniform(lo,hi)×signals`）
+**本身是正确的**，问题只在断言方式。所以我没碰生产代码（那是你的采集域）。
+
+**做法：沿用本项目既有的「用配置把随机区间压成点」手法**
+（`test_boss_crawler.py` / `test_job51_crawler.py` 里就是 `crawl_delay_min=max=0.0`），
+把三个区间都设成单点：
+
+```python
+monkeypatch.setattr(settings, "crawl_delay_min", 1.5)
+monkeypatch.setattr(settings, "crawl_delay_max", 1.5)
+monkeypatch.setattr(settings, "crawl_adaptive_delay_factor", (12, 12))
+```
+
+于是 base 恒为 1.5、factor 恒为 12×信号数，断言成为**确定值**，且比原来更强 ——
+不只断言「变大」，还断言「**线性**放大」：信号 1→2 时延迟恰好翻倍（`more == slowed * 2`）。
+
+### 二、验收证据（四组）
+
+| # | 证据 | 结果 |
+|---|---|---|
+| 1 | **修复后**该用例连跑 **200 次** | **失败 0 次** ✅（你的判据） |
+| 2 | **修复前**断言连跑 200 次（同一 harness） | **失败 10 次**（5%）→ 证明 harness 真能抓到问题，第 1 条的 0 不是「恒真」 |
+| 3 | 纯蒙特卡洛 **20 万次** | 旧断言失败率 **3.98%**，对齐你报告的 3.94% |
+| 4 | **全量连跑 5 次** | `764 passed` × 5，**失败 0 次** ✅（你的判据） |
+
+**跑法透明**：本环境只有 `pytest` + `pytest-asyncio`，**未装 `pytest-repeat`** ——
+命令行跑 200 次要十几分钟（每次进程启动约 2.5s）。证据 1/2 用 in-process 的
+`MonkeyPatch` 直接驱动**同一个测试函数**，代码路径与断言完全一致，
+每轮完整 `undo()` + 重置 `_blocked_signals`，等价于 200 次独立用例；
+证据 4 是 5 次真实的独立 pytest 进程。
+若你要求「200 次必须走 pytest 进程」，我可以装 `pytest-repeat` 重跑（需新增依赖，等你点头）。
+
+### 三、W9：同类断言的排查结果 —— **全项目只有 F4 这一处**
+
+**方法**：① 全量测试目录搜 `random|shuffle|sample`；
+② 定位 4 个含 `random` 的生产模块，逐一回看其测试是否断言了随机输出。
+
+| 模块 | random 用途 | 相关测试的断言方式 | 判定 |
+|---|---|---|---|
+| `app/crawlers/base.py` | `_adaptive_delay` / `crawl_with_retry` | `test_anticrawl.py`（本次修复）；`test_crawler.py::test_退避时长按指数增长` 断言**区间** `base <= waited <= base+1`，精确匹配 `2^(n+1)+uniform(0,1)` | ✅ 安全 |
+| `app/crawlers/throttle.py` | 等待叠加抖动 | `test_throttle.py` 断言**阈值**（`>= interval*0.8`），非两采样对比 | ✅ 安全 |
+| `app/services/job_checker.py` | 错峰 `sleep(random.uniform(...))` | 无测试断言其延时值 | ✅ 安全 |
+| `app/scheduler.py` | `shuffle` 组合 + 组间间隔 | 无测试断言其时刻值 | ✅ 安全 |
+
+**结论：无同类残留**。另 `test_boss_crawler.py` / `test_job51_crawler.py` 早已用
+「区间压点」处理随机，是本项目既有的正确手法，我沿用了它。
+
+### 四、修复手法的取舍（复盘可讲）
+
+你给了两个建议（① 断言设计意图 ② 注入固定种子），我选 ① + 「区间压点」，理由：
+
+- **不 patch `random.uniform`**：那会把**全局**随机源换掉，等于「改动被测环境」；
+  而「区间压点」只改**配置**，走的是生产代码**真实分支**（`uniform(a,a)` 仍真的被调用）。
+  前者容易掩盖实现问题，后者不会。
+- **不 `random.seed()`**：种子只保证「同种子下可复现」，断言依然在比较两个随机量 ——
+  换种子或换 Python 版本仍可能失败，**没有消除随机性**，只是让它「通常能过」。
+- **顺带加强**：从「变大」升级为「线性放大」，覆盖原测试漏掉的设计意图。
+
+### 五、边界与协调
+
+- 我只改了 `tests/test_anticrawl.py`（+26/-7）：**没碰** `app/crawlers/base.py`（你的域），
+  **也没碰** `tests/conftest.py`（Trae 的 F5 要动它）—— 已通过直通信道告知 Trae，避免撞车。
+- 分支 `dev-codebuddy` 已按你的指示 `git merge main`（快进到 `ccf1748`，无冲突）。
+- 提交前 `git rev-parse --abbrev-ref HEAD` 确认，提交后 `git log --oneline -1` 复核。
+
+### 六、⚠️ 一个影响你合并计划的变化：两条 dev 分支已分叉
+
+我提交前观察到：两条分支都基于 `ccf1748`，但**各自加了提交**：
+
+| 分支 | 内容 | 涉及文件 |
+|---|---|---|
+| `dev-codebuddy` | 我的 W8/W9（本次提交） | `tests/test_anticrawl.py` |
+| `dev-trae` | Trae 的 F5（他已提交，基点同为 `ccf1748`） | `tests/conftest.py`、`tests/test_conftest_isolation.py` |
+
+→ **§8.2 里那条「线性链、可快进」的假设已不成立**：现在需要一次真正的 merge
+（`--ff-only` 会失败）。好消息是两侧文件**零重叠** ——
+Trae 只动了 conftest 与隔离断言，我只动了 `test_anticrawl.py`，预计无冲突。
+请在 W7 按「先并一条、再并另一条」处理。
+
+另外 Trae 在他的信道里报告：他跑全量（2.5 分钟 ×2）**期间分支又被切走**，
+F5 改动一度落在 `dev-codebuddy` 工作树上（他改用独立临时索引提交，未动共享索引）。
+**这是本轮第二次同类事件** —— 我在上一封里建议的「跑长任务前后也重新确认分支」
+看来需要升级为硬约定：**任何超过 1 分钟的操作（尤其全量测试）前后都要重新 `rev-parse`**。
