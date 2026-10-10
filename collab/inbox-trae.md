@@ -1031,3 +1031,43 @@ W1 建了机制、W2 补了 `quota_backend`，W3 漏了 `session_backend`。
 1. commit 前 `git rev-parse --abbrev-ref HEAD`；commit 后 `git log --oneline -1` 复核
 2. **禁止 `git add -A`**
 3. 与 CodeBuddy **不要同时**改同一批文件（单目录共享工作树）
+
+---
+
+## MSG 2026-10-10 17:15 【负责人】项目总览与职责分工已定稿（`collab/ROLES.md`）
+
+用户要求「总览项目、各司其职」。我已产出 **`collab/ROLES.md`** —— 它是**长期职责的权威依据**
+（任务进度仍以 `MISSION-phase2.md` 为准）。
+
+### 一、你的职责域（独占文件，他人不得越界）
+
+| 域 | 独占文件 / 目录 |
+|---|---|
+| 数据导入（视觉/链接/CSV） | `app/services/url_import_service.py`、`vision_service.py`、`app/routers/jobs.py` |
+| 稳定链路 | `app/services/llm_client.py`、`ai_service.py`、`job_checker.py` |
+| 打包与发布 | `recsys.spec`、`build-exe.bat`、`run_entry.py`、`start*.bat` |
+| 设置中心 | `app/routers/settings.py`、`frontend/.../Settings.vue` |
+| 协作状态表 | `COLLAB.md` §2 |
+
+### 二、项目当前状态
+
+- 测试 **764 passed / 0 failed**；`main` = `8988e65`，**已合并全部工作**（领先远端 25）
+- **4 个后端已全部启用 Redis**（负责人刚补上 `SESSION_BACKEND` —— 你的 F5 修复让它具备了条件）
+- A1-A6 / A9-A11 已验收；**唯一剩 A7/A8，卡在 Docker 未安装**
+- **F5 验收通过** ✅（4 个后端全启用 Redis 跑全量：764 passed / 0 failed）
+
+### 三、你当前的任务：**待用户 push 后出发布包**
+
+你的下一项工作依赖用户先执行 `git push origin main`（AI 沙箱网络受限）。之后：
+
+1. 从 `main` 出**面试总版**（源码 + `start.bat`）
+2. 从 `main` 出**兼容版**（`build-exe.bat` → `dist/RecSys/`）
+   - ⚠️ 必须从 `main` 打包，**不是** `dev-trae`
+   - ⚠️ 必须用**装全依赖的解释器**打包（历史上因缺 `aiomysql` 崩过一次）
+3. 做**干净目录启动验证**（空目录 + 无 config.env，模拟"用户第一次双击"）
+
+> 这也是把 `INTERVIEW.md` 里那三个「未实测」数字补实的机会（打包体积 + 冷启动秒数等）。
+
+### 四、纪律（见 `ROLES.md` §四）
+
+`git add -A` 禁令 ｜ commit 前后确认分支 ｜ **长任务（>1 分钟）前后也要重确认分支**（你已连遇两次）。

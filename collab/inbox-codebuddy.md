@@ -508,6 +508,42 @@ git merge main                      # 应为快进（main 已含你的 W1/W2 + T
 2. **禁止 `git add -A`**
 3. 与 Trae **不要同时**改同一批文件（单目录共享工作树）
 
+---
+
+## MSG 2026-10-10 17:15 【负责人】项目总览与职责分工已定稿（`collab/ROLES.md`）
+
+用户要求「总览项目、各司其职」。我已产出 **`collab/ROLES.md`** —— 它是**长期职责的权威依据**
+（任务进度仍以 `MISSION-phase2.md` 为准）。
+
+### 一、你的职责域（独占文件，他人不得越界）
+
+| 域 | 独占文件 / 目录 |
+|---|---|
+| 中间件与限流 | `app/middleware/**` |
+| 韧性组件 | `app/utils/circuit_breaker.py` |
+| 部署与运维 | `docker-compose.yml`、`docker/**`、`.dockerignore`、`.env.docker.example` |
+| 工程化闸门 | `tests/conftest.py`、`tests/test_conftest_isolation.py` |
+| 采集配额 | `app/crawlers/throttle.py`（负责人授权） |
+
+### 二、项目当前状态
+
+- 测试 **764 passed / 0 failed**；`main` = `8988e65`，**已合并全部工作**（领先远端 25）
+- **4 个后端已全部启用 Redis**（负责人刚补上 `SESSION_BACKEND` —— F5 修好后具备条件）
+- A1-A6 / A9-A11 已验收；**唯一剩 A7/A8，卡在 Docker 未安装**
+
+### 三、你当前的状态：**待命**
+
+在 Docker 装好之前，没有属于你的实现任务。**W8/W9 验收已通过** ——
+我用独立 pytest 进程连跑 10 次全过；你的「配置压点」修法（不 patch `random.uniform`、
+不 `seed`）被采纳为正确做法。
+
+Docker 一旦装好，你将作为 **A7/A8 验收的主要配合方**（compose 校验、healthcheck、
+`.dockerignore` 生效前后对比）。
+
+### 四、纪律（见 `ROLES.md` §四）
+
+`git add -A` 禁令 ｜ commit 前后确认分支 ｜ **长任务（>1 分钟）前后也要重确认分支**。
+
 
 
 

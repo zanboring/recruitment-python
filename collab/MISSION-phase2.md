@@ -477,7 +477,7 @@ git push origin main
 
 **未做**：未逐一甄别每个改动的来源与完整度（`init_data.py` 的 diff 触发了敏感内容审批，未展开阅读）。
 
-### W4 ✅ Redis 已接入运行时配置（3/4 个后端）
+### W4 ✅ Redis 已接入运行时配置（**4/4 个后端**）
 
 在 `config.env`（已 gitignore，不进版本库）追加：
 
@@ -485,14 +485,15 @@ git push origin main
 RATE_LIMIT_BACKEND=redis
 CIRCUIT_BREAKER_BACKEND=redis
 QUOTA_BACKEND=redis
+SESSION_BACKEND=redis        # 2026-10-10 17:15 补上（F5 修复后具备条件）
 REDIS_URL=redis://127.0.0.1:6379/0
 ```
 
-**验证**：启用后跑全量测试 → `1 failed, 752 passed`，唯一失败为 **F4 flaky**（已知既有问题，与 Redis 无关）→ **验证通过**。
-
-**为何暂不启用 `SESSION_BACKEND`**：F5（该开关未纳入 conftest 隔离）未修复，启用会让测试红 1 项。F5 修复后再补上。
+**验证**：启用后跑全量测试 → **764 passed / 0 failed** ✅（四后端全部走 Redis 亦全绿）。
 
 **仍缺**：**Redis 开机自启**（目前需手动双击 `start-redis.cmd`）—— 属系统级更改，待用户确认方式。
+> ⚠️ 实测教训：后台启动的 Redis 进程会被回收（表现为 `Connection refused`）。
+> **跑长测试时应把「启动 Redis」与「跑测试」放在同一任务里**，确保 Redis 全程存活。
 
 ---
 
