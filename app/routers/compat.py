@@ -684,7 +684,7 @@ async def compat_set_knowledge_status(
         raise AppException("知识条目不存在", 404)
     item.status = status
     await db.commit()
-    knowledge_service._invalidate_caches()
+    await knowledge_service._invalidate_caches()
     return Result.success()
 
 

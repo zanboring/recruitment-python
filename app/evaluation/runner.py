@@ -122,7 +122,7 @@ async def run_evaluation(strategies: list = None, top_k: int = TOP_K) -> dict:
                 continue
 
             # 换库后必须清掉条目缓存，否则会拿到上一个库的 ORM 对象
-            knowledge_service._invalidate_caches()
+            await knowledge_service._invalidate_caches()
 
             records = []
             async with maker() as db:

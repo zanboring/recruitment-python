@@ -135,7 +135,7 @@ class KnowledgeService:
         if request.quality_score is not None:
             kb.quality_score = request.quality_score
         await db.commit()
-        _invalidate_caches()
+        await _invalidate_caches()
         return kb
 
     @staticmethod
@@ -145,7 +145,7 @@ class KnowledgeService:
             raise ValueError("知识条目不存在")
         await db.delete(kb)
         await db.commit()
-        _invalidate_caches()
+        await _invalidate_caches()
 
     @staticmethod
     async def toggle_status(db: AsyncSession, knowledge_id: int):

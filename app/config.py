@@ -248,7 +248,10 @@ class Settings(BaseSettings):
     #   zhipu   强制云端智谱 embedding-3（需 ZHIPUAI_API_KEY）
     #   ollama  强制本地 Ollama（离线、零成本、数据不出内网，需先 ollama pull 向量模型）
     embedding_backend: str = "auto"
-    ollama_embedding_model: str = "nomic-embed-text"
+    # 默认值必须指向「本机实际已装」的模型，否则 Ollama 返回 404，
+    # 而调用方会静默降级到规则引擎 —— 不报错、只是 AI 功能失效，极难察觉。
+    # 改默认模型前，请确认两台机器都 `ollama pull` 过同名模型（见 collab/WORKFLOW.md §0.6）。
+    ollama_embedding_model: str = "qwen3-embedding:0.6b"
 
     # 知识库检索策略，取值：
     #   auto      语义优先，无命中或异常时降级关键词（默认）
@@ -267,8 +270,11 @@ class Settings(BaseSettings):
     # 可用 scripts/bench_local_models.py 在本机复现。
     ollama_enabled: bool = True
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "qwen2.5:14b"
-    ollama_code_model: str = "qwen2.5-coder:7b"
+    # 同 ollama_embedding_model：默认值必须与实装模型一致，否则静默降级。
+    # 历史默认值 qwen2.5:14b / qwen2.5-coder:7b 均已停止使用且本机未安装，
+    # 已统一为当前实装的 qwen3.5:4b（该模型为混合推理模型，见下方 ollama_think 说明）。
+    ollama_model: str = "qwen3.5:4b"
+    ollama_code_model: str = "qwen3.5:4b"
     ollama_tool_model: str = ""
 
     # 思考模式开关（Qwen3 / Qwen3.5 等「混合推理」模型必需）。
