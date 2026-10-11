@@ -104,14 +104,118 @@ git branch -D feat/redis-quota        # 已合并的本地分支清掉
 
 ---
 
-## 六、两台机器各自的一次性准备
+## 六、笔记本一次性开通清单（每条都经实测，别跳步）
 
-| | 台式机 | 笔记本 |
+> ⚠️ **`config.env` 与 `.env` 都被 `.gitignore` 挡住** —— 新 clone 的仓库里**没有这两个文件**。
+> 下面所有命令都据此设计。
+
+### 0.1 先处理旧副本（最高优先级）
+
+笔记本之前开发过本项目 → 很可能有一份带 `.git` 的旧副本。
+**"两份带 `.git` 的活副本指向同一 origin"在本项目历史上已经造成过事故。**
+
+```powershell
+cd <旧的 recruitment-python 目录>
+git log --oneline -12      # 有未推送的本地提交吗？
+git status --short         # 有未提交改动吗？
+git stash list             # 有 stash 吗？
+git remote -v              # 指向哪个 origin？
+```
+
+- **有未推送内容** → `git push origin HEAD:rescue/laptop-legacy` 保住，再删目录
+- **干净且与 origin 一致** → 直接删目录
+- ❌ **任何情况都不要在旧副本上继续开发**
+
+### 0.2 装 Docker Desktop
+
+- **必须选 WSL2 后端**
+- 装完把 **Disk image location** 指到非 C 盘（台式机用的是 `G:\Work\docker`）
+- ⚠️ **必须配 `registry-mirrors`** —— Docker Hub 在你这台机器**实测完全不通**，
+  不配的话第一次 `docker compose up --build` 会全部拉取失败（台式机踩过这个坑）
+
+  Settings → Docker Engine 里加：
+  ```json
+  "registry-mirrors": [
+    "https://docker.m.daocloud.io",
+    "https://docker.1ms.run",
+    "https://docker.1panel.live"
+  ]
+  ```
+  点 Apply & Restart，`docker info` 里出现 Registry Mirrors 即生效。
+
+### 0.3 从 GitHub 重新 clone
+
+```powershell
+git clone https://github.com/zanboring/recruitment-python.git
+cd recruitment-python
+```
+
+### 0.4 模型：走 U 盘（**不要走局域网，也不要各自 `ollama pull`**）
+
+> ❌ **局域网 SMB 在这台台式机上不可用**：`Administrator` 是**空密码**，
+> 而 Windows 默认 `LimitBlankPasswordUse=1` 禁止空密码账户经网络认证
+> → `\\192.168.31.74\D$` **必然报 1326**。别在这条路上浪费时间。
+
+模型已备好，**直接插 U 盘**：
+
+```
+I:\Ollama\models                 13 个文件 / 3.69 GB（8/8 blob 自校验通过）
+I:\Ollama\安装说明-给笔记本.md    ← 含二次校验命令与注意事项
+```
+
+拷到笔记本的 `D:\Apps\Data\Ollama\models`，设环境变量 **`OLLAMA_MODELS`** 指向它，重启 Ollama。
+
+**为什么必须用同一份、而不是各自 `ollama pull`**：嵌入模型的向量空间是模型特有的。
+两台只要不一致，任何一次把 `data/recruitment.db` 带到另一台，
+就会**静默**检索出垃圾结果（不报错，只是答案变差）。
+
+### 0.5 确认显卡有没有真的在用
+
+```powershell
+ollama ps
+```
+
+看 `PROCESSOR` 列：显示 GPU → 6800M 用上了；显示 `100% CPU` → 没用上
+（Ollama 官方 Windows ROCm 清单**不含移动版 6800M**）。
+**不影响项目** —— 4B + 0.6B 太小，CPU 也够用。
+
+### 0.6 起全栈验证
+
+**省事版**（用 compose 内置的默认密钥，本地开发可接受）：
+
+```powershell
+$env:PLAYWRIGHT_DOWNLOAD_HOST='https://cdn.npmmirror.com/binaries/playwright'
+docker compose up -d --build
+```
+
+**推荐版**（有正经的 JWT 密钥）：
+
+```powershell
+copy config.template.env config.env
+#   编辑 config.env：填 JWT_SECRET（可选再加 DEEPSEEK_API_KEY / ZHIPUAI_API_KEY）
+$env:PLAYWRIGHT_DOWNLOAD_HOST='https://cdn.npmmirror.com/binaries/playwright'
+docker compose --env-file config.env up -d --build
+```
+
+> **两点说明：**
+> 1. **`PLAYWRIGHT_DOWNLOAD_HOST` 不能省** —— 官方 CDN 实测约 100 KB/s，
+>    187 MB 的 Chromium 要 1.5 小时以上；换 npmmirror 约 14 秒。
+> 2. 笔记本上**不需要** `--env-file .env`。台式机那条"必须带 `--env-file`"的要求，
+>    是它**本地 `.env` 的插值语法问题（F6）**造成的；
+>    **新 clone 没有 `.env`，不存在这个问题** —— 已实测：模拟无 `.env` 无 `config.env` 的目录，
+>    `docker compose config` **退出码 0**。
+
+---
+
+## 七、两台机器的就绪状态对照
+
+| 项 | 台式机 | 笔记本 |
 |---|---|---|
-| Docker Desktop | ✅ 已装（WSL2 后端，镜像数据在 `G:\Work\docker`） | 待装（**必须选 WSL2 后端**） |
-| registry-mirrors | ✅ 已配（Docker Hub 直连不通） | **待配**（同三个源） |
-| Ollama | ✅ 已装（`D:\Apps\Data\Ollama\models`） | 待装（**模型从 U 盘 `I:\Ollama\models` 拷**） |
-| Python 解释器 | 3.14.7（**仅跑单测**） | 待装（版本不限，测试以容器为准） |
+| 代码仓库 | ✅ `D:\Dev\recruitment-python`，`main` 与远端同步、工作树干净 | 待 0.3 clone |
+| Docker Desktop | ✅ 已装（WSL2，镜像数据在 `G:\Work\docker`） | 待 0.2 |
+| registry-mirrors | ✅ 已配 | 待 0.2 |
+| Ollama + 模型 | ✅ `D:\Apps\Data\Ollama\models` | 待 0.4（**U 盘**） |
+| Python 解释器 | 3.14.7（**仅跑单测**，不等于 3.11 通过） | 版本不限，测试以容器为准 |
 
 > **模型名必须一致**：`qwen3.5:4b` + `qwen3-embedding:0.6b`。
 > 换了名字项目会**静默降级**到规则引擎（不报错，只是 AI 功能失效）。
