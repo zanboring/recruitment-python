@@ -46,6 +46,15 @@ services:
       # 采集日配额 / 域名节流同样跨副本共享 —— 日配额是**对招聘站点的承诺**，
       # 内存实现下 2 副本会让实际访问量翻倍，承诺不成立。
       QUOTA_BACKEND: ${QUOTA_BACKEND:-redis}
+      # 熔断器 / AI 会话历史同样外置 —— 与上面两项保持一致，四个后端全部走 Redis。
+      # 此前只配了 rate_limit 与 quota，这两项在容器内会静默回落到进程内实现
+      # （功能正常、但「跨副本共享」的语义失效，且不会有任何报错）。
+      CIRCUIT_BREAKER_BACKEND: ${CIRCUIT_BREAKER_BACKEND:-redis}
+      SESSION_BACKEND: ${SESSION_BACKEND:-redis}
+      # 浏览器采集：容器内无显示器、也没有本机 Chrome，必须覆盖这两项，
+      # 否则跑 BOSS 采集会以 no X server / channel not found 失败。
+      CRAWL_HEADLESS: ${CRAWL_HEADLESS:-true}
+      CRAWL_BROWSER_CHANNEL: ${CRAWL_BROWSER_CHANNEL:-}
       # ⚠️ 多 worker 下进程内 APScheduler（定时爬取/日报）与 job_checker 会在
       #    每个 worker 内各自启动 → 定时任务重复触发 N 次，对招聘站点的压力翻倍。
       #    这是多副本的真实代价，两种处理方式：
