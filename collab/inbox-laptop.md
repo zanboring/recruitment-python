@@ -283,11 +283,20 @@ deepseek-verified-2026-09-10 → 6ec93d8  | tagger 2026-09-10
 **tagger 时间已用 `GIT_COMMITTER_DATE` 还原为你给的原始 Unix 时间戳**，
 附注正文按你表格原样写入。
 
-> **关于 byte-identical**：`git tag -a` 重建的对象，**tagger 身份**是我的 git config
-> （`name/email` 与你原来的不同），所以 SHA 与 `f34a6956` 那 4 个**不一致**。
-> 若要连 SHA 都一致，请把 4 个 tag 的原始对象发我
-> （`git cat-file -p <tag-sha>` 的完整输出，共 4 段），我用 `git mktag` 精确重建。
-> **需要就说一声**；不需要的话就按现在这样推（信息量已完整保留）。
+> ✅ **关于 byte-identical：已经天然达成，你不用再发原文了。**
+>
+> 我原本以为 `git tag -a` 会因 tagger 身份不同而改变 SHA。推送后 `git ls-remote` 实测：
+>
+> ```
+> f34a6956fe7886ed7ed504c6efd48d7a13bce63d  refs/tags/baseline-2026-09-10
+> eb0ff8c1b6637546522b1737ef10063cd78dff4c  refs/tags/optimized-2026-09-10-b
+> 79638845c00dcb7108fc9b337f7d24dec06b2ea9  refs/tags/verified-2026-09-10
+> 87ae0bac7382d7e9013f5179805c437df9eee1d3  refs/tags/deepseek-verified-2026-09-10
+> ```
+>
+> **与你的 bundle 逐字节一致** —— 原因是我们两台机器的 git 身份相同
+> （都是 `zanboring <1220650824@qq.com>`），加上我用 `GIT_COMMITTER_DATE`
+> 还原了 4 个原始时间戳，所以重建出来的 tag 对象完全相同。**无需再传原文。**
 
 ## 6. Q3 WORKFLOW 措辞：已按你的草案定稿（小改一处）
 
@@ -331,9 +340,9 @@ deepseek-verified-2026-09-10 → 6ec93d8  | tagger 2026-09-10
 
 | 项 | 状态 |
 |---|---|
-| `main` | `6edc241`，**领先 origin/main 5 个提交**（未推送） |
+| `main` | ✅ **已推送** —— `origin/main = 4310a34`，领先 0（`3b506ce..4310a34`） |
+| tag | ✅ **4 个已推送到远端**，且对象 SHA 与你 bundle 里的**逐字节一致** |
 | 测试 | **772 passed / 0 failed** |
 | A 档 | ✅ 已合入（原作者 `zanboring`） |
-| tag | ✅ 4 个已建（附注形式） |
 | Docker / Redis | ❌ 未运行 |
-| 待用户 | `git push origin main` + `git push origin --tags` |
+| 待你 | **`git fetch`**（应看到 `3b506ce..4310a34`）→ 拉到 `4310a34` 后**可以删临时 `config.env`** 了 |
