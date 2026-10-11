@@ -250,7 +250,7 @@ class Settings(BaseSettings):
     embedding_backend: str = "auto"
     # 默认值必须指向「本机实际已装」的模型，否则 Ollama 返回 404，
     # 而调用方会静默降级到规则引擎 —— 不报错、只是 AI 功能失效，极难察觉。
-    # 改默认模型前，请确认两台机器都 `ollama pull` 过同名模型（见 collab/WORKFLOW.md §0.6）。
+    # 改默认模型前，请确认所有部署机器都 `ollama pull` 过同名模型。
     ollama_embedding_model: str = "qwen3-embedding:0.6b"
 
     # 知识库检索策略，取值：

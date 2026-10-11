@@ -3,7 +3,7 @@
 用法：
     python scripts/eval_rag.py                          # 评估全部可用策略
     python scripts/eval_rag.py --strategies keyword     # 只跑关键词基线（离线可用）
-    python scripts/eval_rag.py --output reports/rag_evaluation.md
+    python scripts/eval_rag.py --output docs/reports/rag-evaluation.md
 
 说明：
 - `semantic` / `hybrid` 策略需要 `ZHIPUAI_API_KEY`，未配置时会自动跳过并说明原因；

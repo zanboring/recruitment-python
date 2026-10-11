@@ -10,7 +10,7 @@
 
     python scripts/bench_local_models.py                      # 对比全部已安装模型
     python scripts/bench_local_models.py --models qwen2.5:14b # 只测指定模型
-    python scripts/bench_local_models.py --output reports/local_model_benchmark.md
+    python scripts/bench_local_models.py --output docs/reports/local-model-benchmark.md
 
 设计说明：
 - 工具识别用项目**真实的**提示词与解析器（``app.services.tool_service``），

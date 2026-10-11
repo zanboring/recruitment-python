@@ -578,7 +578,7 @@ async def call_chat_stream(
         # 本地路径也做工具识别，避免降级后「查库」这一核心能力直接失效。
         # 这里刻意用「结构化任务」模型：实测它做工具识别的准确率与语言模型
         # 相同（6/6 = 100%），但平均耗时明显更低（5.4s vs 7.4s）；
-        # 实测数据见 reports/local_model_benchmark.md。
+        # 实测数据见 docs/reports/local-model-benchmark.md。
         if db and should_detect_tool(message):
             try:
                 from app.services.tool_service import build_tool_result_context, execute_tool

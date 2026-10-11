@@ -1,6 +1,6 @@
 # AI 招聘数据可视化系统（Python 重构版）
 
-> 求职作品定位、运行约束与下一步开发请先阅读 [AI_APPLICATION_HANDOFF.md](AI_APPLICATION_HANDOFF.md)。生产部署必须设置 `APP_ENV=production` 和强随机 `JWT_SECRET`。
+> 生产部署必须设置 `APP_ENV=production` 和强随机 `JWT_SECRET`。工程规范见 [CONTRIBUTING.md](CONTRIBUTING.md)，架构说明见 [docs/architecture.md](docs/architecture.md)。
 
 > 毕业设计《AI 招聘数据可视化系统的开发与设计》的 Python / FastAPI 重构实现。
 > Java 原版见：`github.com/zanboring/Recruitment`
@@ -11,7 +11,7 @@
 
 本仓库是毕设的 **Python 重构版**：用 FastAPI + SQLAlchemy 2.0 异步 ORM 重写后端，保留全部业务能力，并强化了 AI 服务、知识库检索与推荐模块。
 
-**规模**：10 个路由模块 / 90+ 个 REST 接口（含 21 个 Java 版前端兼容接口）/ 14 个业务服务 / 8 张数据表 / 459 项自动化测试
+**规模**：12 个路由模块 / 99 个 REST 接口（含 22 个 Java 版前端兼容接口）/ 21 个业务服务 / 8 张数据表 / 772 项自动化测试
 
 ## 二、技术栈
 
@@ -68,12 +68,12 @@ graph LR
 ```
 recruitment-python/
 ├── app/
-│   ├── main.py              # FastAPI 应用入口（注册 8 个路由、CORS、生命周期）
+│   ├── main.py              # FastAPI 应用入口（注册 12 个路由、CORS、生命周期）
 │   ├── config.py            # pydantic-settings 配置（全部走环境变量）
 │   ├── database.py          # 异步引擎与会话工厂
 │   ├── scheduler.py         # APScheduler 定时爬取
 │   ├── init_data.py         # 建表 + 初始化数据
-│   ├── routers/             # 11 个路由模块（95 个 API 端点，含 compat.py 兼容层）
+│   ├── routers/             # 12 个路由模块（99 个 API 端点，含 compat.py 兼容层）
 │   │   ├── auth.py          #   4  认证
 │   │   ├── jobs.py          #   20 岗位 / 统计 / 导出 / 导入
 │   │   ├── ai.py            #   5  AI 对话
@@ -111,9 +111,9 @@ recruitment-python/
 │   ├── eval_rag.py          # RAG 检索效果评估入口
 │   └── bench_local_models.py# 本地模型能力对比基准（决定模型分工）
 ├── userscript/              # 油猴脚本采集通道（真实浏览器采集 + 回传本地服务）
-├── collab/                  # 双 AI 协作信道（收件箱 + 状态/冲突检查器）
-├── reports/                 # 评估报告输出（rag_evaluation.md、local_model_benchmark.md）
-├── tests/                   # 459 个单元测试
+├── docs/                    # 全部对外文档（架构 / 配置 / 展示 / 迁移 / 评估报告 / 配图）
+├── reports/                 # 运行期产出的评估报告（daily/、*.html 不入库）
+├── tests/                   # 单元测试（当前基线 772 passed）
 ├── _archive/                # 开发过程文档（审计报告 / 提示词，不进仓库逻辑）
 └── requirements.txt
 ```
@@ -137,7 +137,7 @@ recruitment-python/
   | 工具识别 / JSON 抽取 | `qwen2.5-coder:7b`（代码类 7.6B） | `OLLAMA_CODE_MODEL` | 准确率同为 100%，耗时更低（5.4s vs 7.4s）|
 
   分工结论不是靠感觉，而是用 `scripts/bench_local_models.py` 实测得出（报告见
-  `reports/local_model_benchmark.md`）：两个模型做**工具识别**准确率完全相同（6/6），
+  `docs/reports/local-model-benchmark.md`）：两个模型做**工具识别**准确率完全相同（6/6），
   但小的那个明显更快；做**知识问答**时大的那个更可靠。因此机械的抽取环节交给小模型、
   需要表达与事实准确性的环交给大模型。本地链路耗时拆解：工具识别 6.1s + 查库 0.01s +
   生成 22.2s ≈ 28.4s，瓶颈在生成而非路由。
@@ -420,7 +420,7 @@ recruitment-python/
 python scripts/eval_rag.py --strategies keyword
 
 # 完整三策略对比并输出 Markdown 报告
-python scripts/eval_rag.py --output reports/rag_evaluation.md
+python scripts/eval_rag.py --output docs/reports/rag-evaluation.md
 ```
 
 ### 11. 自动化日报（聚合 → Excel → AI 摘要 → 可选推送）
@@ -501,7 +501,7 @@ git tag v1.0.1 && git push origin v1.0.1
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 配置环境变量（见 ENV_CONFIG.md）
+# 2. 配置环境变量（见 docs/configuration.md）
 cp .env.example .env
 #    至少设置：MySQL 连接、JWT 密钥
 #    可选：ZHIPUAI_API_KEY（不填则 AI 走本地 Ollama / 规则引擎）
@@ -698,7 +698,7 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 | 权限 | Spring Security + JWT | 手动 JWT 中间件 |
 | 并发 | 线程池 | asyncio 原生异步 |
 
-详细的双栈对比见 `java_vs_python_comparison.md`，迁移说明见 `MIGRATION_GUIDE.md`。
+详细的双栈对比见 `docs/migration/java-vs-python.md`，迁移说明见 `docs/migration/java-to-python.md`。
 
 ## 九、说明
 
