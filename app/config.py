@@ -341,6 +341,16 @@ class Settings(BaseSettings):
     crawl_adaptive_delay_factor: tuple = (8, 16)
     crawl_proxy: str = ""
     crawl_timeout: int = 45
+    # ---- 浏览器采集：有头模式 + 本机 Chrome + 登录态持久化 ----
+    # headless=False 用真实有界面浏览器（反爬重点识别无头特征）。
+    # ⚠️ 容器 / CI 无显示器，跑浏览器采集时必须覆盖为 true（见 docker-compose.yml）。
+    crawl_headless: bool = False
+    # 浏览器通道："chrome" 复用本机 Chrome 的真实浏览器指纹与登录态；
+    # 留空则用 Playwright 自带 chromium（需 playwright install chromium）。
+    # ⚠️ 容器内没有 Chrome，需留空并改用自带 chromium。
+    crawl_browser_channel: str = "chrome"
+    # 登录态文件路径（Playwright storage_state JSON）：首次登录后保存，后续复用
+    crawl_storage_state: str = "data/boss_storage_state.json"
 
     # ---- 采集节流与合规（跨任务层，补充 BaseCrawler 的「组内」护栏）----
     # BaseCrawler.random_delay 只管一次爬取内部相邻请求的间隔；下面这些管的是
