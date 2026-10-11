@@ -195,21 +195,31 @@ ollama ps
 
 ### 0.6 起全栈验证
 
-> 🔴 **P0 先读：`app/config.py` 的 Ollama 模型名默认值是错的**
+> ✅ **P0 已修复（提交 `00b6a50`）** —— 原问题：`app/config.py` 的默认模型名
+> 指向**从未安装、且已停用**的模型（`qwen2.5:14b` / `nomic-embed-text` /
+> `qwen2.5-coder:7b`）。新 clone 的机器没有 `.env` → 落到错误默认值 →
+> **每次 AI 调用 404 → 静默降级到规则引擎**（不报错，只是 AI 功能失效）。
+> 现默认值 = `qwen3.5:4b` + `qwen3-embedding:0.6b`，与两台机器实装一致。
 >
-> | 位置 | 值 |
+> **分界点（看你本地拉到哪个提交）**：
+>
+> | 你的 `git log` 顶端 | 要做什么 |
 > |---|---|
-> | `app/config.py:270` `ollama_model` | **`qwen2.5:14b`** ❌ 未安装 |
-> | `app/config.py:251` `ollama_embedding_model` | **`nomic-embed-text`** ❌ 未安装 |
-> | `app/config.py:271` `ollama_code_model` | **`qwen2.5-coder:7b`** ❌ 未安装 |
-> | 两台机器实装 | `qwen3.5:4b` + `qwen3-embedding:0.6b` |
+> | 含 `00b6a50` 或更新 | ✅ **什么都不用配**，裸 `docker compose up -d --build` 即可 |
+> | 仍是旧提交 | ⚠️ **临时**在 `config.env` 里显式写 `OLLAMA_MODEL` / `OLLAMA_EMBEDDING_MODEL`，并尽快拉到 `00b6a50` |
 >
-> **危险链条**：新 clone 的机器**没有 `.env`、也没有 `OLLAMA_*` 的 `config.env`**
-> → 落到上面这些错误默认值 → **每次 AI 调用 404 → 静默降级到规则引擎**（不报错，只是 AI 功能失效）。
+> **顺带确认（可省一步）**：`JWT_SECRET` 在开发环境下**不需要**配置 ——
+> `validate_production_settings()` 只在 `app_env` 为 `production`/`prod` 时校验，
+> 默认环境直接放行。所以**笔记本不需要为了启动去写 `config.env`**。
+> （注意：JWT 加固版本尚未合入 `main`，合入后这条会变，以本文档为准。）
 >
-> **根治**：改 `app/config.py` 的三个默认值（一处修好，源码与容器两种模式都正确），
-> 而不是靠每台机器写 env 覆盖 —— 后者会再制造一个不一致源。
-> 在修好之前，**临时**在 `config.env` 里显式写 `OLLAMA_MODEL` / `OLLAMA_EMBEDDING_MODEL`。
+> **验证默认值已生效**（源码模式，一行）：
+>
+> ```powershell
+> .\.venv\Scripts\python.exe -c "from app.config import settings; print(settings.ollama_model, settings.ollama_embedding_model)"
+> ```
+>
+> 输出应为 `qwen3.5:4b qwen3-embedding:0.6b`。
 
 **省事版**（用 compose 内置的默认密钥，本地开发可接受）：
 
