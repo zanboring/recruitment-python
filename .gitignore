@@ -52,3 +52,26 @@ dist_*/
 
 # 手工备份文件（改动前留的回滚副本，不是源码）
 *.bak
+
+# ============ 内部文件：不进公开仓库 ============
+# 本仓库是公开作品集，只放「可以给面试官看的东西」。
+# 内部协作 / 个人 / 机器信息已迁入私有仓库 recruitment-python-internal（见 ../../README 说明）。
+#
+# 内部协作文档（任务书 / 协作信道 / 双机协议，含内网 IP 与机器绝对路径）
+collab/
+HANDOFF.md
+AI_APPLICATION_HANDOFF.md
+COLLAB.md
+COLLAB_HANDOFF.md
+ENV_MIGRATION_CHECKLIST.md
+INTERVIEW.md
+LEARNING_PATH.md
+
+# 内部协作脚本（面向「两台机器 + 多个 AI 协同」的自研工具）
+collab-check.cmd
+git-collab.cmd
+git-push.cmd
+git-sync.cmd
+
+# 系统审计报告（含本机磁盘布局 / 已装软件清单，严禁公开）
+reports/*.html
