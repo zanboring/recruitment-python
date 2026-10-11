@@ -249,13 +249,47 @@ docker compose --env-file config.env up -d --build
 
 ## 七、两台机器的就绪状态对照
 
-| 项 | 台式机 | 笔记本 |
+| 项 | 台式机 | 笔记本（2026-10-11 实测） |
 |---|---|---|
-| 代码仓库 | ✅ `D:\Dev\recruitment-python`，`main` 与远端同步、工作树干净 | 待 0.3 clone |
-| Docker Desktop | ✅ 已装（WSL2，镜像数据在 `G:\Work\docker`） | 待 0.2 |
-| registry-mirrors | ✅ 已配 | 待 0.2 |
-| Ollama + 模型 | ✅ `D:\Apps\Data\Ollama\models` | 待 0.4（**U 盘**） |
-| Python 解释器 | 3.14.7（**仅跑单测**，不等于 3.11 通过） | 版本不限，测试以容器为准 |
+| 代码仓库 | ✅ `D:\Dev\recruitment-python`，`main` = `6edc241`（领先远端 5 个提交） | ✅ 同路径，`main` = `3b506ce`（等台式机推送后跟上） |
+| Docker Desktop | ✅ 已装（WSL2，镜像数据在 `G:\Work\docker`） | ❌ **未装 —— 当前唯一阻塞项** |
+| registry-mirrors | ✅ 已配（3 个源） | ⛔ 待 Docker 装好后配（**必做，否则拉不动镜像**） |
+| Ollama + 模型 | ✅ `D:\Apps\Data\Ollama\models` | ✅ **`ollama pull` 直连成功**，实测 **100% GPU** |
+| Python 解释器 | 3.14.7（**仅跑单测**，不等于 3.11 通过） | 3.13.14（同上） |
+| git 推送 | ✅ 可推（沙箱侧时通时断，需用户终端兜底） | ⚠️ **只能拉（gh-proxy 镜像），推不了** → 用 `format-patch` 交台式机代推 |
+| 文件传输 | 局域网 HTTP（**首选**）/ 剪贴板 | 同，见 §八 |
 
 > **模型名必须一致**：`qwen3.5:4b` + `qwen3-embedding:0.6b`。
 > 换了名字项目会**静默降级**到规则引擎（不报错，只是 AI 功能失效）。
+> ✅ 已写进 `app/config.py` 默认值（`00b6a50` 起），**新 clone 无需另配**。
+
+---
+
+## 八、两台机器之间的文件传输
+
+> 2026-10-11 实测补充。**优先用局域网，不要用剪贴板传大文件。**
+
+| 方向 | 手段 | 适用 | 实测 |
+|---|---|---|---|
+| **笔记本 → 台式机** | **局域网 HTTP**（`python -m http.server 8000`） | **首选**：任意大小、二进制、可 SHA256 校验 | ping 平均 **4ms**；18 KB 补丁秒下 |
+| 笔记本 → 台式机 | 剪贴板（UU远程） | 小文本、临时消息 | ✅ |
+| 台式机 → 笔记本 | 剪贴板 / 用户手动复制到桌面（OneDrive 同步） | 同上 | 桌面 = `C:\Users\Administrator\Desktop\` |
+| ❌ 不推荐 | 局域网 SMB（`\\192.168.31.74\D$`） | — | **必然报 1326**：`Administrator` 空密码 + `LimitBlankPasswordUse=1` |
+| ❌ 不推荐 | U 盘 | — | 笔记本是**远程控制**的，插不进 U 盘 |
+
+**校验是必须的**：拿到文件先比对 SHA256 再用。
+
+```powershell
+curl.exe -s -o laptop.patch "http://192.168.31.52:8000/laptop.patch"
+```
+
+> ⚠️ 笔记本 IP 由 DHCP 分配，可能变化；取不到时先 `ping` 确认。
+
+### 8.1 临时网络通路（GitHub 直连不通时）
+
+> **⚠️ 这是当前的临时网络状态，不是架构 —— 网络恢复后请回到 `origin`。**
+
+- **拉取**：`git fetch mirror`（`mirror` = `https://gh-proxy.com/https://github.com/...`，**只读**）
+- **推送**：`git format-patch <base>..<tip> --stdout > x.patch` → 局域网 HTTP → 由能推送的机器 `git am` 后**代推**
+
+已验证：`gh-proxy.com` / `ghproxy.net` 可用；`gitclone.com` 返回 502。
