@@ -1,3 +1,5 @@
+import os
+
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
 from urllib.parse import quote_plus
@@ -21,8 +23,18 @@ else:
         # 相对路径统一挂到 ./ 下，避免在非根目录启动时落到奇怪位置
         if db_name.startswith(("/", "\\\\", "./", "C:\\", "c:\\")):
             DATABASE_URL = f"sqlite+aiosqlite:///{db_name}"
+            _db_file = db_name
         else:
             DATABASE_URL = f"sqlite+aiosqlite:///./{db_name}"
+            _db_file = f"./{db_name}"
+        # SQLite 是文件库：父目录不存在时 sqlite3 直接报
+        # "unable to open database file"，首次启动 / 干净机器必然失败。
+        # 在此统一保证目录存在，脚本 / 服务 / 打包三种入口都受益
+        #（此前只在 run_entry.py 修了打包场景，脚本入口仍会踩）。
+        if _db_file and ":memory:" not in _db_file:
+            _parent = os.path.dirname(os.path.abspath(_db_file))
+            if _parent:
+                os.makedirs(_parent, exist_ok=True)
     else:
         DATABASE_URL = f"mysql+aiomysql://{settings.db_username}:{encoded_password}@{settings.db_host}:{settings.db_port}/{settings.db_name}?charset=utf8mb4"
 def engine_kwargs_for(url: str) -> dict:

@@ -15,6 +15,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
 // @connect      localhost
 // @connect      127.0.0.1
 // @run-at       document-idle
@@ -82,12 +83,12 @@
         'li[ka]',
       ],
       fields: {
-        title: ['.job-name', 'span.job-name', '.job-card-left .job-name', 'h3'],
-        salary: ['.salary', 'span.salary', '.job-salary'],
-        company: ['.company-name', 'h3.company-name', '.company-name a'],
-        area: ['.job-area', '.job-area-wrapper', '.job-card-left .job-area'],
-        experience: ['.job-card-footer .tag-list li', '.tag-list li'],
-        education: ['.job-card-footer .tag-list li', '.tag-list li'],
+        title: ['.job-name', 'span.job-name', '.job-card-left .job-name', 'a[ka*="job"] span', 'h3'],
+        salary: ['.salary', 'span.salary', '.job-salary', '.job-card-left .salary', '[class*="salary"]', 'span[class*="sal"]'],
+        company: ['h3.name', '.company-name', '.company-text', 'h3.company-name', 'a[ka*="company"]', '.name a', '.name', '[class*="company"]', '[class*="brand"]'],
+        area: ['.job-area', '.job-area-wrapper', '.job-card-left .job-area', '[class*="job-area"]', '[class*="location"]', '[class*="area"]', '.job-location'],
+        experience: ['.job-card-footer .tag-list li', '.tag-list li', '.job-limit span'],
+        education: ['.job-card-footer .tag-list li', '.tag-list li', '.job-limit span'],
       },
       tags: ['.job-card-footer .tag-list li', '.tag-list li', '.tag-list span'],
     },
@@ -229,9 +230,34 @@
       skills.push(t);
     }
 
-    const company = txt(pick(card, f.company));
-    const area = txt(pick(card, f.area));
-    const salary = txt(pick(card, f.salary));
+    let company = txt(pick(card, f.company));
+    let area = txt(pick(card, f.area));
+    let salary = txt(pick(card, f.salary));
+
+    // BOSS 结构化兜底：类名改版后按 DOM 结构 + 文本特征定位，不依赖死类名
+    if (site.platform === 'boss') {
+      const titleEl = pick(card, f.title);
+      if (!salary) {
+        // 薪资通常和标题在同一个 title 容器里，特征：含「数字 + K/千」
+        const box = titleEl && (titleEl.closest('.job-title') || titleEl.closest('[class*="title"]') || titleEl.parentElement);
+        if (box) {
+          const salEl = [...box.querySelectorAll('span,div,em')].find((e) => /(\d+\s*[-~]\s*\d+|\d+(\.\d+)?\s*[Kk千])/.test(txt(e)));
+          salary = salEl ? txt(salEl) : '';
+        }
+      }
+      if (!company) {
+        // 公司名通常在标题下方，或卡内第一个 h3 / 带 name 类
+        const box = titleEl && titleEl.closest('.job-title');
+        const h3 = (box && box.nextElementSibling) ? box.nextElementSibling.querySelector('h3, a, [class*="name"], [class*="company"]') : null;
+        company = txt(h3) || txt(card.querySelector('h3')) || '';
+      }
+      if (!area) {
+        // 区域：卡内第一个命中已知城市名的短文本
+        const cityRe = /^(长沙|武汉|成都|杭州|广州|深圳|北京|上海|南京|西安|重庆|苏州|东莞|佛山|合肥|厦门|大连|天津|郑州|青岛)([-·\s]|$)/;
+        const hit = [...card.querySelectorAll('span,div,em,a')].map(txt).find((t) => cityRe.test(t.trim()));
+        area = hit ? hit.trim() : '';
+      }
+    }
 
     return {
       title,
@@ -337,10 +363,11 @@
           <button class="rc-btn rc-preview">预览</button>
         </div>
         <div class="rc-row">
-          <button class="rc-btn rc-auto">自动翻页采集</button>
+          <button class="rc-btn rc-auto">自动滚动采集</button>
         </div>
         <div class="rc-row">
           <button class="rc-btn rc-config">设置</button>
+          <button class="rc-btn rc-debug">复制卡片HTML</button>
         </div>
         <div class="rc-line rc-hint">采集只取原始文本，指纹/薪资/过滤均由服务端统一处理。</div>
         <pre class="rc-out"></pre>
@@ -355,6 +382,7 @@
       preview: box.querySelector('.rc-preview'),
       auto: box.querySelector('.rc-auto'),
       config: box.querySelector('.rc-config'),
+      debug: box.querySelector('.rc-debug'),
     };
 
     box.querySelector('.rc-toggle').onclick = () => box.classList.toggle('rc-collapsed');
@@ -362,6 +390,7 @@
     el.preview.onclick = onPreview;
     el.auto.onclick = onAutoPages;
     el.config.onclick = onConfig;
+    el.debug.onclick = onDebug;
 
     // 整个 head 可拖动，避免面板挡住页面操作
     let dragging = null;
@@ -468,15 +497,46 @@
       }
 
       if (page === maxPages - 1) break;
-      // 下一页：招聘站普遍把「下一页」做成按钮或链接，两种都试
+
+      // 翻到下一页：优先找「下一页」按钮（传统分页站）；找不到则滚动加载（无限滚动站，如 BOSS）
       const next = document.querySelector('a[href*="page="][class*="next"], .options-pages a:last-child, a.next, button.next')
         || [...document.querySelectorAll('a,button')].find((n) => /下一页|下页|next/i.test(txt(n)));
-      if (!next) { say(`已到最后一页（共采 ${totals.pages} 页）`, 'ok'); break; }
-
-      next.click();
-      await sleep(randBetween(cfg.gapMin, cfg.gapMax) * 1000);   // 跟着人的节奏，不像脚本
+      if (next) {
+        next.click();
+        await sleep(randBetween(cfg.gapMin, cfg.gapMax) * 1000);   // 跟着人的节奏，不像脚本
+      } else {
+        // 无限滚动：滚到底触发加载；用「滚动位置是否变化」判断到底。
+        // 不能用卡片数判断：BOSS 用虚拟列表，滚动时旧卡被替换、DOM 卡片总数不变。
+        const beforeY = window.scrollY;
+        const toBottom = () => window.scrollTo(0, document.documentElement.scrollHeight || document.body.scrollHeight);
+        toBottom();
+        await sleep(randBetween(cfg.gapMin, cfg.gapMax) * 1000);
+        toBottom();
+        await sleep(2500);   // 等异步渲染出新岗位
+        if (window.scrollY <= beforeY) {
+          say(`已加载到底（共采 ${totals.pages} 页）`, 'ok');
+          break;
+        }
+      }
     }
     say(`自动采集结束：${totals.pages} 页 · 新增 ${totals.saved} · 重复 ${totals.duplicate}`, 'ok');
+  }
+
+  function onDebug() {
+    const site = currentSite();
+    if (!site) return say('当前页面不在支持的站点上', 'err');
+    const { cards, via } = findCards(site);
+    if (!cards.length) return say('没找到岗位卡片（可能页面还没加载完，刷新后重试）', 'err');
+    const html = [...cards].slice(0, 2).map((c) => c.outerHTML).join('\n\n===== 分隔 =====\n\n');
+    const done = () => say(`已复制 ${Math.min(cards.length, 2)} 张卡片 HTML 到剪贴板（定位方式：${via}），请粘贴给开发者`, 'ok');
+    try {
+      if (typeof GM_setClipboard === 'function') { GM_setClipboard(html); done(); }
+      else if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(html).then(done); }
+      else { el.out.textContent = html; say('复制接口不可用，已显示在下方输出框，请手动复制', 'warn'); }
+    } catch (e) {
+      el.out.textContent = html;
+      say('复制失败，已显示在下方输出框，请手动复制', 'warn');
+    }
   }
 
   function onConfig() {

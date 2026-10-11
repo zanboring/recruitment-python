@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import random
+from pathlib import Path
 from typing import List, Dict
 
 from bs4 import BeautifulSoup
@@ -131,8 +133,10 @@ class BossCrawler(BaseCrawler):
         raise TimeoutError(f"None of the selectors found: {selectors}")
 
     async def _launch_context(self, playwright):
-        """按配置启动浏览器上下文：完整请求头 + 可选代理。"""
-        launch_kwargs = {"headless": True}
+        """按配置启动浏览器上下文：本机 Chrome + 可选登录态 + 可选代理。"""
+        launch_kwargs = {"headless": settings.crawl_headless}
+        if settings.crawl_browser_channel:
+            launch_kwargs["channel"] = settings.crawl_browser_channel
         proxy = settings.crawl_proxy
         if proxy:
             # 支持 http://user:pass@host:port 与 http://host:port 两种形式
@@ -140,12 +144,28 @@ class BossCrawler(BaseCrawler):
         browser = await playwright.chromium.launch(**launch_kwargs)
 
         headers = self.get_random_headers()
-        context = await browser.new_context(
-            user_agent=headers.pop("User-Agent"),
-            extra_http_headers=headers,
-            viewport={"width": 1920, "height": 1080},
-        )
+        ctx_kwargs = {
+            "user_agent": headers.pop("User-Agent"),
+            "extra_http_headers": headers,
+            "viewport": {"width": 1920, "height": 1080},
+        }
+        # 登录态持久化：存在则加载，复用用户已登录的 BOSS 会话
+        state_path = settings.crawl_storage_state
+        if state_path and Path(state_path).exists():
+            ctx_kwargs["storage_state"] = state_path
+            logger.info("已加载登录态：%s", state_path)
+        context = await browser.new_context(**ctx_kwargs)
         return browser, context
+
+    async def _humanize(self, page) -> None:
+        """拟人化操作：随机滚动几屏 + 随机停留，模拟真人浏览行为。"""
+        try:
+            for _ in range(random.randint(1, 3)):
+                await page.mouse.wheel(0, random.randint(300, 900))
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+            await asyncio.sleep(random.uniform(1.0, 2.5))
+        except Exception:
+            pass
 
     async def crawl(self, keyword: str, city: str = "") -> List[Dict]:
         results = []
@@ -169,6 +189,7 @@ class BossCrawler(BaseCrawler):
                         found_selector = await self._wait_for_any_selector(page, SELECTORS["job_card"], timeout=10000)
                         logger.info(f"Using selector: {found_selector}")
                         await asyncio.sleep(2)
+                        await self._humanize(page)
                         html = await page.content()
                         # 风控检测：验证码/安全验证等信号出现时标记降速并跳过该页，
                         # 绝不把「验证码页」当「无岗位结果」静默入库。

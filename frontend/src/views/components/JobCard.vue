@@ -46,10 +46,10 @@
     <div class="job-footer">
       <div class="footer-left">
         <el-tag :type="sourceType" size="small" effect="plain">{{ job.sourceSite || '未知' }}</el-tag>
-        <!-- 【方案A增量】有真实URL时显示"查看原岗"按钮 -->
-        <el-button v-if="hasOriginalUrl" type="primary" link size="small"
+        <!-- 【方案A增量】有真实URL时显示"查看原岗"按钮；搜索页/演示数据显示"搜索同类" -->
+        <el-button v-if="hasAnyUrl" type="primary" link size="small"
           @click.stop="openOriginalUrl" class="view-original-btn">
-          <el-icon><Link /></el-icon>查看原岗
+          <el-icon><Link /></el-icon>{{ originalUrlLabel }}
         </el-button>
         <!-- 【方案A增量】有本地详情时显示"查看本地详情"按钮 -->
         <el-button v-if="hasDetailHtml" type="success" link size="small"
@@ -139,6 +139,9 @@ const sourceType = computed(() => {
 const skillList = computed(() => (props.job.skills || '').split(',').filter(s => s.trim()));
 
 const hasOriginalUrl = computed(() => isPreciseJobSourceUrl(props.job.url));
+// 任何非空 URL 都能跳转：详情页显示「查看原岗」，搜索页/演示数据显示「搜索同类」
+const hasAnyUrl = computed(() => !!props.job.url && props.job.url.trim().length > 0);
+const originalUrlLabel = computed(() => (isPreciseJobSourceUrl(props.job.url) ? '查看原岗' : '搜索同类'));
 
 /** 【方案A增量】判断岗位是否已下架，用于显示"查找类似岗位"按钮 */
 const isOffline = computed(() => props.job.jobStatus === 'OFFLINE');
