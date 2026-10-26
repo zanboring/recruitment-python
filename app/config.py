@@ -1,0 +1,531 @@
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def interpolate_env_vars(content: str) -> str:
+    def replace_var(match):
+        var_name = match.group(1)
+        default = match.group(2)
+        return os.getenv(var_name, default if default else "")
+
+    pattern = r'\$\{(\w+)(?::([^}]*))?\}'
+    return re.sub(pattern, replace_var, content)
+
+
+
+# ---- 运行时配置持久化（前端设置栏填写 → 写 config.env → 热生效）----
+# 通用版用户换电脑时无需碰代码/config 文件：软件启动后在「设置」页填入
+# API Key 即可，保存即写入 exe 同目录 config.env（配置加载链同一文件，天然生效）；
+# 源码模式写入项目根 config.env。空 key 会回写空值并触发下次加载跳过。
+# 允许通过设置栏修改的键白名单（其余键禁止写入，防止越权篡改）。
+RUNTIME_EDITABLE_KEYS = (
+    "ai_provider",
+    "deepseek_api_key", "deepseek_api_url", "deepseek_model",
+    "zhipuai_api_key", "zhipuai_api_url", "zhipuai_model",
+    "ollama_enabled", "ollama_base_url",
+    "ollama_model", "ollama_code_model", "ollama_tool_model",
+)
+
+
+def runtime_env_file() -> str:
+    """返回设置栏写入的配置文件路径（与加载链最高优先级一致）。"""
+    if getattr(sys, "frozen", False):
+        return str(Path(sys.executable).resolve().parent / "config.env")
+    return str(Path(__file__).resolve().parent.parent / "config.env")
+
+
+def masked(value: str) -> str:
+    """脱敏展示：保留前 4 后 4，中间以 **** 代替；空串返回空。"""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return len(value) * "*"
+    return value[:4] + "****" + value[-4:]
+
+
+def save_runtime_config(pairs: dict) -> dict:
+    """把用户设置持久化到 config.env 并热更新 settings 单例。
+
+    参数 pairs 为 {小写配置键: 值}；仅白名单键允许写入，静默过滤其余。
+    返回 {"written": [键...], "enabled": bool} 便于前端确认生效。
+
+    设计要点（修复 review 指出的 3 个缺陷）：
+    1. **保留注释与空行**：按行遍历文件，只替换命中白名单的键行，
+       其余行（注释/空行/无关键）原样写回 —— 模板注释不会在保存时消失；
+    2. **键名大小写归一**：读入即 upper()，写入也用 upper()，
+       同一配置永远只有一行（不再出现 DEEPSEEK_API_KEY 两行）；
+    3. **值转义**：写入前拒绝含换行/回车的值，杜绝配置注入。
+    4. 空值写空串（覆盖旧的 key，等价于清除）；
+    5. 写文件后同步更新 settings，本次进程立即生效（无需重启）。
+    """
+    # 值合法性校验：拒绝换行注入
+    for key, value in pairs.items():
+        if value is None:
+            continue
+        sval = str(value)
+        if any(ch in sval for ch in "\r\n"):
+            raise ValueError(f"配置值不能包含换行：{key}")
+
+    path = runtime_env_file()
+    # 归一后的键 -> 值（大写键名，与 .env 书写习惯一致）
+    merged = {k.upper(): "" for k in RUNTIME_EDITABLE_KEYS}
+    written = []
+
+    # 读取现有文件（保留原样行），同时把已有键值并入 merged
+    original_lines = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as fh:
+            original_lines = fh.readlines()
+        for line in original_lines:
+            sline = line.strip()
+            if not sline or sline.startswith("#") or "=" not in sline:
+                continue
+            k, v = sline.split("=", 1)
+            norm_key = k.strip().upper()
+            if norm_key in merged:
+                merged[norm_key] = v.strip()
+
+    # 应用本次用户设置的键
+    for key, value in pairs.items():
+        if key not in RUNTIME_EDITABLE_KEYS:
+            continue  # 白名单之外静默忽略
+        merged[key.upper()] = "" if value is None else str(value)
+        written.append(key)
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    # 重写：保留注释/空行/无关键行；命中白名单键行则替换为归一化后的一行
+    seen_whitelist = set()
+    out_lines = []
+    for line in original_lines:
+        sline = line.strip()
+        if not sline or sline.startswith("#") or "=" not in sline:
+            out_lines.append(line)  # 注释/空行/无效行原样保留
+            continue
+        k = sline.split("=", 1)[0].strip().upper()
+        if k in merged:
+            if k in seen_whitelist:
+                continue  # 同键多行只留第一处（原文件可能已有重复，去重）
+            seen_whitelist.add(k)
+            out_lines.append(f"{k}={merged[k]}\n")
+        else:
+            out_lines.append(line)  # 无关键原样保留
+
+    # 文件里原本没有的、本次实际写入的键追加到末尾（不追加白名单空键，保持文件整洁）
+    for key in written:
+        k = key.upper()
+        if k not in seen_whitelist:
+            out_lines.append(f"{k}={merged[k]}\n")
+            seen_whitelist.add(k)
+
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.writelines(out_lines)
+
+    # 热生效：同步进程环境变量 + 直接赋值 settings 单例（无需重启）
+    for key in written:
+        raw = merged[key.upper()]
+        env_key = key.upper()
+        if key == "ollama_enabled":
+            bool_val = raw.lower() in ("1", "true", "yes", "on")
+            os.environ[env_key] = "true" if bool_val else "false"
+            setattr(settings, key, bool_val)
+        else:
+            os.environ[env_key] = raw
+            setattr(settings, key, raw)
+
+    logger = __import__("logging").getLogger(__name__)
+    logger.info("设置栏更新配置文件 %s：%s", path, ",".join(written))
+    return {"written": written, "file": path}
+
+def _candidate_env_files() -> list:
+    """按优先级返回候选配置文件路径。
+
+    通用版（发布软件）场景下，用户把 config.env 放在 exe 同目录即可，
+    不需要碰任何代码 —— 「别的电脑只放 config.env 配好 API key 即用」。
+    优先级：exe 同级 config.env > 项目根 config.env > 项目根 .env。
+    """
+    candidates = []
+    # 兜底 .env（本地调试版）放在最前，会被后续的 config.env 覆盖
+    candidates.append(str(Path(__file__).resolve().parent.parent / ".env"))
+    if getattr(sys, "frozen", False):
+        # PyInstaller 打包后：exe 所在目录 config.env（最高优先级）
+        candidates.append(str(Path(sys.executable).resolve().parent / "config.env"))
+    else:
+        # 源码运行：项目根 config.env（最高优先级）
+        candidates.append(str(Path(__file__).resolve().parent.parent / "config.env"))
+    return candidates
+
+
+def load_env_with_interpolation(env_file: str = "") -> dict:
+    """读取候选配置文件，后面的文件覆盖前面的同名变量。
+
+    设计成「候选列表逐个叠加」而非「只读一个」：通用版用户的 config.env
+    可只写要覆盖的 key（API Key 等），其余配置继续从 .env 兜底；
+    未携带任何文件时返回 {}（全部用环境变量 / 默认值）。
+    """
+    files = [env_file] if env_file else _candidate_env_files()
+    env_vars = {}
+    for f in files:
+        if not f or not os.path.exists(f):
+            continue
+        with open(f, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    env_vars[key.strip()] = interpolate_env_vars(value.strip())
+    return env_vars
+
+
+class Settings(BaseSettings):
+    # ``production`` enables fail-fast checks at application startup.
+    app_env: str = "development"
+    db_url: str = ""
+    # 数据库类型：sqlite（打包版默认）| mysql | postgres。
+    # 显式设置 DB_URL 时以 DB_URL 为准（优先级更高）。
+    #
+    # 为什么打包版的默认值必须是 sqlite（这是一个真实缺陷的修复）：
+    # 源码模式的默认值曾是 mysql —— 本地开发机上确实跑着 MySQL，所以看不出问题。
+    # 但「通用版」是给别人的绿色软件，`config.template.env` 里也明写 DB_TYPE=sqlite
+    # 「零依赖、不需要安装 MySQL」。一旦用户**还没放 config.env** 就双击 exe
+    # （这是新用户的第一个动作），默认值会指向 mysql+aiomysql://localhost:3306
+    # → 连不上 → 启动失败。而 SQLite 是内置的，永远连得上。
+    # 见 tests/test_packaging_integrity.py::test_打包版默认用零依赖数据库
+    db_type: str = "sqlite" if getattr(sys, "frozen", False) else "mysql"
+    db_host: str = "localhost"
+    db_port: int = 3306
+    # 打包版把库文件落在 exe 同目录（绝对路径），这样「整个目录拷走即用」才成立 ——
+    # 相对路径会依赖启动时的 CWD：双击图标启动时 CWD 是 exe 目录（碰巧对），
+    # 但从命令行在别处执行、或被快捷方式改了「起始位置」时，库会落到别的地方。
+    db_name: str = (
+        str(Path(sys.executable).resolve().parent / "recsys.db")
+        if getattr(sys, "frozen", False)
+        else "recruitment_db"
+    )
+    db_username: str = "root"
+    db_password: str = ""
+
+    # 开发环境默认密钥，仅用于本地演示；生产部署必须通过环境变量 JWT_SECRET 覆盖
+    jwt_secret: str = "dev_only_jwt_secret_change_in_production"
+    jwt_expiration: int = 86400000
+
+    # ---- AI 对话模型（OpenAI 兼容协议）----
+    # 主服务商：deepseek（默认）| zhipu。另一个自动作为备选，
+    # 实现「多供应商容灾」—— 主服务商密钥过期或额度用尽时链路不中断。
+    ai_provider: str = "deepseek"
+
+    # DeepSeek（默认主模型）。密钥留空则自动降级到本地 Ollama。
+    # 申请地址：https://platform.deepseek.com/api_keys
+    deepseek_api_key: str = ""
+    deepseek_api_url: str = "https://api.deepseek.com/chat/completions"
+    deepseek_model: str = "deepseek-flash"
+    # 思考模式强度：none 关闭 / low / high / max。
+    # 招聘问答场景用 none 即可，开启会显著增加延迟与 token 消耗。
+    deepseek_reasoning_effort: str = "none"
+
+    # 智谱 GLM（备选服务商，同为 OpenAI 兼容协议）
+    zhipuai_api_key: str = ""
+    zhipuai_api_url: str = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    zhipuai_model: str = "glm-4-flash"
+
+    embedding_enabled: bool = True
+    embedding_model: str = "embedding-3"
+    embedding_api_url: str = "https://open.bigmodel.cn/api/paas/v4/embeddings"
+    embedding_dimensions: int = 1024
+
+    # 向量化后端：
+    #   auto    有智谱密钥则用云端 embedding-3，否则自动改用本地 Ollama（默认，最省心）
+    #   zhipu   强制云端智谱 embedding-3（需 ZHIPUAI_API_KEY）
+    #   ollama  强制本地 Ollama（离线、零成本、数据不出内网，需先 ollama pull 向量模型）
+    embedding_backend: str = "auto"
+    # 默认值必须指向「本机实际已装」的模型，否则 Ollama 返回 404，
+    # 而调用方会静默降级到规则引擎 —— 不报错、只是 AI 功能失效，极难察觉。
+    # 改默认模型前，请确认所有部署机器都 `ollama pull` 过同名模型。
+    ollama_embedding_model: str = "qwen3-embedding:0.6b"
+
+    # 知识库检索策略，取值：
+    #   auto      语义优先，无命中或异常时降级关键词（默认）
+    #   semantic  仅语义向量检索
+    #   keyword   仅关键词检索（无需密钥，可离线）
+    #   hybrid    向量 + 关键词的 RRF 融合
+    # 三种策略的检索质量对比见 scripts/eval_rag.py
+    rag_retrieval_strategy: str = "auto"
+
+    # ---- 本地模型（Ollama）----
+    # 本地不是「一个备胎」，而是按能力分工的两类模型：
+    #   ollama_model       语言类 —— 对话生成、分析报告（语言理解与表达更强）
+    #   ollama_code_model  代码类 —— 工具识别、JSON 结构化抽取（小而快）
+    #   ollama_tool_model  显式指定工具识别模型；留空则自动用 code_model，再回退 model
+    # 分工依据见 app/services/ollama_client.py 的实测对比表，
+    # 可用 scripts/bench_local_models.py 在本机复现。
+    ollama_enabled: bool = True
+    ollama_base_url: str = "http://localhost:11434"
+    # 同 ollama_embedding_model：默认值必须与实装模型一致，否则静默降级。
+    # 历史默认值 qwen2.5:14b / qwen2.5-coder:7b 均已停止使用且本机未安装，
+    # 已统一为当前实装的 qwen3.5:4b（该模型为混合推理模型，见下方 ollama_think 说明）。
+    ollama_model: str = "qwen3.5:4b"
+    ollama_code_model: str = "qwen3.5:4b"
+    ollama_tool_model: str = ""
+
+    # 思考模式开关（Qwen3 / Qwen3.5 等「混合推理」模型必需）。
+    # 这类模型的 chat_template 默认进入思考段：正式回答前先输出一整段
+    # ``thinking``，且这段内容同样消耗 num_predict 预算。对本项目的影响是
+    # 「首字延迟成倍增加 + 回答被思考内容挤占而截断」—— 而代码只读
+    # ``message.content``，思考段完全不会被使用，纯属净损耗。
+    # 关闭方式必须走请求体的 ``think: false``（见 ollama_client._think_option），
+    # 改提示词或调 temperature 都无效。
+    # 置 true 可恢复思考链，此时调用方需自行读取 ``message.thinking``。
+    ollama_think: bool = False
+
+    # ---- ReAct Agent ----
+    # 多步推理 Agent 的最大步数上限。每步都是一次完整 LLM 调用（有成本、有延迟），
+    # 必须给循环一个上界，防止模型反复调用工具造成死循环或成本失控。
+    # 达到上限仍无 Final Answer 时，Agent 会强制基于已有 Observation 收尾。
+    agent_max_steps: int = 5
+
+    # ---- Function Calling 的工具识别前置过滤 ----
+    # 朴素实现对每条消息都发起一次「是否需要查库」的 LLM 调用（实测约 2.9s/次，
+    # 云端则多一次 token 消耗），而大量消息本就不涉及数据库。
+    # 过滤规则保守（仅在「短消息且无领域信号」时跳过），可整体关闭以便回退。
+    # 详细说明与判定表见 app/services/tool_service.py::should_detect_tool
+    ai_tool_prefilter_enabled: bool = True
+    ai_tool_prefilter_max_chars: int = 24
+
+    # ---- 知识库自动入库 ----
+    # 每次问答都会把回答沉淀进知识库，形成「AI 生成内容 → 被当作知识召回 →
+    # 再次喂给 AI」的闭环。答错时错误会被固化并反复出现，因此提供总开关。
+    ai_auto_learn_enabled: bool = True
+
+    # ---- 输出长度上限（成本与延迟的硬边界）----
+    # 原实现不给云端请求传 max_tokens，Ollama 的本地对话也不传 num_predict
+    # （Ollama 默认 -1 = 不限），于是单次回答的输出长度没有任何上界：
+    # 按 token 计费的云端模型成本不可控，本地模型则可能让用户等上几分钟。
+    # 这里给一个默认上限，分析报告这类需要长输出的场景单独放宽。
+    ai_max_output_tokens: int = 1024
+    ai_analysis_max_output_tokens: int = 2048
+    # 工具识别只需输出一行 JSON 或 NONE，128 足够
+    ai_tool_detect_max_tokens: int = 128
+
+    # ---- 熔断器（防级联雪崩）----
+    # 云端连续失败 N 次后进入 OPEN，冷却期内快速失败（不发起真实请求），
+    # 半开后放行一个试探请求。false 可整体关闭。
+    ai_circuit_breaker_enabled: bool = True
+    circuit_breaker_failure_threshold: int = 3
+    circuit_breaker_cooldown_seconds: int = 30
+
+    # ---- Token 用量与成本统计 ----
+    # 记录每次 LLM / embedding 调用的 token 消耗、耗时与降级路径，用于成本核算。
+    # 单价按「元 / 百万 token」计，默认值仅供估算，请按实际采购价调整。
+    ai_usage_log_enabled: bool = True
+    usage_price_deepseek_input: float = 2.0
+    usage_price_deepseek_output: float = 8.0
+    usage_price_zhipu_input: float = 0.1
+    usage_price_zhipu_output: float = 0.1
+    # 本地模型无 API 费用，此处仅用于把「省下多少」折算成可比数字
+    usage_price_local: float = 0.0
+
+    crawl_max_jobs: int = 200
+    crawl_retry_times: int = 4
+    crawl_delay_min: int = 12
+    crawl_delay_max: int = 18
+    crawl_adaptive_delay_factor: tuple = (8, 16)
+    crawl_proxy: str = ""
+    crawl_timeout: int = 45
+    # ---- 浏览器采集：有头模式 + 本机 Chrome + 登录态持久化 ----
+    # headless=False 用真实有界面浏览器（反爬重点识别无头特征）。
+    # ⚠️ 容器 / CI 无显示器，跑浏览器采集时必须覆盖为 true（见 docker-compose.yml）。
+    crawl_headless: bool = False
+    # 浏览器通道："chrome" 复用本机 Chrome 的真实浏览器指纹与登录态；
+    # 留空则用 Playwright 自带 chromium（需 playwright install chromium）。
+    # ⚠️ 容器内没有 Chrome，需留空并改用自带 chromium。
+    crawl_browser_channel: str = "chrome"
+    # 登录态文件路径（Playwright storage_state JSON）：首次登录后保存，后续复用
+    crawl_storage_state: str = "data/boss_storage_state.json"
+
+    # ---- 采集节流与合规（跨任务层，补充 BaseCrawler 的「组内」护栏）----
+    # BaseCrawler.random_delay 只管一次爬取内部相邻请求的间隔；下面这些管的是
+    # 「任务之间」：同一域名会不会被并发访问、今天还能请求多少次、robots 允不允许。
+    # 同一域名两次请求之间的最小间隔（秒）。0 = 不限制。
+    crawl_domain_min_interval: float = 20.0
+    # 单个平台每日最大请求次数。0 = 不限制。按北京日期计数，与日报口径一致。
+    crawl_daily_quota_per_platform: int = 2000
+    # 是否检查 robots.txt。
+    crawl_robots_check_enabled: bool = True
+    # 命中 robots.txt 的 Disallow 时是否直接拒绝该平台。
+    # 默认 false（只告警）是刻意取舍：默认阻断会让人撞上「配置全对却跑不起来」
+    # 且分不清是自己配错还是站点不允许。对外交付/有合规要求时设为 true。
+    crawl_robots_strict: bool = False
+
+    # ---- 浏览器采集通道（油猴脚本 / 浏览器扩展）----
+    # 用户在真实浏览器里采集、回传给本地服务。默认**关闭**：留空即关闭该入口。
+    # 生成令牌：python -c "import secrets;print(secrets.token_urlsafe(24))"
+    browser_collect_token: str = ""
+    # 单次提交的岗位数上限。浏览器采集不受日配额限制（走用户真实 IP，
+    # 无集中访问特征），但需要一道批量上限防止脚本写错一次灌进几万条。
+    browser_collect_max_batch: int = 500
+
+    # ---- 定时爬取的「人类化」节奏 ----
+    # 18 组任务（3 关键词 × 6 城市）原先背靠背连跑，一个小时内打完一整套，
+    # 比分散在日间更像脚本。这里在组间插入随机间隔，并把顺序打乱。
+    # 组与组之间的随机间隔（秒），默认 2~6 分钟。
+    scheduled_crawl_gap_min: int = 120
+    scheduled_crawl_gap_max: int = 360
+
+    # ---- 岗位存活核查（job_checker）----
+    # 默认开启：启动后后台慢速核查已存 URL 的岗位是否仍在线
+    job_checker_enabled: bool = True
+    job_checker_batch_size: int = 10        # 每轮核查条数（慢速小批）
+    checker_delay_min: float = 8.0         # 两条之间随机延迟下限（秒）
+    checker_delay_max: float = 15.0        # 随机延迟上限（秒）
+    job_checker_round_interval: int = 4    # 两轮之间间隔（小时）
+
+    server_port: int = 8080
+
+    # ---- Redis 缓存（可选）----
+    # 配置 REDIS_URL（如 redis://localhost:6379/0）后启用 Redis 缓存；
+    # 留空或连接失败时自动降级为进程内内存缓存，业务无感知。
+    redis_url: str = ""
+    redis_cache_ttl: int = 600
+    cors_origins: list[str] = ["http://localhost:5173"]
+
+    # ---- 接口限流（滑动窗口，单进程内存实现）----
+    rate_limit_enabled: bool = True
+    rate_limit_window_seconds: int = 60
+    rate_limit_default_per_minute: int = 120
+    rate_limit_login_per_minute: int = 10
+    rate_limit_register_per_minute: int = 5
+    rate_limit_ai_per_minute: int = 20
+
+    # 是否信任 X-Forwarded-For 作为客户端 IP。
+    # 默认 False（安全优先）：代理头由客户端完全可控，若直接用于限流维度，
+    # 攻击者「换个头就换一份配额」，登录接口的防爆破会被彻底绕过。
+    # 只有应用确实部署在可信反向代理（Nginx / 网关）之后、且代理会重写该头时才开启。
+    rate_limit_trust_forwarded_for: bool = False
+
+    # ---- 定时任务（APScheduler，时区 Asia/Shanghai）----
+    # 原先触发时间写死在 app/scheduler.py（爬取 02:00、日报 06:30），
+    # 换部署环境必须改代码。这里改为配置化，并把开关也一并放开。
+    scheduled_crawl_enabled: bool = True
+    scheduled_crawl_hour: int = 2
+    scheduled_crawl_minute: int = 0
+
+    report_enabled: bool = True
+    report_hour: int = 6
+    report_minute: int = 30
+
+    # ---- 日报推送 Webhook（可选）----
+    # 默认关闭：不配置就只在本地产出 Excel，不发任何外部请求。
+    # 支持 wecom（企业微信机器人）/ dingtalk（钉钉机器人）/ generic（通用 JSON）。
+    report_webhook_enabled: bool = False
+    report_webhook_type: str = "wecom"
+    report_webhook_url: str = ""
+    # 推送内容里最多列几个城市/技能，避免消息过长被机器人截断
+    report_webhook_top_n: int = 5
+
+    # ---- 版本与更新检查 ----
+    # 指向 GitHub 仓库（owner/name，也接受完整 URL）。用于「检查更新」接口。
+    update_repo: str = "zanboring/recruitment-python"
+    # 默认开启，但**只在接口被调用时才发请求**（不做启动时自动联网）：
+    # 绿色版可能跑在内网/离网机器上，启动即联网只会带来无谓等待与失败日志。
+    update_check_enabled: bool = True
+
+    # ================= Redis + Docker 架构硬化 =================
+    # 限流计数后端：memory（默认，进程内滑动窗口）/ redis（跨副本共享计数）。
+    # 设为 redis 时需同时配置 REDIS_URL（如 redis://localhost:6379/0）；
+    # Redis 不可用（未配置 / 连接失败 / 脚本报错）时自动降级回内存并记 warning，
+    # 请求不中断 —— 延续 app/cache.py 已定下的原则「缓存是加速手段，不是正确性依赖」。
+    #
+    # 【为什么默认值必须是 memory】
+    # 单进程部署下内存实现完全正确且零依赖；新配置项的默认值不得改变现有单机行为
+    # （redis_url 为空时项目必须与改造前完全一致地跑起来）。
+    # 多副本部署时改为 redis —— 否则 N 个副本各算一份计数，登录防爆破配额会变成 N 倍。
+    rate_limit_backend: str = "memory"
+
+    # 熔断器状态后端：memory（默认，进程内）/ redis（跨副本共享）。
+    # 多副本下进程内熔断器各自为战：副本 A 熔断了，副本 B 仍继续向已挂的上游
+    # 发请求（每个都要等满超时）—— 故障被放大而不是被抑制。
+    # 设为 redis 后「一次熔断、全局生效」；Redis 不可用时自动降级进程内状态。
+    circuit_breaker_backend: str = "memory"
+
+    # 采集节流 / 日配额后端：memory（默认，进程内）/ redis（跨副本共享）。
+    # 多副本下进程内日配额各算一份（实际访问量 × N，对招聘站点的合规承诺
+    # 不成立）；域名节流也只能约束本进程的请求。设为 redis 后两者全局共享。
+    # Redis 不可用时自动降级进程内实现（行为与改造前一致）。
+    quota_backend: str = "memory"
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError:
+                return [o.strip() for o in v.split(",") if o.strip()]
+        return v
+
+    @property
+    def resolved_embedding_backend(self) -> str:
+        """把 auto 解析为具体向量化后端。
+
+        刻意不使用「先试 A 失败再试 B」的隐式回退：显式解析让实际走到哪个后端
+        一目了然（也会记进日志），排查问题时不必猜。
+        """
+        backend = (self.embedding_backend or "auto").strip().lower()
+        if backend != "auto":
+            return backend
+        return "zhipu" if self.zhipuai_api_key else "ollama"
+
+    # ================= 多副本会话历史 =================
+    # AI 对话会话历史后端：memory（默认，进程内）/ redis（跨副本共享）。
+    #
+    # 【为什么需要外置】会话历史是 AI 应用的核心状态。进程内实现在单进程下
+    # 完全正确，但多副本部署时同一 session_id 的请求会被负载均衡分到不同副本，
+    # 用户会看到「上一轮说过的话这一轮不见了」（历史分片 / 串台）。
+    # 设为 redis 后会话历史落 Redis，TTL 由 Redis EXPIRE 原生管理
+    # （替代内存后端手工的容量淘汰）；Redis 不可用（未配置 / 连接失败）时
+    # 自动降级回进程内实现，行为与改造前完全一致。
+    # 默认值必须是 memory —— 不得改变现有单机行为。
+    session_backend: str = "memory"
+
+
+_config_files = _candidate_env_files()
+# 两层来源语义不同：
+#   .env        —— 本地调试默认值，可用 setdefault（平台环境变量优先）
+#   config.env  —— 用户配置层（手动放置或前端设置栏写入），必须强制覆盖
+#                   .env 插值占位，否则设置栏填的 Key 永远不会生效。
+_env_defaults: dict = {}
+_env_overrides: dict = {}
+for _f in _config_files:
+    _vals = load_env_with_interpolation(_f)
+    if str(_f).endswith("config.env"):
+        _env_overrides.update(_vals)
+    else:
+        _env_defaults.update(_vals)
+
+# 平台环境变量必须赢过版本库里的 .env（防止用开发值覆盖生产密钥）
+for _key, _value in _env_defaults.items():
+    os.environ.setdefault(_key, _value)
+# 用户配置层强制生效：设置栏保存的 Key 在此处覆盖 .env 插值占位
+os.environ.update(_env_overrides)
+
+settings = Settings()
+
+
+def validate_production_settings() -> None:
+    """Fail early instead of serving production traffic with demo secrets."""
+    if settings.app_env.lower() not in {"production", "prod"}:
+        return
+    if settings.jwt_secret == "dev_only_jwt_secret_change_in_production":
+        raise RuntimeError("JWT_SECRET must be configured in production")
+    if len(settings.jwt_secret) < 32:
+        raise RuntimeError("JWT_SECRET must be at least 32 characters in production")

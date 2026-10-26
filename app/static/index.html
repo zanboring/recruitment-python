@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>招聘系统管理后台</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css" rel="stylesheet">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        }
+        .sidebar {
+            width: 250px;
+            min-height: 100vh;
+        }
+        .main-content {
+            margin-left: 250px;
+        }
+        .scrollbar-thin::-webkit-scrollbar {
+            width: 6px;
+        }
+        .scrollbar-thin::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+        .scrollbar-thin::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 3px;
+        }
+        .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+        .chat-message {
+            animation: fadeIn 0.3s ease-in;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .loading-dots span {
+            animation: loading 1.4s infinite ease-in-out both;
+        }
+        .loading-dots span:nth-child(1) { animation-delay: -0.32s; }
+        .loading-dots span:nth-child(2) { animation-delay: -0.16s; }
+        @keyframes loading {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1); }
+        }
+    </style>
+</head>
+<body class="bg-gray-50">
+    <div class="flex">
+        <div class="sidebar bg-slate-800 text-white fixed">
+            <div class="p-6 border-b border-slate-700">
+                <h1 class="text-xl font-bold flex items-center gap-2">
+                    <i class="fa fa-briefcase"></i>
+                    招聘系统
+                </h1>
+                <p class="text-slate-400 text-sm mt-1">Python 重构版</p>
+            </div>
+            <nav class="p-4">
+                <div class="space-y-2">
+                    <button onclick="switchTab('dashboard')" class="w-full text-left px-4 py-3 rounded-lg bg-blue-600 hover:bg-blue-700 flex items-center gap-3 transition">
+                        <i class="fa fa-dashboard"></i> 数据概览
+                    </button>
+                    <button onclick="switchTab('jobs')" class="w-full text-left px-4 py-3 rounded-lg hover:bg-slate-700 flex items-center gap-3 transition">
+                        <i class="fa fa-list"></i> 岗位管理
+                    </button>
+                    <button onclick="switchTab('stats')" class="w-full text-left px-4 py-3 rounded-lg hover:bg-slate-700 flex items-center gap-3 transition">
+                        <i class="fa fa-bar-chart"></i> 数据分析
+                    </button>
+                    <button onclick="switchTab('ai')" class="w-full text-left px-4 py-3 rounded-lg hover:bg-slate-700 flex items-center gap-3 transition">
+                        <i class="fa fa-robot"></i> AI 助手
+                    </button>
+                    <button onclick="switchTab('salary')" class="w-full text-left px-4 py-3 rounded-lg hover:bg-slate-700 flex items-center gap-3 transition">
+                        <i class="fa fa-money"></i> 薪资预测
+                    </button>
+                </div>
+            </nav>
+            <div class="absolute bottom-0 left-0 right-0 p-4 border-t border-slate-700">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 rounded-full bg-slate-600 flex items-center justify-center">
+                        <i class="fa fa-user"></i>
+                    </div>
+                    <div>
+                        <p id="user-name" class="font-medium">未登录</p>
+                        <button onclick="logout()" class="text-xs text-slate-400 hover:text-white">退出登录</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="main-content min-h-screen">
+            <div class="bg-white shadow-sm sticky top-0 z-10">
+                <div class="flex items-center justify-between px-6 py-4">
+                    <h2 id="page-title" class="text-xl font-semibold text-gray-800">数据概览</h2>
+                    <div class="flex items-center gap-4">
+                        <span id="login-status" class="text-sm text-red-500">未登录</span>
+                        <button onclick="loginModal.show()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">
+                            <i class="fa fa-sign-in"></i> 登录
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="dashboard-tab" class="p-6">
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                    <div class="bg-white rounded-xl p-6 shadow-sm">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <p class="text-gray-500 text-sm">总岗位数</p>
+                                <p id="stat-total" class="text-3xl font-bold text-gray-800 mt-2">0</p>
+                            </div>
+                            <div class="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center">
+                                <i class="fa fa-briefcase text-blue-600 text-xl"></i>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="bg-white rounded-xl p-6 shadow-sm">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <p class="text-gray-500 text-sm">活跃岗位</p>
+                                <p id="stat-active" class="text-3xl font-bold text-green-600 mt-2">0</p>
+                            </div>
+                            <div class="w-12 h-12 bg-green-100 rounded-lg flex items-center justify-center">
+                                <i class="fa fa-check-circle text-green-600 text-xl"></i>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="bg-white rounded-xl p-6 shadow-sm">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <p class="text-gray-500 text-sm">平均薪资</p>
+                                <p id="stat-avg-salary" class="text-3xl font-bold text-orange-600 mt-2">¥0</p>
+                            </div>
+                            <div class="w-12 h-12 bg-orange-100 rounded-lg flex items-center justify-center">
+                                <i class="fa fa-money text-orange-600 text-xl"></i>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="bg-white rounded-xl p-6 shadow-sm">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <p class="text-gray-500 text-sm">更新时间</p>
+                                <p id="stat-update-time" class="text-lg font-medium text-gray-800 mt-2">--</p>
+                            </div>
+                            <div class="w-12 h-12 bg-purple-100 rounded-lg flex items-center justify-center">
+                                <i class="fa fa-clock text-purple-600 text-xl"></i>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="mt-6 bg-white rounded-xl p-6 shadow-sm">
+                    <h3 class="text-lg font-semibold text-gray-800 mb-4">最近岗位</h3>
+                    <table class="w-full">
+                        <thead>
+                            <tr class="border-b border-gray-200">
+                                <th class="text-left py-3 px-4 text-sm font-medium text-gray-600">岗位名称</th>
+                                <th class="text-left py-3 px-4 text-sm font-medium text-gray-600">公司</th>
+                                <th class="text-left py-3 px-4 text-sm font-medium text-gray-600">城市</th>
+                                <th class="text-left py-3 px-4 text-sm font-medium text-gray-600">薪资</th>
+                                <th class="text-left py-3 px-4 text-sm font-medium text-gray-600">状态</th>
+                            </tr>
+                        </thead>
+                        <tbody id="recent-jobs-body">
+                            <tr><td colspan="5" class="text-center py-8 text-gray-500">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="jobs-tab" class="p-6 hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <div class="flex items-center gap-4">
+                        <input type="text" id="job-search" placeholder="搜索岗位名称..." class="px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        <select id="job-city" class="px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <option value="">全部城市</option>
+                        </select>
+                        <button onclick="searchJobs()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">
+                            <i class="fa fa-search"></i> 搜索
+                        </button>
+                    </div>
+                    <button onclick="exportJobs()" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition">
+                        <i class="fa fa-download"></i> 导出
+                    </button>
+                </div>
+                <div class="bg-white rounded-xl shadow-sm overflow-hidden">
+                    <table class="w-full">
+                        <thead>
+                            <tr class="bg-gray-50">
+                                <th class="text-left py-4 px-4 text-sm font-medium text-gray-600">ID</th>
+                                <th class="text-left py-4 px-4 text-sm font-medium text-gray-600">岗位名称</th>
+                                <th class="text-left py-4 px-4 text-sm font-medium text-gray-600">公司</th>
+                                <th class="text-left py-4 px-4 text-sm font-medium text-gray-600">城市</th>
+                                <th class="text-left py-4 px-4 text-sm font-medium text-gray-600">薪资</th>
+                                <th class="text-left py-4 px-4 text-sm font-medium text-gray-600">经验</th>
+                                <th class="text-left py-4 px-4 text-sm font-medium text-gray-600">学历</th>
+                                <th class="text-left py-4 px-4 text-sm font-medium text-gray-600">状态</th>
+                            </tr>
+                        </thead>
+                        <tbody id="jobs-table-body">
+                            <tr><td colspan="8" class="text-center py-8 text-gray-500">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="flex items-center justify-between mt-4">
+                    <button onclick="prevPage()" class="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 transition">上一页</button>
+                    <span id="page-info" class="text-sm text-gray-600">第 1 页 / 共 1 页</span>
+                    <button onclick="nextPage()" class="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 transition">下一页</button>
+                </div>
+            </div>
+
+            <div id="stats-tab" class="p-6 hidden">
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <div class="bg-white rounded-xl p-6 shadow-sm">
+                        <h3 class="text-lg font-semibold text-gray-800 mb-4">城市分布</h3>
+                        <div id="city-chart" class="space-y-3"></div>
+                    </div>
+                    <div class="bg-white rounded-xl p-6 shadow-sm">
+                        <h3 class="text-lg font-semibold text-gray-800 mb-4">经验分布</h3>
+                        <div id="experience-chart" class="space-y-3"></div>
+                    </div>
+                    <div class="bg-white rounded-xl p-6 shadow-sm">
+                        <h3 class="text-lg font-semibold text-gray-800 mb-4">学历要求</h3>
+                        <div id="education-chart" class="space-y-3"></div>
+                    </div>
+                    <div class="bg-white rounded-xl p-6 shadow-sm">
+                        <h3 class="text-lg font-semibold text-gray-800 mb-4">技能标签</h3>
+                        <div id="skill-cloud" class="flex flex-wrap gap-2"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="ai-tab" class="p-6 hidden">
+                <div class="max-w-4xl mx-auto">
+                    <div class="bg-white rounded-xl shadow-sm overflow-hidden">
+                        <div class="bg-gradient-to-r from-blue-600 to-purple-600 px-6 py-4">
+                            <h3 class="text-white font-semibold flex items-center gap-2">
+                                <i class="fa fa-robot"></i> AI 智能助手
+                            </h3>
+                            <p class="text-blue-100 text-sm mt-1">基于 GLM-4-Flash 大模型</p>
+                        </div>
+                        <div id="chat-messages" class="h-96 overflow-y-auto p-6 space-y-4 scrollbar-thin bg-gray-50">
+                            <div class="chat-message flex gap-3">
+                                <div class="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center flex-shrink-0">
+                                    <i class="fa fa-robot text-white"></i>
+                                </div>
+                                <div class="bg-white rounded-lg rounded-tl-none px-4 py-3 shadow-sm">
+                                    <p class="text-gray-800">您好！我是招聘系统的 AI 助手。请问有什么可以帮您的？</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="p-4 border-t border-gray-200">
+                            <div class="flex gap-3">
+                                <input type="text" id="chat-input" placeholder="输入您的问题..." 
+                                    class="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    onkeypress="if(event.key === 'Enter') sendMessage()">
+                                <button onclick="sendMessage()" class="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">
+                                    <i class="fa fa-paper-plane"></i>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="salary-tab" class="p-6 hidden">
+                <div class="max-w-2xl mx-auto">
+                    <div class="bg-white rounded-xl p-6 shadow-sm">
+                        <h3 class="text-lg font-semibold text-gray-800 mb-6">薪资预测</h3>
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">城市</label>
+                                <select id="salary-city" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                    <option value="北京">北京</option>
+                                    <option value="上海">上海</option>
+                                    <option value="深圳">深圳</option>
+                                    <option value="广州">广州</option>
+                                    <option value="杭州">杭州</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">学历</label>
+                                <select id="salary-education" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                    <option value="本科">本科</option>
+                                    <option value="硕士">硕士</option>
+                                    <option value="博士">博士</option>
+                                    <option value="大专">大专</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">工作经验</label>
+                                <select id="salary-experience" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                    <option value="1-3年">0-3年</option>
+                                    <option value="3-5年">3-5年</option>
+                                    <option value="5-10年">5-10年</option>
+                                    <option value="10年以上">10年以上</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">技能（逗号分隔）</label>
+                                <input type="text" id="salary-skills" placeholder="如：Python, Java, SQL" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            </div>
+                            <button onclick="predictSalary()" class="w-full py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">
+                                <i class="fa fa-calculator"></i> 预测薪资
+                            </button>
+                        </div>
+                        <div id="salary-result" class="mt-6 p-4 bg-gray-50 rounded-lg hidden">
+                            <div class="flex items-center justify-center gap-8">
+                                <div class="text-center">
+                                    <p class="text-gray-500 text-sm">最低薪资</p>
+                                    <p class="text-2xl font-bold text-gray-800">¥<span id="salary-min">0</span></p>
+                                </div>
+                                <div class="w-px h-12 bg-gray-300"></div>
+                                <div class="text-center">
+                                    <p class="text-gray-500 text-sm">平均薪资</p>
+                                    <p class="text-3xl font-bold text-blue-600">¥<span id="salary-avg">0</span></p>
+                                </div>
+                                <div class="w-px h-12 bg-gray-300"></div>
+                                <div class="text-center">
+                                    <p class="text-gray-500 text-sm">最高薪资</p>
+                                    <p class="text-2xl font-bold text-gray-800">¥<span id="salary-max">0</span></p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="login-modal" class="fixed inset-0 bg-black/50 flex items-center justify-center hidden z-50">
+        <div class="bg-white rounded-xl p-8 w-96 shadow-xl">
+            <h3 class="text-xl font-semibold text-gray-800 mb-6">登录系统</h3>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">用户名</label>
+                    <input type="text" id="login-username" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">密码</label>
+                    <input type="password" id="login-password" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <button onclick="login()" class="w-full py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">
+                    登录
+                </button>
+                <button onclick="loginModal.hide()" class="w-full py-2 text-gray-500 hover:text-gray-700 transition">
+                    取消
+                </button>
+            </div>
+            <p id="login-error" class="text-red-500 text-sm mt-4 text-center hidden"></p>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8080/api';
+        let token = localStorage.getItem('token');
+        let currentPage = 1;
+        let currentKeyword = '';
+        let currentCity = '';
+
+        const tabs = ['dashboard', 'jobs', 'stats', 'ai', 'salary'];
+        const titles = {
+            dashboard: '数据概览',
+            jobs: '岗位管理',
+            stats: '数据分析',
+            ai: 'AI 助手',
+            salary: '薪资预测'
+        };
+
+        const loginModal = {
+            show: () => document.getElementById('login-modal').classList.remove('hidden'),
+            hide: () => document.getElementById('login-modal').classList.add('hidden')
+        };
+
+        function switchTab(tabName) {
+            tabs.forEach(tab => {
+                document.getElementById(`${tab}-tab`).classList.add('hidden');
+            });
+            document.getElementById(`${tabName}-tab`).classList.remove('hidden');
+            document.getElementById('page-title').textContent = titles[tabName];
+
+            if (tabName === 'dashboard') loadDashboard();
+            if (tabName === 'jobs') { loadCities(); loadJobs(); }
+            if (tabName === 'stats') loadStats();
+        }
+
+        async function apiCall(url, method = 'GET', body = null, headers = {}) {
+            const options = { method, headers: { ...headers } };
+            if (body) {
+                options.body = JSON.stringify(body);
+                options.headers['Content-Type'] = 'application/json';
+            }
+            if (token) {
+                options.headers['Authorization'] = `Bearer ${token}`;
+            }
+            const response = await fetch(`${API_BASE}${url}`, options);
+            return response.json();
+        }
+
+        function updateLoginStatus() {
+            const statusEl = document.getElementById('login-status');
+            const nameEl = document.getElementById('user-name');
+            const loginBtn = document.querySelector('button[onclick="loginModal.show()"]');
+
+            if (token) {
+                statusEl.textContent = '已登录';
+                statusEl.className = 'text-sm text-green-500';
+                nameEl.textContent = '管理员';
+                loginBtn.innerHTML = '<i class="fa fa-refresh"></i> 刷新';
+                loginBtn.onclick = loadDashboard;
+            } else {
+                statusEl.textContent = '未登录';
+                statusEl.className = 'text-sm text-red-500';
+                nameEl.textContent = '未登录';
+                loginBtn.innerHTML = '<i class="fa fa-sign-in"></i> 登录';
+                loginBtn.onclick = loginModal.show;
+            }
+        }
+
+        async function login() {
+            const username = document.getElementById('login-username').value;
+            const password = document.getElementById('login-password').value;
+            
+            const result = await apiCall('/auth/login', 'POST', { username, password });
+            if (result.code === 0) {
+                token = result.data.token;
+                localStorage.setItem('token', token);
+                updateLoginStatus();
+                loginModal.hide();
+                loadDashboard();
+            } else {
+                document.getElementById('login-error').textContent = result.message || '登录失败';
+                document.getElementById('login-error').classList.remove('hidden');
+            }
+        }
+
+        function logout() {
+            token = null;
+            localStorage.removeItem('token');
+            updateLoginStatus();
+        }
+
+        async function loadDashboard() {
+            const result = await apiCall('/jobs/analysis/summary');
+            if (result.code === 0) {
+                document.getElementById('stat-total').textContent = result.data.total;
+                document.getElementById('stat-active').textContent = result.data.active;
+                document.getElementById('stat-avg-salary').textContent = '¥' + result.data.avg_salary.toLocaleString();
+                document.getElementById('stat-update-time').textContent = result.data.update_time;
+            }
+
+            const jobsResult = await apiCall('/jobs/page', 'POST', { page_num: 1, page_size: 5 });
+            if (jobsResult.code === 0) {
+                const tbody = document.getElementById('recent-jobs-body');
+                tbody.innerHTML = jobsResult.data.list.map(job => `
+                    <tr class="border-b border-gray-100 hover:bg-gray-50">
+                        <td class="py-3 px-4 text-sm font-medium text-blue-600">${job.title}</td>
+                        <td class="py-3 px-4 text-sm text-gray-600">${job.company_name}</td>
+                        <td class="py-3 px-4 text-sm text-gray-600">${job.city}</td>
+                        <td class="py-3 px-4 text-sm font-medium text-orange-600">
+                            ¥${job.min_salary || 0}-${job.max_salary || 0}K
+                        </td>
+                        <td class="py-3 px-4">
+                            <span class="px-2 py-1 text-xs rounded-full ${job.job_status === 'ACTIVE' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700'}">
+                                ${job.job_status === 'ACTIVE' ? '活跃' : '已关闭'}
+                            </span>
+                        </td>
+                    </tr>
+                `).join('');
+            }
+        }
+
+        async function loadCities() {
+            const result = await apiCall('/jobs/stat/city');
+            if (result.code === 0) {
+                const select = document.getElementById('job-city');
+                select.innerHTML = '<option value="">全部城市</option>';
+                result.data.forEach(city => {
+                    const option = document.createElement('option');
+                    option.value = city.city;
+                    option.textContent = city.city;
+                    select.appendChild(option);
+                });
+            }
+        }
+
+        async function loadJobs(page = 1) {
+            currentPage = page;
+            const body = { page_num: page, page_size: 10 };
+            if (currentKeyword) body.keyword = currentKeyword;
+            if (currentCity) body.city = currentCity;
+            const result = await apiCall('/jobs/page', 'POST', body);
+            if (result.code === 0) {
+                const tbody = document.getElementById('jobs-table-body');
+                tbody.innerHTML = result.data.list.map(job => `
+                    <tr class="border-b border-gray-100 hover:bg-gray-50">
+                        <td class="py-3 px-4 text-sm text-gray-500">${job.id}</td>
+                        <td class="py-3 px-4 text-sm font-medium text-blue-600">${job.title}</td>
+                        <td class="py-3 px-4 text-sm text-gray-600">${job.company_name}</td>
+                        <td class="py-3 px-4 text-sm text-gray-600">${job.city}</td>
+                        <td class="py-3 px-4 text-sm font-medium text-orange-600">
+                            ¥${job.min_salary || 0}-${job.max_salary || 0}K
+                        </td>
+                        <td class="py-3 px-4 text-sm text-gray-600">${job.experience}</td>
+                        <td class="py-3 px-4 text-sm text-gray-600">${job.education}</td>
+                        <td class="py-3 px-4">
+                            <span class="px-2 py-1 text-xs rounded-full ${job.job_status === 'ACTIVE' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700'}">
+                                ${job.job_status === 'ACTIVE' ? '活跃' : '已关闭'}
+                            </span>
+                        </td>
+                    </tr>
+                `).join('');
+                document.getElementById('page-info').textContent = `第 ${page} 页 / 共 ${Math.ceil(result.data.total / 10)} 页`;
+            }
+        }
+
+        function searchJobs() {
+            currentKeyword = document.getElementById('job-search').value;
+            currentCity = document.getElementById('job-city').value;
+            loadJobs(1);
+        }
+
+        function prevPage() {
+            if (currentPage > 1) loadJobs(currentPage - 1);
+        }
+
+        function nextPage() {
+            loadJobs(currentPage + 1);
+        }
+
+        async function loadStats() {
+            const [cityResult, expResult, eduResult, skillResult] = await Promise.all([
+                apiCall('/jobs/stat/city'),
+                apiCall('/jobs/stat/experience'),
+                apiCall('/jobs/stat/education'),
+                apiCall('/jobs/stat/skill')
+            ]);
+
+            if (cityResult.code === 0) {
+                const maxCount = Math.max(...cityResult.data.map(d => d.count));
+                document.getElementById('city-chart').innerHTML = cityResult.data.map(d => `
+                    <div class="flex items-center gap-3">
+                        <span class="w-20 text-sm text-gray-600">${d.name}</span>
+                        <div class="flex-1 bg-gray-200 rounded-full h-6 overflow-hidden">
+                            <div class="bg-blue-600 h-full rounded-full" style="width: ${(d.count / maxCount) * 100}%"></div>
+                        </div>
+                        <span class="w-12 text-sm text-gray-800 text-right">${d.count}</span>
+                    </div>
+                `).join('');
+            }
+
+            if (expResult.code === 0) {
+                const maxCount = Math.max(...expResult.data.map(d => d.count));
+                document.getElementById('experience-chart').innerHTML = expResult.data.map(d => `
+                    <div class="flex items-center gap-3">
+                        <span class="w-24 text-sm text-gray-600">${d.name}</span>
+                        <div class="flex-1 bg-gray-200 rounded-full h-6 overflow-hidden">
+                            <div class="bg-green-600 h-full rounded-full" style="width: ${(d.count / maxCount) * 100}%"></div>
+                        </div>
+                        <span class="w-12 text-sm text-gray-800 text-right">${d.count}</span>
+                    </div>
+                `).join('');
+            }
+
+            if (eduResult.code === 0) {
+                const maxCount = Math.max(...eduResult.data.map(d => d.count));
+                document.getElementById('education-chart').innerHTML = eduResult.data.map(d => `
+                    <div class="flex items-center gap-3">
+                        <span class="w-20 text-sm text-gray-600">${d.name}</span>
+                        <div class="flex-1 bg-gray-200 rounded-full h-6 overflow-hidden">
+                            <div class="bg-purple-600 h-full rounded-full" style="width: ${(d.count / maxCount) * 100}%"></div>
+                        </div>
+                        <span class="w-12 text-sm text-gray-800 text-right">${d.count}</span>
+                    </div>
+                `).join('');
+            }
+
+            if (skillResult.code === 0) {
+                const maxCount = Math.max(...skillResult.data.map(d => d.count));
+                document.getElementById('skill-cloud').innerHTML = skillResult.data.map(d => {
+                    const size = Math.max(14, Math.min(24, 14 + (d.count / maxCount) * 10));
+                    const opacity = 0.6 + (d.count / maxCount) * 0.4;
+                    return `<span class="px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-sm" style="font-size: ${size}px; opacity: ${opacity};">${d.name} (${d.count})</span>`;
+                }).join('');
+            }
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('chat-input');
+            const message = input.value.trim();
+            if (!message) return;
+
+            input.value = '';
+            const chatContainer = document.getElementById('chat-messages');
+            
+            chatContainer.innerHTML += `
+                <div class="chat-message flex gap-3 justify-end">
+                    <div class="bg-blue-600 rounded-lg rounded-tr-none px-4 py-3 shadow-sm text-white">
+                        <p>${message}</p>
+                    </div>
+                    <div class="w-8 h-8 rounded-full bg-gray-600 flex items-center justify-center flex-shrink-0">
+                        <i class="fa fa-user text-white"></i>
+                    </div>
+                </div>
+            `;
+            
+            chatContainer.innerHTML += `
+                <div class="chat-message flex gap-3" id="ai-response">
+                    <div class="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center flex-shrink-0">
+                        <i class="fa fa-robot text-white"></i>
+                    </div>
+                    <div class="bg-white rounded-lg rounded-tl-none px-4 py-3 shadow-sm">
+                        <div class="loading-dots text-gray-500">
+                            <span>.</span><span>.</span><span>.</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+
+            const responseDiv = document.querySelector('#ai-response .bg-white');
+            responseDiv.innerHTML = '';
+
+            try {
+                const response = await fetch(`${API_BASE}/ai/chat-stream`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': token ? `Bearer ${token}` : ''
+                    },
+                    body: JSON.stringify({ message, session_id: 'frontend' })
+                });
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    const chunks = decoder.decode(value).split('\n');
+                    chunks.forEach(chunk => {
+                        if (chunk.startsWith('data: ')) {
+                            const data = chunk.slice(6);
+                            if (data.trim() !== '[DONE]') {
+                                responseDiv.innerHTML += data;
+                                chatContainer.scrollTop = chatContainer.scrollHeight;
+                            }
+                        }
+                    });
+                }
+            } catch (error) {
+                responseDiv.innerHTML = '抱歉，AI服务暂时不可用。';
+            }
+        }
+
+        async function predictSalary() {
+            const city = document.getElementById('salary-city').value;
+            const education = document.getElementById('salary-education').value;
+            const experience = document.getElementById('salary-experience').value;
+            const skills = document.getElementById('salary-skills').value;
+
+            const params = new URLSearchParams({ city, education, experience, skills });
+            const result = await apiCall(`/jobs/predict-salary?${params}`);
+            if (result.code === 0) {
+                document.getElementById('salary-min').textContent = Math.round(result.data.min_salary).toLocaleString();
+                document.getElementById('salary-avg').textContent = Math.round(result.data.avg_salary).toLocaleString();
+                document.getElementById('salary-max').textContent = Math.round(result.data.max_salary).toLocaleString();
+                document.getElementById('salary-result').classList.remove('hidden');
+            }
+        }
+
+        async function exportJobs() {
+            if (!token) {
+                loginModal.show();
+                return;
+            }
+            const response = await fetch(`${API_BASE}/jobs/export`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ page_num: 1, page_size: 999999 })
+            });
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'jobs_export.xlsx';
+            a.click();
+            window.URL.revokeObjectURL(url);
+        }
+
+        updateLoginStatus();
+        loadDashboard();
+    </script>
+</body>
+</html>

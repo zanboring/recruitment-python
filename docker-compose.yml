@@ -1,0 +1,131 @@
+# 全栈一键启动：docker compose up -d --build
+# 访问 http://localhost:8080（前端由 nginx 托管，/api 自动反代到后端）
+#
+# ⚠️ 首次部署前请先准备项目根 `.env`（模板见 `.env.docker.example`）——
+#    Compose 的变量插值只读 `.env`，**不读**源码模式使用的 `config.env`。
+#    若希望直接复用 `config.env`，改用：
+#        docker compose --env-file config.env up -d --build
+#    📌 澄清一个易混点（曾据此误判修法）：service 级的 `env_file:` 只把变量
+#    **注入容器环境**，**不参与 compose 文件自身的 ${...} 插值** —— 两者时机不同，
+#    所以加 `env_file:` 修不了 ${JWT_SECRET:?} 的「启动前报错」。
+name: recruitment-python
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+      # Playwright 浏览器下载源。默认官方 CDN；国内网络改成 npmmirror 可快约 100 倍
+      # （实测官方 ~100 KB/s vs npmmirror ~10 MB/s）：
+      #   PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright docker compose up -d --build
+      args:
+        PLAYWRIGHT_DOWNLOAD_HOST: ${PLAYWRIGHT_DOWNLOAD_HOST:-https://cdn.playwright.dev}
+    # 多副本（默认 2 worker）：这是 Redis 后端「真正承担职责」的前提 ——
+    # 单 worker 时进程内实现本就正确，Redis 不产生差别；2 worker 后
+    # 限流计数 / 爬虫日配额 / 熔断状态必须跨进程共享，否则配额翻倍（防爆破失效）。
+    # init_db 在 fork worker 之前只执行一次。
+    command: ["sh", "-c", "python scripts/init_db.py && exec uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers ${BACKEND_WORKERS:-2}"]
+    environment:
+      APP_ENV: production
+      DB_TYPE: sqlite
+      DB_NAME: data/recruitment.db
+      JWT_SECRET: ${JWT_SECRET:-change_me_to_a_long_random_secret_for_production}
+      # AI 密钥：留空则自动降级本地/规则引擎
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ZHIPUAI_API_KEY: ${ZHIPUAI_API_KEY:-}
+      REDIS_URL: redis://redis:6379/0
+      OLLAMA_ENABLED: "false"
+      AI_TOOL_PREFILTER_ENABLED: "true"
+      # ⚠️ 必须是 JSON 数组。cors_origins 声明为 list[str]，pydantic-settings 对复杂类型
+      #    会先做 json.loads，裸字符串会直接抛 SettingsError、容器起不来。
+      #    （app/config.py 里 @field_validator("cors_origins", mode="before") 的
+      #      「逗号分隔」兜底在这一步之前就被绕过了，等于不可达。）
+      CORS_ORIGINS: '["http://localhost:8080"]'
+      # 限流计数走 Redis（多副本共享）。Redis 故障时自动降级内存并记 warning。
+      RATE_LIMIT_BACKEND: ${RATE_LIMIT_BACKEND:-redis}
+      # 采集日配额 / 域名节流同样跨副本共享 —— 日配额是**对招聘站点的承诺**，
+      # 内存实现下 2 副本会让实际访问量翻倍，承诺不成立。
+      QUOTA_BACKEND: ${QUOTA_BACKEND:-redis}
+      # 熔断器 / AI 会话历史同样外置 —— 与上面两项保持一致，四个后端全部走 Redis。
+      # 此前只配了 rate_limit 与 quota，这两项在容器内会静默回落到进程内实现
+      # （功能正常、但「跨副本共享」的语义失效，且不会有任何报错）。
+      CIRCUIT_BREAKER_BACKEND: ${CIRCUIT_BREAKER_BACKEND:-redis}
+      SESSION_BACKEND: ${SESSION_BACKEND:-redis}
+      # 浏览器采集：容器内无显示器、也没有本机 Chrome，必须覆盖这两项，
+      # 否则跑 BOSS 采集会以 no X server / channel not found 失败。
+      CRAWL_HEADLESS: ${CRAWL_HEADLESS:-true}
+      CRAWL_BROWSER_CHANNEL: ${CRAWL_BROWSER_CHANNEL:-}
+      # ⚠️ 多 worker 下进程内 APScheduler（定时爬取/日报）与 job_checker 会在
+      #    每个 worker 内各自启动 → 定时任务重复触发 N 次，对招聘站点的压力翻倍。
+      #    这是多副本的真实代价，两种处理方式：
+      #      a) 生产：关掉进程内调度，改由外部 cron 调 POST /api/crawler/start；
+      #      b) 后续任务：用 Redis 锁选主，只让一个 worker 启动调度器。
+      SCHEDULED_CRAWL_ENABLED: ${SCHEDULED_CRAWL_ENABLED:-true}
+      REPORT_ENABLED: ${REPORT_ENABLED:-true}
+    volumes:
+      - appdata:/app/data
+    depends_on:
+      redis:
+        # 就绪依赖而非启动顺序：只保证「先启动」时，backend 可能在 Redis
+        # 尚未接受连接时就发起访问，启动早期刷一堆连接错误。
+        condition: service_healthy
+    healthcheck:
+      # 用 /openapi.json（无需鉴权；/api/system/version 返回 401，不适合探活）。
+      # 镜像内没有 curl，故用基础镜像自带的 python。
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/openapi.json', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        # 等 backend **就绪**（healthcheck 通过）再启动 nginx：
+        # 否则 nginx 先起时会代理到尚未监听的后端，前端首屏 502。
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+volumes:
+  appdata:
+  redisdata:

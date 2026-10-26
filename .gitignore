@@ -1,0 +1,80 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 测试
+.pytest_cache/
+.coverage
+
+# 数据库
+*.db
+*.sqlite3
+
+# 日志
+logs/
+*.log
+
+# 环境变量
+.env
+
+# 开发过程产物（AI 工具审计 / 提示词记录，不进仓库）
+_archive/
+
+# 协作检查器的本机状态（记录"上次看到哪版收件箱"，每个工作区各不相同，
+# 入库只会制造无意义的冲突）
+collab/.state/
+
+# 自动化日报生成的 Excel 产物
+reports/daily/
+
+# 前端构建产物与依赖（只提交源码；部署时 npm run build 生成 dist）
+frontend/node_modules/
+frontend/dist/
+
+# 用户自定义配置（含 API Key，模板才是入库对象）
+config.env
+env/config.env
+
+# PyInstaller 打包产物（本地生成，发布走 GitHub Release 附件）
+build/
+dist/
+# 用 --distpath/--workpath 指定别的输出目录时（例如为了绕开被占用的 dist/）
+# 也必须忽略，否则构建产物会被误提交
+build_*/
+dist_*/
+*.spec.bak
+
+# AI 编码工具的本机工作区元数据（每个工作区各不相同，入库只会制造噪音）
+.workbuddy/
+
+# 手工备份文件（改动前留的回滚副本，不是源码）
+*.bak
+
+# ============ 内部文件 ============
+# 2026-10-12：仓库已转 **private**，且 `origin`(GitHub) 推送已**冻结** ⇒ 内部协作文档/脚本**恢复入库**
+# （原名单保留为注释备查）。唯一仍排除的是系统审计报告，理由见末行。
+#
+# 内部协作文档（任务书 / 协作信道 / 双机协议，含内网 IP 与机器绝对路径）
+# collab/
+# AI_APPLICATION_HANDOFF.md
+# COLLAB.md
+# COLLAB_HANDOFF.md
+# ENV_MIGRATION_CHECKLIST.md
+# INTERVIEW.md
+# LEARNING_PATH.md
+
+# 内部协作脚本（面向「两台机器 + 多个 AI 协同」的自研工具）
+# collab-check.cmd
+# git-collab.cmd
+# git-push.cmd
+# git-sync.cmd
+
+# 系统审计报告（含本机磁盘布局 / 已装软件清单，**与项目无关**，仍排除）
+reports/*.html
+
+# ── 本地工具/辅助脚本（不入库）──
+.codebuddy/
+一键推送.bat
