@@ -212,9 +212,9 @@ ollama:
   enabled: ${OLLAMA_ENABLED:true}
   base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
   # 语言类：对话生成
-  model: ${OLLAMA_MODEL:qwen2.5:14b}
-  # 代码类：工具识别 / 结构化抽取
-  code-model: ${OLLAMA_CODE_MODEL:qwen2.5-coder:7b}
+  model: ${OLLAMA_MODEL:qwen3.5:4b}
+  # 代码类：工具识别 / 结构化抽取（默认与 model 同值）
+  code-model: ${OLLAMA_CODE_MODEL:qwen3.5:4b}
   # 单独指定工具识别模型（留空则用 code-model，再回退 model）
   tool-model: ${OLLAMA_TOOL_MODEL:}
 
