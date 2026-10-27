@@ -23,7 +23,7 @@
 
 本仓库是毕设的 **Python 重构版**：用 FastAPI + SQLAlchemy 2.0 异步 ORM 重写后端，保留全部业务能力，并强化了 AI 服务、知识库检索与推荐模块。
 
-**规模**：12 个路由模块 / 99 个 REST 接口（含 22 个 Java 版前端兼容接口）/ 21 个业务服务 / 8 张数据表 / 772 项自动化测试
+**规模**：12 个路由模块 / 104 个 API 路由（其中 89 个在 `/api` 前缀下，含 Java 版前端兼容接口）/ 21 个业务服务 / 8 张数据表 / 847 项自动化测试
 
 ## 二、技术栈
 
@@ -85,7 +85,7 @@ recruitment-python/
 │   ├── database.py          # 异步引擎与会话工厂
 │   ├── scheduler.py         # APScheduler 定时爬取
 │   ├── init_data.py         # 建表 + 初始化数据
-│   ├── routers/             # 12 个路由模块（99 个 API 端点，含 compat.py 兼容层）
+│   ├── routers/             # 12 个路由模块（104 个 API 路由，含 compat.py 兼容层）
 │   │   ├── auth.py          #   4  认证
 │   │   ├── jobs.py          #   20 岗位 / 统计 / 导出 / 导入
 │   │   ├── ai.py            #   5  AI 对话
@@ -122,11 +122,11 @@ recruitment-python/
 │   ├── init_db.py           # 建表 + 初始化管理员
 │   ├── eval_rag.py          # RAG 检索效果评估入口
 │   └── bench_local_models.py# 本地模型能力对比基准（决定模型分工）
+├── frontend/                # Vue3 + Vite 前端（图表 / AI 对话 / 岗位管理）
 ├── userscript/              # 油猴脚本采集通道（真实浏览器采集 + 回传本地服务）
 ├── docs/                    # 全部对外文档（架构 / 配置 / 展示 / 迁移 / 评估报告 / 配图）
-├── reports/                 # 运行期产出的评估报告（daily/、*.html 不入库）
-├── tests/                   # 单元测试（当前基线 772 passed）
-├── _archive/                # 开发过程文档（审计报告 / 提示词，不进仓库逻辑）
+├── docker/                  # Dockerfile 与部署编排（可选方式，非必需）
+├── tests/                   # 自动化测试（当前基线 847 passed）
 └── requirements.txt
 ```
 
@@ -348,7 +348,7 @@ recruitment-python/
   还多一个只存在于下架岗位的技能。数字互相矛盾比数字不准更糟，现在统一到
   `VISIBLE_STATUS` 口径；唯一例外是「岗位状态分布」图表，它的职责就是展示各状态。
 - 后端提供 7 个维度的统计聚合接口
-- 前端（Vue3 + ECharts，在 Java 版仓库）：饼图 3 个 / 柱状图 10+ 个 / 折线图 1 个 / 雷达图 1 个
+- 前端（Vue3 + ECharts，源码在本仓库 `frontend/`）：饼图 3 个 / 柱状图 10+ 个 / 折线图 1 个 / 雷达图 1 个
 
 ### 8. 操作日志与审计
 
@@ -721,9 +721,9 @@ python -m pytest tests/test_auth_api.py -v   # 单个模块
 ## 九、说明
 
 - 数据库建表与初始化数据见 `app/init_data.py`
-- 前端代码在 Java 版仓库 `Recruitment/recruitment-system-frontend`，本仓库只提供后端接口；
-  该前端按 Java 版契约编写，由 `app/routers/compat.py` 兼容层承接（见第 5 节第 9 小节）
-- `_archive/` 目录下是开发过程文档（代码审计报告、提示词记录），不参与项目运行
+- 前端是 Vue3 + Vite，源码在本仓库 `frontend/`，`npm run build` 后产物进 `frontend/dist/`，
+  后端优先伺服该目录；接口同时保留 `app/routers/compat.py` 兼容层，以兼容按 Java 版契约写的老前端
+- 文档在 `docs/`（架构 / 配置 / 数据源插件 / 迁移对比 / 评估报告）；评估类报告由 `scripts/eval_rag.py` 重新生成
 
 ### 表结构变更（升级须知）
 
