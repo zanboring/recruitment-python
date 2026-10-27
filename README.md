@@ -140,19 +140,18 @@ recruitment-python/
   任一服务商密钥过期或额度用尽都会自动尝试下一个；接入任意 OpenAI 兼容厂商
   （Moonshot、通义、SiliconFlow…）只需加一行配置，调用方代码零改动
   （统一实现在 `app/services/llm_client.py`）
-- **本地模型按角色分工**（`app/services/ollama_client.py`）：本地不是「一个备胎」，
-  而是把两个能力互补的模型各放到它更擅长的那一环 ——
+- **本地模型：一个模型跑全链路**（`app/services/ollama_client.py`）：`OLLAMA_MODEL` 与
+  `OLLAMA_CODE_MODEL` 现在都指向 `qwen3.5:4b`。**曾经**按角色分成两个模型，但方案被显存推翻了 ——
 
-  | 角色 | 模型 | 配置项 | 实测依据 |
+  | 环节 | 曾用模型 | 实测 | 结论 |
   |---|---|---|---|
-  | 对话生成 | `qwen2.5:14b`（语言类 14.8B） | `OLLAMA_MODEL` | 知识问答 3/3 通过 |
-  | 工具识别 / JSON 抽取 | `qwen2.5-coder:7b`（代码类 7.6B） | `OLLAMA_CODE_MODEL` | 准确率同为 100%，耗时更低（5.4s vs 7.4s）|
+  | 工具识别 / JSON 抽取 | `qwen2.5-coder:7b`（7.6B） | 准确率 6/6，**5.4s**，72.2 tok/s | 又快又准，这一环被保留 |
+  | 对话生成 | `qwen2.5:14b`（14.8B） | 知识问答 3/3，但只有 **12.2 tok/s** | 8 GB 显存装不下只能 offload，生成要 22s，实际不可用 |
 
-  分工结论不是靠感觉，而是用 `scripts/bench_local_models.py` 实测得出（报告见
-  `docs/reports/local-model-benchmark.md`）：两个模型做**工具识别**准确率完全相同（6/6），
-  但小的那个明显更快；做**知识问答**时大的那个更可靠。因此机械的抽取环节交给小模型、
-  需要表达与事实准确性的环交给大模型。本地链路耗时拆解：工具识别 6.1s + 查库 0.01s +
-  生成 22.2s ≈ 28.4s，瓶颈在生成而非路由。
+  分工思路本身是对的（`scripts/bench_local_models.py`，报告见
+  `docs/reports/local-model-benchmark.md`）：机械抽取交给小模型、需要事实准确性的生成交给大模型。
+  但「大模型」在本机 8 GB 显存上反而更慢，所以最终收敛为 `qwen3.5:4b` 一个模型跑全链路。
+  **不是没测过分工，是测完发现这台机器不支持分工** —— 12.2 tok/s 就是证据。
 - **本地 Function Calling**：降级到本地后「查库」能力不失效 —— 本地路径同样执行
   「工具识别 → 查库 → 结果回填」，与云端共用同一套提示词与解析器
   （`ollama_client.detect_tool_call` 复用 `tool_service`），区别只在由哪个模型来读。
@@ -521,7 +520,7 @@ cp .env.example .env
 #    可选：ZHIPUAI_API_KEY（不填则 AI 走本地 Ollama / 规则引擎）
 
 # 3. 初始化数据库（自动建表 + 插入默认管理员）
-#    ⚠️ 默认账号 admin / admin123 仅供本地首次登录，
+**首次登录**：账号 `admin`；口令取自 `ADMIN_INITIAL_PASSWORD`（未设置时用 `app/init_data.py` 里的开发默认值，生产环境启动会随机生成并写入 `data/admin-initial-password.txt`，**不打印到日志**）。
 #       部署到任何可被外部访问的环境前，必须先改掉这个密码
 python scripts/init_db.py
 
