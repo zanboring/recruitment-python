@@ -33,6 +33,7 @@ from app.crawlers.browser import launch
 from app.crawlers.city_map import UnsupportedCityError
 from app.crawlers.cleaner import clean_job_data, deduplicate_jobs, generate_job_key
 from app.crawlers.throttle import await_domain_slot, parse_retry_after
+from app.utils.salary import parse_salary_to_monthly as _parse_salary_monthly
 
 logger = logging.getLogger("job51_crawler")
 
@@ -124,94 +125,19 @@ def require_area_code(city_name: str) -> str:
 # 薪资解析
 # --------------------------------------------------------------------------
 
-# 单位倍率。51job 的写法比 BOSS 杂，需要单独处理。
-_UNIT_MULTIPLIERS = {
-    "万": 10000,
-    "w": 10000,
-    "千": 1000,
-    "k": 1000,
-    "元": 1,
-}
-
-_AMOUNT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(万|w|W|千|k|K|元)?")
-
-# 非月薪口径（日薪 / 时薪 / 年薪按年计）无法与月薪区间直接比较，一律丢弃
-_NON_MONTHLY_HINTS = ("/天", "元/天", "/时", "小时", "/周")
+# 薪资解析：实现已统一到 app/utils/salary.py，这里只做转发。
+# 历史教训：本模块与 cleaner 曾各持一套实现 —— 这边认「1-1.5万」，那边只认
+# 「8K-12K」，于是 BOSS 的「15-25K·13薪」全部解析成 0，岗位能入库、列表能显示，
+# 只是薪资列全空、薪资分布图与高薪过滤静默失效。两处维护必然漂移，故收敛为一份。
 
 
 def parse_salary_to_monthly(raw) -> Tuple[int, int]:
-    """把 51job 的薪资文本解析成**月薪**区间（元）。
+    """把薪资文本解析成**月薪**区间（元）。
 
-    覆盖的写法（均来自真实页面样本）::
-
-        1-1.5万        → (10000, 15000)   单位只写在后半段，前半段要继承
-        8千-1.2万      → (8000, 12000)    两端单位不同
-        6-8千          → (6000, 8000)
-        1-1.5万·13薪   → (10000, 15000)   「13薪」不影响月薪区间
-        15-25万/年     → (12500, 20833)   年包折算成月
-        2万            → (20000, 20000)   单值
-        面议 / 空      → (0, 0)
-        200-300元/天   → (0, 0)           非月薪口径，宁可留空也不换算
-
-    解析不出来一律返回 ``(0, 0)``，由 ``cleaner`` 的通用解析兜底 ——
-    **绝不为了「看起来有数据」而瞎猜一个薪资**。
+    实现见 ``app.utils.salary``（与 ``cleaner.parse_salary`` 共用一份）。
+    保留本函数名是因为既有测试与调用方都引用它；**不要在这里再写一套解析**。
     """
-    if raw is None:
-        return 0, 0
-    text = str(raw).strip()
-    if not text:
-        return 0, 0
-    if "面议" in text or "议" in text or "保密" in text:
-        return 0, 0
-    if any(hint in text for hint in _NON_MONTHLY_HINTS):
-        return 0, 0
-
-    annual = "/年" in text or "年薪" in text or "年" in text.replace("年经验", "")
-
-    # 去掉「·13薪」「(xx)」等尾巴，以及单位说明，只留下数字与量级单位
-    cleaned = text.split("·")[0].split("（")[0].split("(")[0]
-    for noise in ("年薪", "月薪", "元/月", "/月", "元/年", "/年", "元", "/"):
-        cleaned = cleaned.replace(noise, " ")
-    cleaned = cleaned.strip()
-
-    tokens = [t for t in re.split(r"[-~～至]", cleaned) if t.strip()]
-    if not tokens:
-        return 0, 0
-
-    parsed = [_parse_amount(t) for t in tokens[:2]]
-    parsed = [p for p in parsed if p is not None]
-    if not parsed:
-        return 0, 0
-
-    if len(parsed) == 1:
-        low_value, low_unit = parsed[0]
-        high_value, high_unit = parsed[0]
-    else:
-        (low_value, low_unit), (high_value, high_unit) = parsed[0], parsed[1]
-
-    # 「1-1.5万」：量级单位只写在后半段，前半段继承后半段的单位。
-    # 用「前半段数值 < 100 且自身没有量级单位」来判定，避免把「8000-12000」误判。
-    if low_unit == 1 and high_unit != 1 and low_value < 100:
-        low_unit = high_unit
-
-    low = low_value * low_unit
-    high = high_value * high_unit
-    if high < low:
-        low, high = high, low
-
-    if annual:
-        low, high = low / 12, high / 12
-
-    return int(round(low)), int(round(high))
-
-
-def _parse_amount(token: str) -> Optional[Tuple[float, int]]:
-    """解析 ``'1.5万'`` → ``(1.5, 10000)``；无法解析返回 ``None``。"""
-    match = _AMOUNT_RE.search(str(token).strip())
-    if not match:
-        return None
-    unit = (match.group(2) or "").lower()
-    return float(match.group(1)), _UNIT_MULTIPLIERS.get(unit, 1)
+    return _parse_salary_monthly(raw)
 
 
 # --------------------------------------------------------------------------

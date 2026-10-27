@@ -15,8 +15,27 @@ DB_PASSWORD=your_mysql_password
 # ========== JWT ==========
 # 至少32字符的随机密钥, Base64编码
 # 生成方式: python -c "import secrets; print(secrets.token_urlsafe(32))"
+#
+# ⚠️ APP_ENV=production 时启动会校验这个值：仓库里出现过的默认值
+#    （change_me_* / dev_only_* / your_jwt_* 等）会被直接拒绝，容器/进程起不来。
+#    这是有意的 fail-fast —— 用公开常量当密钥，等于任何人读过源码就能伪造管理员 token。
 JWT_SECRET=your_jwt_secret_base64
 JWT_EXPIRATION=86400000
+
+# ========== 初始管理员口令 ==========
+# 留空时的行为：
+#   APP_ENV=development → 沿用 admin/admin123（与本仓库 README 一致）
+#   APP_ENV=production  → **随机生成**并写入 data/admin-initial-password.txt
+# 生产部署想自己指定就填这里（不要在源码里改默认值）。
+ADMIN_INITIAL_PASSWORD=
+
+# ========== 监听地址（仅打包版 run_entry.py 读取）==========
+# 默认 127.0.0.1：这是个单机桌面软件，只需要本机能访问。
+# 需要局域网/容器访问时才设为 0.0.0.0，并自行确认网络环境可信
+# —— 注意免密登录 /api/auth/auto-login 虽然另有"仅回环"判定，
+# 但账号密码登录在任何来源都是开放的。
+SERVER_HOST=127.0.0.1
+SERVER_PORT=8080
 
 # ========== AI 对话模型（OpenAI 兼容协议）==========
 # 主服务商：deepseek（默认）| zhipu。另一个自动作为备选，实现多供应商容灾。

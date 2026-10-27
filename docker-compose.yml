@@ -29,6 +29,10 @@ services:
       APP_ENV: production
       DB_TYPE: sqlite
       DB_NAME: data/recruitment.db
+      # ⚠️ 必须显式设置 JWT_SECRET（否则容器会启动失败，这是有意的 fail-fast）。
+      #    下面这个兜底值是仓库里的公开常量，启动校验会直接拒绝它 ——
+      #    留着它等于「任何读过源码的人都能伪造管理员 token」。
+      #    生成：python -c "import secrets;print(secrets.token_urlsafe(48))"
       JWT_SECRET: ${JWT_SECRET:-change_me_to_a_long_random_secret_for_production}
       # AI 密钥：留空则自动降级本地/规则引擎
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}

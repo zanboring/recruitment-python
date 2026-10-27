@@ -57,6 +57,10 @@ def pytest_configure(config):
     settings.ai_usage_log_enabled = False
     # 自动入库开关默认保持开启（与生产一致），需要验证它的用例自行覆盖
     settings.ai_auto_learn_enabled = True
+    # 抓取基础间隔归零：默认 12~18 秒是给真实站点用的，测试里会真的等，
+    # 多页用例直接跑到超时。需要验证"延迟确实存在/被放大"的用例自行 patch。
+    settings.crawl_delay_min = 0
+    settings.crawl_delay_max = 0
 
     # 采集护栏（跨任务层）默认关闭，原因与上面几条同类：
     # - robots 检查会向目标站点发起**真实网络请求**；
@@ -144,6 +148,26 @@ async def engine():
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
     await eng.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _isolate_operation_log(engine):
+    """把操作日志的独立会话重定向到测试内存库。
+
+    ``log_action`` 现在用**独立会话**写日志（不再复用业务 session，避免异常路径
+    上把半截修改一起提交）。它默认走 ``app.database.async_session`` ——
+    测试环境下那指向**另一个**内存库，表现为「日志确实写了，但 /api/logs/list
+    查不到」，test_log_action 会整组变红。所以必须在这里覆盖。
+
+    与 ``usage_service.set_session_factory`` 同一模式。
+    """
+    from app.utils import log_decorator
+
+    log_decorator.set_session_factory(
+        async_sessionmaker(engine, expire_on_commit=False)
+    )
+    yield
+    log_decorator.set_session_factory(None)
 
 
 @pytest_asyncio.fixture

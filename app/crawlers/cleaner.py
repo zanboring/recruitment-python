@@ -17,7 +17,32 @@ SKILL_KEYWORDS = []
 for category, skills in SKILL_KEYWORDS_FULL.items():
     SKILL_KEYWORDS.extend(skills)
 
-SKILL_PATTERNS = [re.compile(re.escape(skill), re.IGNORECASE) for skill in SKILL_KEYWORDS]
+
+def _build_skill_matcher(skill: str):
+    """为一个技能词编译匹配器。
+
+    **为什么不能一律用子串**：短英文词会命中别的单词内部 —— 最典型的是 ``Go``
+    命中 ``Django``（这个项目里 Django 岗位极常见），于是每一条 Django 岗位都
+    被额外打上 Go 标签，技能分布、技能图谱与「按技能搜索」全部被污染，而且
+    没有任何报错，看起来只是"数据有点怪"。
+
+    规则：
+    - 纯字母/数字且长度 ≤3（Go / PHP / Vue / AWS / LLM / Git）→ 加词边界，避免
+      ``\\bgo\\b`` 命中 ``django`` / ``logo`` / ``cargo``。
+    - 含特殊字符的（C++ / C# / .NET / Node.js / CI/CD）→ 保持子串匹配，因为
+      ``\\b`` 在这些符号边界上不成立，加边界反而永远命中不了。
+    - 中文技能词（数据分析 / 机器学习）→ 子串匹配，中文没有词边界概念。
+    """
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", skill) and len(skill) <= 3:
+        return re.compile(rf"(?<![A-Za-z0-9]){re.escape(skill)}(?![A-Za-z0-9])", re.IGNORECASE)
+    return re.compile(re.escape(skill), re.IGNORECASE)
+
+
+# 预编译：词表固定，每次调用重新编译是纯浪费（爬取时每条岗位都会走一遍）
+_SKILL_MATCHERS = {skill: _build_skill_matcher(skill) for skill in SKILL_KEYWORDS}
+
+# 兼容既有引用（历史上是纯子串正则，容易被误用到判断逻辑里）
+SKILL_PATTERNS = list(_SKILL_MATCHERS.values())
 
 
 def is_senior_job(title: str, experience: str) -> bool:
@@ -45,26 +70,36 @@ def is_high_salary(min_salary: float) -> bool:
 
 
 def parse_salary(salary_str: str) -> tuple[int, int]:
-    if not salary_str:
-        return 0, 0
-    match = re.match(r'(\d+)[Kk]-(\d+)[Kk]', salary_str)
-    if match:
-        return int(match.group(1)) * 1000, int(match.group(2)) * 1000
-    match = re.match(r'(\d+)[Kk]', salary_str)
-    if match:
-        return int(match.group(1)) * 1000, int(match.group(1)) * 1000
-    return 0, 0
+    """薪资文本 → 月薪区间；实现见 ``app.utils.salary``（唯一一份）。
+
+    历史坑：这里原先只认 ``8K-12K`` 一种写法，而 BOSS 的真实文本是
+    ``15-25K·13薪`` —— 正则不匹配，于是**整站薪资全部落成 0**。
+    表现是岗位能正常入库、列表能显示，只是薪资列全空、薪资分布图与
+    「高薪岗位过滤」静默失效，全程没有任何报错。现在统一委托，别再改回本地正则。
+    """
+    from app.utils.salary import parse_salary_to_monthly
+
+    return parse_salary_to_monthly(salary_str)
 
 
 def extract_skills(title: str, description: str) -> str:
-    text = (title + " " + description).lower()
+    """从标题与描述里抽取技能标签（最多 8 个，逗号分隔）。
+
+    匹配规则见 :func:`_build_skill_matcher` —— 短英文词走词边界，
+    否则 ``Go`` 会把每一条 ``Django`` 岗位都污染成双技能。
+    """
+    text = f"{title} {description}"
     found = []
     all_skills = []
     for category, skills in SKILL_KEYWORDS_FULL.items():
         all_skills.extend(skills)
+    # 长词优先，避免 "Spring" 抢先占位后 "SpringBoot" 被挤掉
     all_skills.sort(key=len, reverse=True)
     for skill in all_skills:
-        if skill.lower() in text and skill not in found:
+        if skill in found:
+            continue
+        matcher = _SKILL_MATCHERS.get(skill)
+        if matcher is not None and matcher.search(text):
             found.append(skill)
         if len(found) >= 8:
             break

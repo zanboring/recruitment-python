@@ -13,6 +13,50 @@ GitHub Release 的 tag 必须与之一致（`v1.0.0`）—— 更新检查就是
 
 ## [Unreleased]
 
+### 安全（默认配置不再等于「管理员公开」）
+
+四条默认值单独看都不致命，叠加起来是「双击运行 = 同一 WiFi 下任何人都能拿到管理员 token」：
+打包入口写死 `host=0.0.0.0` + `app_env` 默认 `development` + 免密登录只判环境不判来源
++ 初始口令写死在源码里。
+
+- **默认只监听回环**：`run_entry.py` 由 `0.0.0.0` 改为 `127.0.0.1`。这是个单机桌面软件，
+  没有对外服务的需求；需要局域网/容器访问时显式设 `SERVER_HOST=0.0.0.0`。
+- **免密登录增加来源判定**：`/api/auth/auto-login` 与 `/api/auth/default-username`
+  仅在**回环地址**可用，局域网来源一律 403。判定用 `ipaddress.is_loopback` 而不是
+  `startswith("127.")`（后者连 `127.0.0.1.evil` 都会放行，已被单元测试抓到）。
+  前端依赖这两个接口做静默登录，所以是收紧来源而非删除接口。
+- **生产密钥校验改按特征拒绝**：`change_me_to_a_long_random_secret_for_production`
+  长 48 字符能穿过「至少 32 位」的长度门，但它是仓库里的公开常量 ——
+  任何读过源码的人都能离线签发任意 role 的 token。改为「特征片段 + 精确值」双判据：
+  只枚举具体值必然漏掉下一个新增的模板（`config.template.env` 里就还有一个变体）。
+- **初始口令不再写死**：支持 `ADMIN_INITIAL_PASSWORD`；生产环境未设置时随机生成
+  并写入 `data/admin-initial-password.txt`，日志不再输出明文口令。
+  开发环境仍沿用 `admin/admin123`（与 README 一致，否则「照文档跑却登不进去」）。
+
+前端 `v-html` 的两处正则黑名单换成 DOMPurify 白名单。实测旧实现对
+`java&#9;script:`、`<math><mtext><script>` 这类变形必然失效 ——
+根因是 HTML 不是正则语言。`frontend/scripts/xss-check.mjs` 可用
+`node scripts/xss-check.mjs` 复跑 18 个 payload 与排版保留断言。
+
+### 修复（事务与连接生命周期）
+
+- **操作日志会把半截修改一起提交**（`app/utils/log_decorator.py`）：原先复用业务
+  session 并在 `finally` 里 `commit`。接口在「已改字段、尚未提交」时抛 400（如角色
+  校验失败），那把 commit 会把半截修改落库 —— 调用方收到失败，数据却变了。
+  改为独立会话写日志；对照实测：旧实现提交了、新实现没有，且日志仍然写入。
+- **SSE 接口用已关闭的会话**（`app/routers/ai.py`）：`StreamingResponse` 是「先返回
+  响应、后迭代生成器」，而依赖注入的清理发生在响应返回之前 —— 流真正开始时，
+  `Depends(get_db)` 给的 session 已经被关掉，之后再用它会重新借连接且无人 close。
+  改为在生成器内部 `async with async_session()`。同一结论项目已在
+  `compat.py` 的后台任务里写过，这里当时漏改。
+
+### 测试
+
+- 792 → 845 passed。新增 `tests/test_security_defaults.py`（25 条）与
+  `tests/test_salary_and_ingest.py`（28 条）。
+- 修 3 个测试夹具里 `db_session.commit()` 未 `await` —— 数据能查到只因 SQLAlchemy
+  的 autoflush，实际没有提交，等于「测了个寂寞」。
+
 ### 修复（打包产物，均为「测试全绿但产物不可用」类缺陷）
 
 - **通用版 exe 在干净机器上启动即崩**：`ModuleNotFoundError: No module named 'aiomysql'`。

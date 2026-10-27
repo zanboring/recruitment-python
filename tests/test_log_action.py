@@ -107,3 +107,62 @@ class TestLogActionMasking:
         job_logs = [item for item in data["list"] if item["action"] == "新增岗位"]
         assert job_logs
         assert "<AsyncSession>" in job_logs[0]["params"]
+
+
+@pytest.mark.asyncio
+class TestLogIsolation:
+    """日志会话与业务会话必须隔离（2026-10-27 修复）。
+
+    原实现复用业务 session 并在 ``finally`` 里 ``commit``。它看起来"同事务更一致"，
+    实际有个反直觉后果：接口在「已改字段、尚未提交」时抛业务异常（如 400 参数
+    校验失败），``finally`` 的 commit 会把**那半截修改一起提交** ——
+    调用方收到失败，数据却变了。下面第一条用例锁死这个行为。
+    """
+
+    async def test_业务异常时半截修改不会被日志提交(self, db_session):
+        from sqlalchemy import select
+
+        from app.exceptions import AppException
+        from app.models.user import User
+        from app.utils.log_decorator import log_action
+        from app.utils.security import hash_password
+
+        # 模拟「改到一半就抛异常」的接口
+        db_session.add(
+            User(username="half_written", password=hash_password("x"), role="USER")
+        )
+        assert db_session.new, "前提：事务里确实有未提交的新增对象"
+
+        @log_action("角色调整")
+        async def failing_endpoint(db=None):
+            raise AppException("角色只能是 ADMIN 或 USER", 400)
+
+        with pytest.raises(AppException):
+            await failing_endpoint(db=db_session)
+
+        # 关键断言：不能因为写了操作日志就把业务改动带上去
+        await db_session.rollback()
+        rows = (
+            await db_session.execute(select(User).where(User.username == "half_written"))
+        ).scalars().all()
+        assert rows == [], "业务异常路径上，日志的 commit 把半截修改一起提交了"
+
+    async def test_日志写入独立会话(self, db_session):
+        """日志本身仍要能落下（隔离不等于不写）。"""
+        from sqlalchemy import select
+
+        from app.models.sys_log import SysLog
+        from app.utils.log_decorator import log_action
+
+        @log_action("独立会话探针")
+        async def ok_endpoint():
+            return "ok"
+
+        assert await ok_endpoint() == "ok"
+        rows = (
+            await db_session.execute(
+                select(SysLog).where(SysLog.action == "独立会话探针")
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].success == 1

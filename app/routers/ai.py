@@ -3,7 +3,6 @@ import json
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.ai_service import (
     call_ollama_stream, call_chat_stream, update_conversation_history,
@@ -11,7 +10,9 @@ from app.services.ai_service import (
 )
 from app.services.model_service import ModelService, compat_aliases
 from app.schemas.common import Result
-from app.database import get_db
+# SSE 接口不用 Depends(get_db)：流式响应在依赖清理之后才开始跑，
+# 详见 chat_stream 里 generate() 的注释。
+from app.database import async_session
 from app.dependencies import get_current_user
 from app.models.user import User
 
@@ -102,29 +103,41 @@ async def chat_local(request: ChatRequest, current_user: User = Depends(get_curr
 
 @router.post("/chat-stream")
 @router.post("/stream", include_in_schema=False)
-async def chat_stream(request: ChatRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+async def chat_stream(request: ChatRequest, current_user: User = Depends(get_current_user)):
     user_id = current_user.id
 
     async def generate():
-        # 两个 holder 由回调写入、由 sse_generator 读取：检索在首个分片之前完成，
-        # 因此「来源」能在正文之前发出；「元信息」在流结束后发出。
-        sources: list = []
-        meta: dict = {}
-        async for chunk in sse_generator(
-            call_chat_stream(
-                request.message, request.session_id, db, user_id,
-                on_sources=lambda items: sources.extend(items),
-                on_meta=lambda info: meta.update(info),
-            ),
-            request.session_id, request.message, user_id,
-            sources_holder=sources, meta_holder=meta,
-        ):
-            yield chunk
+        # 会话必须在**生成器内部**创建，不能靠 Depends(get_db)。
+        #
+        # StreamingResponse 的执行顺序是「先返回 response 对象，后迭代生成器」，
+        # 而依赖注入的清理（async with 退出、关闭 session）发生在 response 返回之前。
+        # 也就是说：流真正开始跑的时候，Depends 给的 session 已经被关掉了 ——
+        # 之后再用它查知识库、写 usage、写会话历史，会重新向池里借连接，
+        # 而依赖生命周期已结束，没有人再 close（单次流最长可达分钟级，
+        # 并发几个就能把 MySQL 的 pool_size 打满）。
+        #
+        # 同一个坑在 compat.py 的 _run_crawl_in_background 里已经踩过并修好，
+        # 这里当时漏改。写法保持一致，别再回退成 Depends。
+        async with async_session() as db:
+            # 两个 holder 由回调写入、由 sse_generator 读取：检索在首个分片之前完成，
+            # 因此「来源」能在正文之前发出；「元信息」在流结束后发出。
+            sources: list = []
+            meta: dict = {}
+            async for chunk in sse_generator(
+                call_chat_stream(
+                    request.message, request.session_id, db, user_id,
+                    on_sources=lambda items: sources.extend(items),
+                    on_meta=lambda info: meta.update(info),
+                ),
+                request.session_id, request.message, user_id,
+                sources_holder=sources, meta_holder=meta,
+            ):
+                yield chunk
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @router.post("/agent-stream")
-async def agent_stream(request: ChatRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+async def agent_stream(request: ChatRequest, current_user: User = Depends(get_current_user)):
     """ReAct 多步推理 Agent 入口。
 
     与 ``/chat-stream`` 的区别：前者是单步 Function Calling，这里让模型在
@@ -144,25 +157,28 @@ async def agent_stream(request: ChatRequest, db: AsyncSession = Depends(get_db),
 
     async def generate():
         full_answer = ""
-        async for event in run_agent_stream(request.message, db, user_id):
-            etype = event.get("type")
-            if etype == "step":
-                yield _sse_event("agent_step", {
-                    "step": event.get("step"),
-                    "thought": event.get("thought"),
-                    "action": event.get("action"),
-                    "args": event.get("args"),
-                })
-            elif etype == "observation":
-                yield _sse_event("agent_observation", {
-                    "step": event.get("step"),
-                    "content": event.get("content"),
-                })
-            elif etype == "answer":
-                full_answer = event.get("content", "")
-                yield f"data: {full_answer}\n\n"
-            elif etype == "meta":
-                yield _sse_event("meta", event)
+        # 同 chat_stream：会话必须在生成器内部创建，Depends 的会话在流开始前就已关闭。
+        # Agent 是多步循环，跑得更久，用错会话的后果比单轮更严重。
+        async with async_session() as db:
+            async for event in run_agent_stream(request.message, db, user_id):
+                etype = event.get("type")
+                if etype == "step":
+                    yield _sse_event("agent_step", {
+                        "step": event.get("step"),
+                        "thought": event.get("thought"),
+                        "action": event.get("action"),
+                        "args": event.get("args"),
+                    })
+                elif etype == "observation":
+                    yield _sse_event("agent_observation", {
+                        "step": event.get("step"),
+                        "content": event.get("content"),
+                    })
+                elif etype == "answer":
+                    full_answer = event.get("content", "")
+                    yield f"data: {full_answer}\n\n"
+                elif etype == "meta":
+                    yield _sse_event("meta", event)
         if request.session_id:
             await update_conversation_history(
                 request.session_id, request.message, full_answer, user_id

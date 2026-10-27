@@ -23,12 +23,13 @@
 会被原生的 `GET /api/knowledge/{knowledge_id}` 抢先匹配成 int 解析失败。
 """
 import asyncio
+import ipaddress
 import logging
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import List, Optional
 
-from fastapi import APIRouter, Body, Depends, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, func, select
@@ -422,8 +423,48 @@ async def compat_delete_user(
 # ============================================================ 认证（登录页依赖）
 
 
+def _assert_loopback(request: Request, action: str) -> None:
+    """免密类接口只允许**本机**访问。
+
+    为什么不能只判断 ``app_env != production``：默认配置就是 ``development``，
+    打包版双击即运行，这个条件形同虚设 —— 它描述的是"部署意图"，
+    而不是"谁在访问"。真正的边界是来源地址：本机浏览器（127.0.0.1 / ::1）
+    才允许免密，同一 WiFi 下的其他设备一律拒绝。
+
+    前端依赖这两个接口做静默登录（``api/http.ts`` 的 401 自动重试），
+    所以不能直接删掉，只能收紧来源。
+
+    注意：**不要在这里信任 ``X-Forwarded-For``**。请求头是客户端可伪造的，
+    拿它当判据等于自己开了个后门。真部署在反向代理后面时，
+    应该由代理把 ``request.client`` 设成可信值（uvicorn 的
+    ``--proxy-headers`` + ``--forwarded-allow-ips``），而不是读裸头。
+    """
+    client = request.client
+    if client is None:
+        # 测试用 ASGITransport 可能不填 client 信息；真实 uvicorn always 有
+        return
+    host = (client.host or "").strip()
+
+    # 必须用 ipaddress 判定，不能用 startswith("127.")：
+    # 「127.0.0.1.evil」这种串能骗过前缀匹配（单元测试抓到过）。
+    # 解析失败的一律拒绝 —— 认不出来的地址不该被当成"本机"。
+    is_loopback = False
+    if host:
+        try:
+            is_loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            is_loopback = host == "localhost"  # 名字回环，仅此一种
+
+    if not is_loopback:
+        raise AppException(
+            f"{action}仅限本机访问（当前来源：{host or '未知'}）。"
+            "如需从其他设备访问，请用账号密码登录。",
+            403,
+        )
+
+
 @router.get("/api/auth/default-username", deprecated=True)
-async def compat_default_username():
+async def compat_default_username(request: Request):
     """登录页表单预填用户名（仅用户名，不含密码）。
 
     **仅在非生产环境启用** —— 与相邻的 ``/api/auth/auto-login`` 同一个理由：
@@ -437,20 +478,32 @@ async def compat_default_username():
     if settings.app_env.lower() in {"production", "prod"}:
         raise AppException("生产环境已禁用该接口", 403)
 
+    _assert_loopback(request, "用户名预填接口")
+
     return Result.success({"username": "admin"})
 
 
 @router.post("/api/auth/auto-login", deprecated=True)
 @log_action("自动登录")
-async def compat_auto_login(db: AsyncSession = Depends(get_db)):
+async def compat_auto_login(request: Request, db: AsyncSession = Depends(get_db)):
     """开发/演示环境的免密登录，返回管理员 Token。
 
-    **仅在非生产环境启用**：生产（APP_ENV=production）直接 403。
-    这是对应 Java 版 `/auth/auto-login` 的兼容接口，用于前端路由守卫的
-    「静默登录」体验；生产环境绝不能出现无需凭证即可获得管理员 Token 的后门。
+    **两道门，缺一不可**：
+
+    1. ``APP_ENV=production`` → 403（部署方明确表示了这是生产环境）；
+    2. **来源必须是本机回环地址** → 否则 403。
+
+    第 2 道是这次补的。原先只有第 1 道，而 ``app_env`` 默认值是
+    ``development`` —— 也就是说「没有任何人配置过」的情况下它永远开着。
+    打包版是个双击即运行的单机软件，再叠上默认监听 0.0.0.0，
+    同一 WiFi 下任何人都能 `POST /api/auth/auto-login` 拿到管理员 token。
+
+    判定来源而不是判定环境，是因为**环境是意图，来源是事实**。
     """
     if settings.app_env.lower() in {"production", "prod"}:
         raise AppException("生产环境已禁用自动登录", 403)
+
+    _assert_loopback(request, "自动登录")
 
     result = await db.execute(select(User).where(User.role == "ADMIN").order_by(User.id))
     admin = result.scalars().first()

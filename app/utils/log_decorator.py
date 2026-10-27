@@ -6,9 +6,13 @@
   str() 后写进库（既无意义又可能抛异常）。
 - **敏感字段脱敏**：参数名含 password / pwd / token / secret 时统一写 ***。
 - **日志失败绝不影响业务**：整体 try/except 吞掉并记 warning。
-- **复用业务 session**：本项目的写操作 endpoint 都自行 commit，
-  装饰器在 endpoint 返回前追加一条 INSERT + commit，不破坏业务事务；
-  若业务抛异常导致 session 脏状态，写入失败也只记 warning。
+- **日志用独立会话写入**（2026-10-27 修正）：原先复用业务 session 并在
+  ``finally`` 里 ``commit``，看起来"同事务更一致"，实际有个反直觉的后果 ——
+  接口在「已改字段、尚未提交」时抛业务异常（如 400 参数校验失败），
+  finally 的 commit 会把**那半截修改一起提交**：调用方收到失败，数据却变了。
+  现在日志走自己的会话，业务事务完全不受影响。
+  代价是日志可能"先于"业务落库（业务随后回滚时日志仍在），
+  但操作日志本就是旁路记录，这个取舍是对的。
 
 用法（注意顺序：log_action 放在 @router 之后、async def 之前）：
 
@@ -35,6 +39,24 @@ _MAX_PARAMS_LEN = 2000
 _SENSITIVE_HINTS = ("password", "passwd", "pwd", "token", "secret", "api_key")
 
 _MASK = "***"
+
+# 会话工厂可注入，便于测试指向内存库而不触碰真实数据库
+# （与 app/services/usage_service.py 同一模式，保持两处一致）
+_session_factory = None
+
+
+def set_session_factory(factory) -> None:
+    """注入操作日志的会话工厂（测试用）。默认走 ``app.database.async_session``。"""
+    global _session_factory
+    _session_factory = factory
+
+
+def _get_session_factory():
+    if _session_factory is not None:
+        return _session_factory
+    from app.database import async_session
+
+    return async_session
 
 
 def _is_sensitive(key: str) -> bool:
@@ -121,11 +143,13 @@ def log_action(action: str):
                 error_msg = str(e)[:1000]
                 raise
             finally:
-                db = kwargs.get("db")
-                if db is not None:
-                    try:
-                        uri, ip = _extract_request_info(kwargs)
-                        db.add(
+                try:
+                    uri, ip = _extract_request_info(kwargs)
+                    # 独立会话：绝不碰业务 session，避免在异常路径上
+                    # 把「已改未提交」的半截修改顺手提交掉。
+                    factory = _get_session_factory()
+                    async with factory() as log_db:
+                        log_db.add(
                             SysLog(
                                 username=_extract_username(kwargs),
                                 action=action,
@@ -137,9 +161,9 @@ def log_action(action: str):
                                 error_msg=error_msg,
                             )
                         )
-                        await db.commit()
-                    except Exception as e:  # noqa: BLE001 - 日志失败不能影响业务
-                        logger.warning("写入操作日志失败（不影响业务）：%s", e)
+                        await log_db.commit()
+                except Exception as e:  # noqa: BLE001 - 日志失败不能影响业务
+                    logger.warning("写入操作日志失败（不影响业务）：%s", e)
 
         return wrapper
 

@@ -28,8 +28,8 @@ from app.utils.timeutil import utc_now
 # --------------------------------------------------------------------------
 
 
-@pytest.fixture
-def multi_platform_jobs(db_session):
+@pytest_asyncio.fixture
+async def multi_platform_jobs(db_session):
     """两个平台 × 三个城市的岗位样本（只在架岗位参与统计）。"""
     rows = [
         # (title, city, source_site, status)
@@ -57,7 +57,7 @@ def multi_platform_jobs(db_session):
             job_desc=title,
             last_seen_at=utc_now(),
         ))
-    db_session.commit()
+    await db_session.commit()
 
 
 # --------------------------------------------------------------------------

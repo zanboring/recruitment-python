@@ -1,14 +1,19 @@
 # -*- coding: utf-8 -*-
 """技能画像服务测试：覆盖率 / 缺口技能 / 匹配排序 / 别名归一化。"""
 import pytest
+import pytest_asyncio
 
 from app.models.job import Job
 from app.services import skill_profile
 from app.utils.job_key import generate_job_key
 
 
-@pytest.fixture
-def profile_jobs(db_session):
+# 必须是 async 夹具且 await commit：原先写成同步 def 里调 db_session.commit()，
+# 拿到的是协程对象、**从未被 await**（pytest 报 RuntimeWarning 就是这个）——
+# 数据能查到只是因为 SQLAlchemy 的 autoflush 把待提交对象刷进了同一事务，
+# 一旦换掉 autoflush 或断言走到独立会话，这些用例就会静默变成"测了个寂寞"。
+@pytest_asyncio.fixture
+async def profile_jobs(db_session):
     """构造覆盖不同技能组合的岗位。"""
     rows = [
         # (title, company, city, salary, skills)
@@ -33,7 +38,7 @@ def profile_jobs(db_session):
             skills=skills,
             job_desc=title,
         ))
-    db_session.commit()
+    await db_session.commit()
 
 
 def test_normalize_skill_alias():

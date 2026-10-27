@@ -84,6 +84,7 @@ import { computed, ref } from 'vue';
 import { OfficeBuilding, Location, Reading, Clock, Document, Link, Search } from '@element-plus/icons-vue';
 import { isPreciseJobSourceUrl } from '@/utils/jobSourceUrl';
 import { getJobDetailHtml } from '@/api/job';
+import { sanitizeSnapshotHtml } from '../utils/sanitize';
 
 interface JobItem {
   id: number; title: string; companyName?: string; sourceSite: string;
@@ -105,17 +106,16 @@ const hasDetailHtml = computed(() => {
   return props.job.detailHtml != null && props.job.detailHtml.trim().length > 0;
 });
 
-/** 净化HTML内容，防止XSS */
-const sanitizeHtml = (html: string) => {
-  if (!html) return '';
-  // 简单净化：移除script标签和on事件属性
-  return html
-    .replace(/<script[^>]*>.*?<\/script>/gis, '')
-    .replace(/\s+on\w+\s*=\s*["'][^"']*["']/gi, '')
-    .replace(/\s+on\w+\s*=\s*[^"'\s>]+/gi, '');
-};
-
-const sanitizedDetailHtml = computed(() => sanitizeHtml(localDetailHtml.value));
+/**
+ * 详情快照消毒：**最严格档**，连内联 style 都剥掉。
+ *
+ * 这里是第三方页面快照（原平台详情页），内容完全不受我们控制：
+ * 一段 `style="position:fixed;inset:0;z-index:99999"` 就能做全屏钓鱼遮罩，
+ * 所以宁可牺牲还原度（由外层 .local-detail-content 的 CSS 兜底排版），
+ * 也不放行 style。原实现只删 script 和 on* 属性，`<iframe src=//evil>`、
+ * `<meta http-equiv=refresh>` 全部能过。详见 utils/sanitize.ts
+ */
+const sanitizedDetailHtml = computed(() => sanitizeSnapshotHtml(localDetailHtml.value));
 
 // ===== 计算属性 =====
 

@@ -1,0 +1,56 @@
+# ============================================================
+#  声明式数据源示例：quotes.toscrape.com
+# ------------------------------------------------------------
+#  这是一个专门给爬虫练习用的站点（robots.txt 允许抓取），
+#  用它演示「不改一行 Python，只加这个文件就能接入新数据源」。
+#
+#  复制本文件改几处，就是一个新数据源：
+#    1. site / label / url
+#    2. list.container  列表项的选择器
+#    3. list.fields     字段名 → 抽取表达式
+#    4. pagination      分页方式
+#  然后重启服务即可，app/crawlers/specs/*.yaml 会被自动加载。
+# ============================================================
+
+site: quotes_demo
+label: 名言示例站（爬虫练习用）
+
+# 请求参数：可在 URL 模板里用 {name} 引用
+# type 目前仅用于文档说明，运行期按字符串渲染
+inputs:
+  keyword:
+    label: 未使用（该站不支持搜索）
+    default: ""
+
+request:
+  url: "https://quotes.toscrape.com/page/{page}/"
+  method: GET
+  render: false          # true 则用 Playwright 渲染（JS 站点才需要）
+  timeout: 30
+  headers:
+    Referer: "https://quotes.toscrape.com/"
+
+pagination:
+  type: page_param       # page_param（页码）| next_link（下一页链接）| none
+  start: 1
+  max_pages: 2           # 演示只翻 2 页，避免给别人站点添压力
+
+list:
+  container: "div.quote"
+  fields:
+    # 语法：css::text | css::html | css::attr(x)；末尾加 [] 表示取全部
+    text: "span.text::text"
+    author: "small.author::text"
+    author_link: "small.author ~ a::attr(href)"
+    tags: "div.tags a.tag::text[]"
+
+limits:
+  max_items: 20
+  min_interval: 2.0      # 每页之间至少等 2 秒
+
+# 输出映射
+#   generic → 原样输出抽取到的字段（适合先看效果，或接自定义表）
+#   job     → 按 field_map 映射到 Job 模型字段（复用现有分析与可视化）
+mapping:
+  target: generic
+  field_map: {}

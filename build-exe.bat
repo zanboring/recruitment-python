@@ -44,15 +44,20 @@ echo 校验运行时依赖...
 rem ---- 4. 执行打包 ----
 ".venv\Scripts\python.exe" -m PyInstaller recsys.spec --noconfirm
 
-rem ---- 5. 打包后校验：关键驱动确实进了产物 ----
-rem  校验「装了的依赖」还不够 —— 要确认它们真的被 PyInstaller 收进 _internal，
-rem  否则仍然会在目标机器上 ModuleNotFoundError。
-for %%M in (aiosqlite aiomysql asyncpg) do (
-    if not exist "dist\RecSys\_internal\%%M" (
-        echo [错误] %%M 未打进产物：dist\RecSys\_internal\%%M 不存在
-        pause
-        exit /b 1
-    )
+rem ---- 5. 打包后校验：依赖真的进了产物 ----
+rem  2026-10-26 修正：原判据「dist\RecSys\_internal\<模块> 是否存在」对纯 Python 包必然为假。
+rem  原因：纯 Python 包被打进 exe 内嵌的 PYZ 归档，不产生 _internal 目录；
+rem        只有带 C 扩展的包（asyncpg / pydantic_core）才会落成 _internal\<模块>\。
+rem  实测：原判据会让「打包成功」被误报为失败（aiosqlite / aiomysql 永远「不存在」），
+rem        而产物实际启动正常、GET / 返回 200。
+rem  现改为调用 scripts\check_bundle.py，用 PyInstaller 官方 API 直接读 PYZ，对两类包都成立。
+echo 校验产物完整性...
+".venv\Scripts\python.exe" "scripts\check_bundle.py"
+if errorlevel 1 (
+    echo.
+    echo [错误] 产物校验未通过，不要发布。请修复上面标 [错误] 的项。
+    pause
+    exit /b 1
 )
 
 echo.

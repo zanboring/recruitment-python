@@ -24,6 +24,13 @@ email-validator==2.2.0
 httpx==0.27.0
 beautifulsoup4==4.12.3
 lxml
+# 声明式数据源（app/crawlers/specs/*.yaml）需要 YAML 解析。
+# 注意：此前 PyYAML 只是被其他包间接带入而「碰巧可用」，
+# 没有显式声明 —— 换环境时可能导致 spec 全部加载失败。
+PyYAML==6.0.3
+# brotli 解码器：请求头声明 Accept-Encoding 含 br 时，没有它就拿不到可读内容。
+# 详见 app/crawlers/spec_crawler.py 的 _supported_encodings() 注释。
+brotli==1.2.1
 playwright
 openpyxl==3.1.5
 python-multipart==0.0.9

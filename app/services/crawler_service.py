@@ -26,7 +26,7 @@ from app.crawlers.cleaner import (
     is_invalid_job,
     is_senior_job,
 )
-from app.crawlers.registry import SUPPORTED_PLATFORMS, get_crawler, probe_url
+from app.crawlers.registry import SUPPORTED_PLATFORMS, display_label, get_crawler, probe_url
 from app.crawlers.throttle import await_domain_slot, daily_quota
 from app.models.crawl_task import CrawlTask
 from app.models.job import Job
@@ -131,7 +131,7 @@ def platform_label(raw) -> str:
     for part in parts:
         key = normalize_platform(part)
         meta = PLATFORM_META.get(key)
-        labels.append(meta["label"] if meta else key)
+        labels.append(meta["label"] if meta else display_label(key))
     return "、".join(labels)
 
 
@@ -148,7 +148,7 @@ def platform_options() -> list:
     return [
         {
             "value": key,
-            "label": PLATFORM_META.get(key, {}).get("label", key),
+            "label": PLATFORM_META.get(key, {}).get("label") or display_label(key),
             "implemented": key in SUPPORTED_PLATFORMS,
         }
         for key in keys
@@ -161,8 +161,34 @@ def _utc_now():
     return utc_now()
 
 
+def normalize_job(job_data: dict) -> dict:
+    """入库前补齐薪资字段（``min_salary`` / ``max_salary``）。
+
+    **为什么必须有这一步**：各爬虫的输出契约并不一致 —— ``job51`` 在 ``crawl()``
+    内部就调用了 ``clean_job_data``（自带 min/max），而 ``boss`` 只产出原始
+    ``salary`` 字符串（"15-25K"）。``save_job`` 按 ``job_data["min_salary"]`` 取
+    值，于是 BOSS 的**每一条新岗位**都抛 ``KeyError: 'min_salary'``，整个任务被
+    外层标成 FAILED；而库里已存在的岗位走 update 分支不碰该键，所以「抓到的全是
+    老岗位」时反而看起来成功，故障被完美掩盖。
+
+    归一化放在服务层（入库的唯一入口）而不是各爬虫里：新增爬虫不必记得调用，
+    契约由这里统一保证。已有 min/max 的数据原样返回，避免二次
+    ``clean_job_data`` 把 job51 算好的值按空 salary 覆盖成 0。
+    """
+    if job_data.get("min_salary") is not None and job_data.get("max_salary") is not None:
+        return job_data
+    # clean_job_data 内部对每个字段做 .strip()，None 会抛 AttributeError，先兜一层
+    safe = {k: ("" if v is None else v) for k, v in job_data.items()}
+    return clean_job_data(safe)
+
+
 async def save_job(db: AsyncSession, job_data: dict) -> bool:
-    """保存单个岗位。已存在则只刷新状态与 last_seen_at，返回 False。"""
+    """保存单个岗位。已存在则只刷新状态与 last_seen_at，返回 False。
+
+    :param job_data: 必须已过 :func:`normalize_job`（含 min_salary / max_salary）。
+        这里仍用 ``.get`` 兜底而不是下标：一次字段缺失不该让整批 50 条全部回滚，
+        但缺字段本身要留 warn 以便定位是哪个爬虫没遵守契约。
+    """
     existing = await db.execute(select(Job).where(Job.job_key == job_data["job_key"]))
     job = existing.scalar_one_or_none()
     if job:
@@ -171,19 +197,19 @@ async def save_job(db: AsyncSession, job_data: dict) -> bool:
         return False
 
     job = Job(
-        title=job_data["title"],
-        company_name=job_data["company_name"],
-        source_site=job_data["source_site"],
+        title=job_data.get("title", ""),
+        company_name=job_data.get("company_name", ""),
+        source_site=job_data.get("source_site", ""),
         job_key=job_data["job_key"],
         job_status="NEW",
-        city=job_data["city"],
-        experience=job_data["experience"],
-        education=job_data["education"],
-        min_salary=job_data["min_salary"],
-        max_salary=job_data["max_salary"],
-        skills=job_data["skills"],
+        city=job_data.get("city", ""),
+        experience=job_data.get("experience", ""),
+        education=job_data.get("education", ""),
+        min_salary=job_data.get("min_salary") or 0,
+        max_salary=job_data.get("max_salary") or 0,
+        skills=job_data.get("skills", ""),
         url=job_data.get("url", ""),
-        job_desc=job_data["description"],
+        job_desc=job_data.get("description", ""),
         last_seen_at=_utc_now(),
     )
     db.add(job)
@@ -299,6 +325,9 @@ async def _crawl_platform(db: AsyncSession, keyword: str, city: str, platform: s
     seen_keys: list = []
 
     for job_data in jobs:
+        # 各爬虫输出契约不一致（boss 只给 salary，job51 已算好 min/max），
+        # 入库前统一补齐 —— 否则 boss 的新岗位全部 KeyError。
+        job_data = normalize_job(job_data)
         title = job_data.get("title", "")
         experience = job_data.get("experience", "")
         description = job_data.get("description", "")
@@ -436,7 +465,11 @@ async def run_crawl(
         seen_keys: list = []
         crawled_platforms: list = []
 
-        for platform in platforms:
+        # 必须遍历 runnable（已归一化 + 已过滤）而不是原始 platforms：
+        # 传「BOSS直聘」时 normalize_platforms 会得到 "boss"，但原始列表里仍是中文，
+        # `platform not in SUPPORTED_PLATFORMS` 恒真 → 全部跳过 → 任务 COMPLETED / 0 条，
+        # 且不写任何说明，前端只看到「已完成」。归一化了却不用，等于没归一化。
+        for platform in runnable:
             if platform not in SUPPORTED_PLATFORMS:
                 logger.warning("平台 %s 尚未实现，跳过", platform)
                 continue

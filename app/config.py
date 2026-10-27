@@ -219,6 +219,17 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev_only_jwt_secret_change_in_production"
     jwt_expiration: int = 86400000
 
+    # ---- 初始管理员口令 ----
+    # 留空表示「按环境取默认」，由 ``app/init_data.py`` 决定：
+    #   development → 沿用本地默认口令（不打断开发/演示流程）
+    #   production  → **随机生成**并写入 ``data/admin-initial-password.txt``
+    #
+    # 为什么不能只靠"代码里写死一个默认口令"：
+    # 源码一旦公开（本项目有 GitHub 公开版），默认口令就是**全员已知凭据**；
+    # 再叠加「默认监听局域网 + 免密登录接口」，等于把管理员权限直接送出去。
+    # 所以生产环境既不用固定值，也不在日志里打印明文 —— 只给文件路径。
+    admin_initial_password: str = ""
+
     # ---- AI 对话模型（OpenAI 兼容协议）----
     # 主服务商：deepseek（默认）| zhipu。另一个自动作为备选，
     # 实现「多供应商容灾」—— 主服务商密钥过期或额度用尽时链路不中断。
@@ -521,11 +532,48 @@ os.environ.update(_env_overrides)
 settings = Settings()
 
 
+# 仓库里出现过的/文档里写过的「默认密钥」集中登记，生产环境一律拒绝。
+#
+# 只判「等于 dev 默认值 + 长度 < 32」是不够的：docker-compose 的兜底值
+# change_me_to_a_long_random_secret_for_production 长 48 字符，能轻松穿过长度门，
+# 而它是**源码里公开的常量** —— 任何读过仓库的人都能离线签发任意 role 的 token。
+#
+# 而且**枚举具体值会继续漏**：config.template.env 里还有第三个变体
+# （change_me_to_a_long_random_secret_32chars_min）。所以采用「特征片段 + 精确值」
+# 双判据：片段负责拦住"同类但写法不同"的默认值，精确值兜住历史遗留。
+_WEAK_SECRET_MARKERS = (
+    "change_me",
+    "changeme",
+    "dev_only",
+    "your_secret",
+    "your-secret",
+    "your_jwt",
+    "placeholder",
+    "example_secret",
+    "secret_key_here",
+)
+
+_KNOWN_WEAK_JWT_SECRETS = frozenset({
+    "dev_only_jwt_secret_change_in_production",
+    "change_me_to_a_long_random_secret_for_production",
+    "change_me_to_a_long_random_secret_32chars_min",
+    "your_secret_key",
+    "change_me",
+    "secret",
+})
+
+
 def validate_production_settings() -> None:
-    """Fail early instead of serving production traffic with demo secrets."""
+    """生产环境启动前做 fail-fast 校验，而不是带着演示密钥对外服务。"""
     if settings.app_env.lower() not in {"production", "prod"}:
         return
-    if settings.jwt_secret == "dev_only_jwt_secret_change_in_production":
-        raise RuntimeError("JWT_SECRET must be configured in production")
-    if len(settings.jwt_secret) < 32:
+
+    secret = (settings.jwt_secret or "").strip()
+    lowered = secret.lower()
+    if secret in _KNOWN_WEAK_JWT_SECRETS or any(m in lowered for m in _WEAK_SECRET_MARKERS):
+        raise RuntimeError(
+            "JWT_SECRET 仍是仓库中公开的默认值，生产环境必须替换。"
+            "生成方式：python -c \"import secrets;print(secrets.token_urlsafe(48))\""
+        )
+    if len(secret) < 32:
         raise RuntimeError("JWT_SECRET must be at least 32 characters in production")

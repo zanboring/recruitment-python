@@ -27,7 +27,7 @@
       </div>
       <div class="message-content">
         <div class="message-text" v-if="message.role === 'user'">{{ message.content }}</div>
-        <div class="message-text markdown-body" v-else v-html="sanitizeHtml(renderMarkdown(message.content))"></div>
+        <div class="message-text markdown-body" v-else v-html="sanitizeChatHtml(renderMarkdown(message.content))"></div>
 
         <!--
           引用来源：由后端 SSE `event: sources` 透出。
@@ -92,24 +92,13 @@ import { ref } from 'vue';
 import { User, ChatLineRound, Loading, CircleCloseFilled, Check, Document } from '@element-plus/icons-vue';
 import WelcomeMessage from './WelcomeMessage.vue';
 import { renderMarkdown } from '../utils/markdownRenderer';
+// 消毒统一走 DOMPurify 白名单。原先这里是一段正则黑名单（只剥 script 与 on* 属性），
+// 挡不住 `<svg/onload=...>`、`<img src=x onerror=...>`、`java&#9;script:` ——
+// 而 AI 回答的内容来源是爬来的岗位原文，属于不可信输入。详见 utils/sanitize.ts
+import { sanitizeChatHtml } from '../utils/sanitize';
 // 复用 store 里的消息类型，避免组件自己再声明一份而漏掉新字段
 // （sources / meta 由 SSE 具名事件填充，本地重复声明会让它们「悄悄丢失」）
 import type { Message, ChatMeta } from '@/store/chat';
-
-// [安全优化] HTML消毒函数 - 移除script标签和事件属性，防止XSS攻击
-// 建议后续安装 DOMPurify (npm install dompurify @types/dompurify) 替代此简易实现
-function sanitizeHtml(html: string): string {
-  if (!html) return '';
-  return html
-    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-    .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, '')
-    .replace(/<iframe\b[^<]*(?:(?!<\/iframe>)<[^<]*)*<\/iframe>/gi, '')
-    .replace(/<object\b[^<]*(?:(?!<\/object>)<[^<]*)*<\/object>/gi, '')
-    .replace(/<embed\b[^>]*>/gi, '')
-    .replace(/javascript\s*:/gi, '')
-    .replace(/vbscript\s*:/gi, '')
-    .replace(/data\s*:\s*text\/html/gi, '');
-}
 
 /** 降级层级对应的标签颜色：本地与兜底要与云端区分开，用户才知道看到的是降级结果。 */
 function metaTagType(tier?: string): 'success' | 'warning' | 'danger' | 'info' {

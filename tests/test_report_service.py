@@ -1,14 +1,18 @@
 """自动化日报模块测试：幂等、统计、Excel、AI 摘要降级、API 链路。"""
 import json
 import pytest
+import pytest_asyncio
 
 from app.models.job import Job
 from app.services import report_service
 from app.utils.timeutil import utc_now
 
 
-@pytest.fixture
-def sample_jobs(db_session):
+# 必须 async + await：同步 fixture 里调 db_session.commit() 只会创建一个协程，
+# 从未被 await（pytest 的 RuntimeWarning 就是指这个）。数据能查到仅因 autoflush，
+# 一旦断言走到独立会话就会静默变成"测了个寂寞"。
+@pytest_asyncio.fixture
+async def sample_jobs(db_session):
     """插入少量岗位样本，供日报统计使用。"""
     from app.utils.job_key import generate_job_key
 
@@ -37,7 +41,7 @@ def sample_jobs(db_session):
         )
         db_session.add(job)
         jobs.append(job)
-    db_session.commit()
+    await db_session.commit()
     return jobs
 
 

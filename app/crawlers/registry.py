@@ -13,12 +13,19 @@ from typing import Dict, List, Type
 from app.crawlers.base import BaseCrawler
 from app.crawlers.boss import BossCrawler
 from app.crawlers.job51 import Job51Crawler
+from app.crawlers.spec_crawler import SpecCrawler
+from app.crawlers.spec_schema import load_all_specs
 
 # 平台标识 → 爬虫类。标识与 ``crawler_service.PLATFORM_META`` 的键保持一致。
 CRAWLER_REGISTRY: Dict[str, Type[BaseCrawler]] = {
     "boss": BossCrawler,
     "51job": Job51Crawler,
 }
+
+# ---- 声明式数据源（app/crawlers/specs/*.yaml）----
+# 加一个 yaml 就多一个数据源，不需要新增 Python 类。
+# 加载失败的文件会被跳过并记 error，不影响其他源与其他爬虫。
+SPECS = load_all_specs()
 
 # 各平台用于「合规探针」与「域名节流」的代表性地址。
 # robots.txt 按域名生效，所以取该平台实际要访问的那个域名上的页面即可。
@@ -27,13 +34,34 @@ PLATFORM_PROBE_URLS: Dict[str, str] = {
     "51job": "https://we.51job.com/pc/search",
 }
 
+# 声明式数据源的探针地址由 url 模板渲染成真实地址（去掉 {page} 之类的占位符）
+for _site, _spec in SPECS.items():
+    try:
+        PLATFORM_PROBE_URLS[_site] = _spec.render_url(_spec.build_params())
+    except Exception:  # noqa: BLE001
+        # 渲染失败不影响数据源本身可用，只是缺少合规探针
+        PLATFORM_PROBE_URLS.setdefault(_site, "")
+
 
 def probe_url(platform: str) -> str:
     """取平台的合规探针地址；未登记时返回空串（调用方据此跳过该平台的合规与节流检查）。"""
     return PLATFORM_PROBE_URLS.get(platform, "")
 
-# 已实现抓取的平台集合（由注册表派生，避免两处维护）
-SUPPORTED_PLATFORMS = frozenset(CRAWLER_REGISTRY)
+
+# 已实现抓取的平台集合（由注册表 + 声明式规格派生，避免多处维护）
+SUPPORTED_PLATFORMS = frozenset(CRAWLER_REGISTRY) | frozenset(SPECS)
+
+
+def display_label(platform: str) -> str:
+    """单个平台的展示名。
+
+    注意与 ``crawler_service.platform_label`` 的区别：那个处理**逗号分隔的
+    多平台**并拼接，这里只处理单个标识。早先两边同名，导致声明式数据源
+    的 label 被静默覆盖成英文标识 —— 命名必须能区分职责。
+    """
+    if platform in SPECS:
+        return SPECS[platform].label
+    return platform
 
 
 def get_crawler(platform: str) -> BaseCrawler:
@@ -43,6 +71,8 @@ def get_crawler(platform: str) -> BaseCrawler:
     做前置校验并给出明确原因，而不是在这里静默回退到别的平台
     （回退会让「选 51job」变成一个悄悄爬 BOSS 的任务，数据记在错误平台名下）。
     """
+    if platform in SPECS:
+        return SpecCrawler(SPECS[platform])
     return CRAWLER_REGISTRY[platform]()
 
 
