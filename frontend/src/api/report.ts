@@ -59,7 +59,7 @@ export interface PushResult {
 }
 
 /** 手动生成当日日报（管理员） */
-export function generateReportApi() {
+export function generateReportApi(): Promise<{ status: string; id?: number }> {
   return http.post('/api/reports/generate');
 }
 

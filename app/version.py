@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 APP_NAME = "RecSys"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 # 版本号形如 1.2.3，可选带 -beta.1 这类预发布后缀
 _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+](.*))?$")

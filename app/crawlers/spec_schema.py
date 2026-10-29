@@ -13,8 +13,10 @@
 能覆盖什么、不能覆盖什么（诚实边界）
 ------------------------------------
 能（纯配置即可）：
-  · 静态或 JS 渲染的**列表页 + 详情页**
-  · 分页：页码参数 / 下一页链接 / 滚动加载
+  · 静态或 JS 渲染的列表页；可选的**详情页补齐**（``detail.*``，受
+    ``detail.max_items`` 与 ``limits.max_items`` 双重约束 —— 见
+    docs/data-source-plugin.md §六）
+  · 分页：页码参数 / 下一页链接（滚动加载尚未实现）
   · 字段抽取：CSS 选择器、取文本或属性、正则后处理
   · 限速、单次上限、合规探针
 
@@ -44,6 +46,28 @@ SPEC_DIR = Path(__file__).parent / "specs"
 
 # 站点标识只允许字母数字下划线中划线，避免被当作路径或注入
 _SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,48}$")
+
+# ``mapping.field_map`` 的取值域：Job 入库链路能接收的标准字段。
+# 键 = 标准字段名（左），值 = YAML ``list.fields`` / ``detail.fields`` 里的字段名（右）。
+# 方向选「标准字段 → 抽取字段」而不是反过来：目标 schema 是固定的，
+# 这样加载期就能把写错的键名挡下来，而不是等入库时才静默丢字段。
+JOB_STANDARD_FIELDS = (
+    "title",
+    "company_name",
+    "city",
+    "experience",
+    "education",
+    "salary",
+    "min_salary",
+    "max_salary",
+    "description",
+    "url",
+    "skills",
+)
+
+# 薪资字段单独处理：``salary`` 是文本（交给既有解析器归一），
+# ``min_salary`` / ``max_salary`` 是数值，二者取其一即可。
+JOB_SALARY_FIELDS = ("salary", "min_salary", "max_salary")
 
 
 class SpecError(ValueError):
@@ -130,6 +154,9 @@ class CrawlSpec:
     detail_enabled: bool = False
     detail_link_field: str = ""
     detail_fields: List[FieldSpec] = field(default_factory=list)
+    # 一次抓取里最多请求多少个详情页；0 = 不抓详情（未配置 detail 时的默认行为）。
+    # 这是防「列表 100 条 × 每条详情」把目标站点打爆的第一层闸门。
+    detail_max_items: int = 0
 
     # 限额
     max_items: int = 100
@@ -184,6 +211,27 @@ class CrawlSpec:
         for f in detail_fields:
             f.parse_expr()
 
+        detail_enabled = bool(detail.get("enabled", False))
+        detail_link_field = str(detail.get("link_field") or "").strip()
+        # 未写 detail.max_items 时默认 10（仅在 enabled 时生效）；
+        # 显式写 0 表示「知道有详情页，但这次不抓」。
+        detail_max_raw = detail.get("max_items", 10)
+        try:
+            detail_max_items = max(0, int(detail_max_raw))
+        except (TypeError, ValueError):
+            raise SpecError(
+                f"{where}detail.max_items 必须是整数，收到 {detail_max_raw!r}"
+            )
+        if detail_enabled and not detail_link_field:
+            raise SpecError(
+                f"{where}detail.enabled=true 但缺少 detail.link_field"
+                f"（取值应为 list.fields 里存放详情页链接的字段名）"
+            )
+        if detail_enabled and not detail_fields:
+            raise SpecError(
+                f"{where}detail.enabled=true 但 detail.fields 为空 —— 抓详情页却没有任何字段要取"
+            )
+
         pg = data.get("pagination") or {}
         limits = data.get("limits") or {}
         mapping = data.get("mapping") or {}
@@ -191,6 +239,43 @@ class CrawlSpec:
         target = str(mapping.get("target") or "generic").lower()
         if target not in ("generic", "job"):
             raise SpecError(f"{where}mapping.target 只能是 generic 或 job，收到 {target!r}")
+
+        field_map = {str(k): str(v) for k, v in (mapping.get("field_map") or {}).items()}
+        if target == "job" and field_map:
+            # 加载期就挡下两类笔误，而不是等入库时才发现字段全是空的：
+            #   1) 左边写了不存在的标准字段（例如 company）；
+            #   2) 右边引用了 list/detail 里都不存在的抽取字段。
+            unknown_keys = sorted(set(field_map) - set(JOB_STANDARD_FIELDS))
+            if unknown_keys:
+                raise SpecError(
+                    f"{where}mapping.field_map 含未知标准字段：{', '.join(unknown_keys)}"
+                    f"（可用：{', '.join(JOB_STANDARD_FIELDS)}）"
+                )
+            # 只认真实会被抓取的来源：list.fields 恒可用；detail.fields 仅在
+            # 「enabled + link_field + max_items>0」时才会被执行器消费，
+            # 否则把它算进合法来源只会让用户配出一个「永远取到空值」的映射。
+            known_sources = {f.name for f in fields}
+            if detail_enabled and detail_link_field and detail_max_items > 0:
+                known_sources |= {f.name for f in detail_fields}
+            missing_sources = sorted(set(field_map.values()) - known_sources)
+            if missing_sources:
+                raise SpecError(
+                    f"{where}mapping.field_map 引用了不可用的抽取字段：{', '.join(missing_sources)}"
+                    f"（可用：{', '.join(sorted(known_sources))}；"
+                    f"detail.fields 需 detail.enabled + link_field + max_items>0 才可用）"
+                )
+        if target == "job":
+            # 没有 title 就生成不了 job_key，整行只能在入库前被丢掉。
+            # 这里只告警不报错：field_map 可能故意留空（走同名字段），
+            # 运行期会对确实缺失的行计数并写进任务说明，不会静默消失。
+            effective_title = field_map.get("title", "title")
+            # 详情页也可能提供 title（列表只给链接、标题在详情页里），故一并算上
+            known_names = {f.name for f in fields} | {f.name for f in detail_fields}
+            if effective_title not in known_names:
+                logger.warning(
+                    "%smapping.target=job 但没有任何字段映射到 title（期望抽取字段 %r），"
+                    "运行期所有条目都会因缺标题而无法入库", where, effective_title,
+                )
 
         return cls(
             site=site,
@@ -208,13 +293,14 @@ class CrawlSpec:
             pagination_start=int(pg.get("start", 1)),
             max_pages=max(1, int(pg.get("max_pages", 1))),
             next_selector=str(pg.get("next_selector") or ""),
-            detail_enabled=bool(detail.get("enabled", False)),
-            detail_link_field=str(detail.get("link_field") or ""),
+            detail_enabled=detail_enabled,
+            detail_link_field=detail_link_field,
             detail_fields=detail_fields,
+            detail_max_items=detail_max_items,
             max_items=max(1, int(limits.get("max_items", 100))),
             min_interval=float(limits.get("min_interval", 0.0) or 0.0),
             target=target,
-            field_map={str(k): str(v) for k, v in (mapping.get("field_map") or {}).items()},
+            field_map=field_map,
             source_path=source_path,
         )
 

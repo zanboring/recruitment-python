@@ -237,3 +237,276 @@ async def test_next_link_pagination_stops_when_no_next(monkeypatch):
     monkeypatch.setattr(crawler, "_fetch", fake_fetch)
     rows = await crawler.crawl()
     assert len(rows) == 2           # 只解析了第一页
+
+
+# --------------------------------------------------------------- 详情页抓取
+#
+# 这一组的重点是**请求量**：详情页最容易把「抓一个列表」变成「抓 N 个页面」，
+# 所以断言都落在「实际发出了几个请求」上，而不是「结果里有没有这个字段」。
+
+DETAIL_LIST_HTML = """
+<html><body>
+  <div class="item">
+    <a class="title" href="/job/1">岗位一</a><span class="company">列表公司一</span>
+  </div>
+  <div class="item">
+    <a class="title" href="/job/2">岗位二</a><span class="company">列表公司二</span>
+  </div>
+  <div class="item">
+    <a class="title" href="/job/3">岗位三</a><span class="company">列表公司三</span>
+  </div>
+</body></html>
+"""
+
+LIST_URL = "https://example.com/list"
+
+
+def detail_html(index: int) -> str:
+    return (
+        f"<html><body><h1>岗位{index}</h1>"
+        f'<div class="company">详情公司{index}</div>'
+        f'<div class="desc">岗位{index}的详细描述</div>'
+        "</body></html>"
+    )
+
+
+def make_detail_spec(detail=None, **over):
+    data = {
+        "site": "detail_site",
+        "label": "详情演示",
+        "url": LIST_URL,
+        "list": {
+            "container": "div.item",
+            "fields": {
+                "title": "a.title::text",
+                "company": "span.company::text",
+                "link": "a.title::attr(href)",
+            },
+        },
+        # 详情页：company 与列表同名（应被覆盖），description 只有详情页有
+        "detail": detail if detail is not None else {
+            "enabled": True,
+            "link_field": "link",
+            "max_items": 5,
+            "fields": {
+                "company": "div.company::text",
+                "description": "div.desc::text",
+            },
+        },
+        "pagination": {"type": "none"},
+        "limits": {"max_items": 10},
+    }
+    data.update(over)
+    return CrawlSpec.from_dict(data)
+
+
+class FetchRecorder:
+    """``_fetch`` 的替身：记录每一次请求，并按 URL 返回预置 HTML。
+
+    断言直接落在 ``calls`` 上 —— 「还能返回数据」不代表「没有继续请求」，
+    风控那条只能靠请求计数证明。
+    """
+
+    def __init__(self, list_html, detail_pages=None, fail_urls=(), blocked_urls=()):
+        self.list_html = list_html
+        self.detail_pages = detail_pages or {}
+        self.fail_urls = set(fail_urls)
+        self.blocked_urls = set(blocked_urls)
+        self.calls = []
+
+    async def __call__(self, url):
+        self.calls.append(url)
+        if url in self.blocked_urls:
+            return "<html><body>请完成安全验证（滑块）</body></html>"
+        if url in self.fail_urls:
+            raise TimeoutError(f"timeout: {url}")
+        return self.detail_pages.get(url, self.list_html)
+
+    @property
+    def detail_calls(self):
+        return [u for u in self.calls if "/job/" in u]
+
+
+def all_detail_pages():
+    return {f"{LIST_URL.replace('/list', '')}/job/{i}": detail_html(i) for i in (1, 2, 3)}
+
+
+async def test_detail_fields_override_same_name_and_keep_list_values(monkeypatch):
+    """详情页字段覆盖列表同名字段；详情页取不到的一律保留列表原值。"""
+    crawler = SpecCrawler(make_detail_spec())
+    rec = FetchRecorder(DETAIL_LIST_HTML, detail_pages=all_detail_pages())
+    monkeypatch.setattr(crawler, "_fetch", rec)
+
+    rows = await crawler.crawl()
+
+    assert len(rows) == 3
+    assert rows[0]["title"] == "岗位一"            # 列表页字段保留
+    assert rows[0]["company"] == "详情公司1"        # 同名字段被详情页覆盖
+    assert rows[0]["description"] == "岗位1的详细描述"
+
+
+async def test_detail_relative_link_is_joined_to_absolute_url(monkeypatch):
+    """列表里的 href 常是 ``/job/1``，必须 urljoin 成绝对地址再请求。"""
+    crawler = SpecCrawler(make_detail_spec())
+    rec = FetchRecorder(DETAIL_LIST_HTML, detail_pages=all_detail_pages())
+    monkeypatch.setattr(crawler, "_fetch", rec)
+
+    await crawler.crawl()
+
+    assert "https://example.com/job/1" in rec.detail_calls
+    assert "/job/1" not in rec.calls             # 绝对不能拿相对路径直接发请求
+
+
+async def test_detail_requests_capped_by_detail_max_items(monkeypatch):
+    """detail.max_items=2 时，第 3 条不再抓详情（保留列表页字段）。"""
+    spec = make_detail_spec(detail={
+        "enabled": True, "link_field": "link", "max_items": 2,
+        "fields": {"description": "div.desc::text"},
+    })
+    crawler = SpecCrawler(spec)
+    rec = FetchRecorder(DETAIL_LIST_HTML, detail_pages=all_detail_pages())
+    monkeypatch.setattr(crawler, "_fetch", rec)
+
+    rows = await crawler.crawl()
+
+    assert len(rows) == 3
+    assert len(rec.detail_calls) == 2
+    assert rows[2]["company"] == "列表公司三"
+    assert "description" not in rows[2]
+
+
+async def test_detail_requests_capped_by_total_max_items(monkeypatch):
+    """总上限也管详情：limits.max_items=1 时只允许 1 个详情请求。"""
+    spec = make_detail_spec(limits={"max_items": 1})
+    crawler = SpecCrawler(spec)
+    rec = FetchRecorder(DETAIL_LIST_HTML, detail_pages=all_detail_pages())
+    monkeypatch.setattr(crawler, "_fetch", rec)
+
+    rows = await crawler.crawl()
+
+    assert len(rows) == 1
+    assert len(rec.detail_calls) == 1
+
+
+async def test_detail_request_throttled_by_interval(monkeypatch):
+    """每条详情请求前都要等 ``_interval()`` —— 不因"就三条"跳过。"""
+    crawler = SpecCrawler(make_detail_spec())
+    rec = FetchRecorder(DETAIL_LIST_HTML, detail_pages=all_detail_pages())
+    monkeypatch.setattr(crawler, "_fetch", rec)
+
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+
+    await crawler.crawl()
+
+    assert len(sleeps) == len(rec.detail_calls) == 3
+
+
+async def test_single_detail_failure_keeps_that_row_and_others_work(monkeypatch):
+    """单条详情超时只影响这一条，其余照常补齐，失败条数进说明条目。"""
+    crawler = SpecCrawler(make_detail_spec())
+    rec = FetchRecorder(
+        DETAIL_LIST_HTML,
+        detail_pages=all_detail_pages(),
+        fail_urls={"https://example.com/job/2"},
+    )
+    monkeypatch.setattr(crawler, "_fetch", rec)
+
+    rows = await crawler.crawl()
+
+    assert len(rows) == 3
+    assert rows[1]["company"] == "列表公司二"     # 失败条目保留列表值
+    assert "description" not in rows[1]
+    assert rows[2]["description"] == "岗位3的详细描述"
+    assert any("失败 1 条" in n for n in crawler.detail_notes)
+
+
+async def test_blocked_detail_page_stops_further_requests(monkeypatch):
+    """详情页命中风控必须立即停手（不是跳过这一条接着打），列表数据仍返回。"""
+    crawler = SpecCrawler(make_detail_spec())
+    rec = FetchRecorder(
+        DETAIL_LIST_HTML,
+        detail_pages=all_detail_pages(),
+        blocked_urls={"https://example.com/job/1"},
+    )
+    monkeypatch.setattr(crawler, "_fetch", rec)
+
+    rows = await crawler.crawl()
+
+    # 列表页 1 次 + 详情页 1 次，第 2/3 条详情绝不能再发
+    assert len(rec.calls) == 2
+    assert len(rec.detail_calls) == 1
+    assert len(rows) == 3
+    assert rows[0]["company"] == "列表公司一"
+    assert any("停止" in n for n in crawler.detail_notes)
+
+
+async def test_no_detail_config_fetches_only_list(monkeypatch):
+    """未配 detail 的既有规格行为零变化：只请求列表页、不加任何字段。"""
+    crawler = SpecCrawler(make_spec())
+    rec = FetchRecorder(SAMPLE_HTML)
+    monkeypatch.setattr(crawler, "_fetch", rec)
+
+    rows = await crawler.crawl()
+
+    assert len(rec.calls) == 2                  # page_param max_pages=2
+    assert not rec.detail_calls
+    assert set(rows[0]) == {"text", "author", "link", "tags", "_target"}
+    assert crawler.detail_notes == []
+
+
+# ------------------------------------------------ 详情字段的加载期校验
+
+
+def test_field_map_may_reference_detail_fields_when_configured():
+    """detail 三要素齐全时，引用 detail.fields 应当通过加载期校验。"""
+    spec = make_detail_spec(mapping={
+        "target": "job",
+        "field_map": {"title": "title", "company_name": "company", "description": "description"},
+    })
+    assert spec.target == "job"
+    assert spec.detail_max_items == 5
+
+
+def test_field_map_rejects_detail_fields_when_detail_disabled():
+    """detail.enabled=false 却引用 detail.* → 报错（不能静默取空值）。"""
+    with pytest.raises(SpecError, match="不可用"):
+        make_detail_spec(
+            detail={"enabled": False, "link_field": "link", "max_items": 5,
+                    "fields": {"description": "div.desc::text"}},
+            mapping={"target": "job",
+                     "field_map": {"title": "title", "description": "description"}},
+        )
+
+
+def test_field_map_rejects_detail_fields_when_max_items_zero():
+    """detail.max_items=0 等于不抓详情，引用它同样要报错。"""
+    with pytest.raises(SpecError, match="不可用"):
+        make_detail_spec(
+            detail={"enabled": True, "link_field": "link", "max_items": 0,
+                    "fields": {"description": "div.desc::text"}},
+            mapping={"target": "job",
+                     "field_map": {"title": "title", "description": "description"}},
+        )
+
+
+def test_field_map_still_rejects_unknown_field():
+    """回归：引用根本不存在的字段名，仍然报错。"""
+    with pytest.raises(SpecError, match="不可用"):
+        make_detail_spec(mapping={
+            "target": "job",
+            "field_map": {"title": "title", "skills": "no_such_field"},
+        })
+
+
+def test_detail_enabled_without_link_field_raises():
+    """开启详情却没写 link_field，等于永远取不到链接 —— 加载期就炸。"""
+    with pytest.raises(SpecError, match="link_field"):
+        make_detail_spec(detail={
+            "enabled": True,
+            "fields": {"description": "div.desc::text"},
+        })

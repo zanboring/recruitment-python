@@ -49,8 +49,11 @@ limits:
   min_interval: 2.0      # 每页之间至少等 2 秒
 
 # 输出映射
-#   generic → 原样输出抽取到的字段（适合先看效果，或接自定义表）
+#   generic → 原样输出抽取到的字段（适合先看效果，或接自定义表），不入岗位表
 #   job     → 按 field_map 映射到 Job 模型字段（复用现有分析与可视化）
+#             field_map 方向是「标准字段 → 抽取字段」，例如 title: job_name；
+#             不写则按同名字段取；title 必须有值，否则该条无法生成 job_key。
+#             详见 docs/data-source-plugin.md §五
 mapping:
   target: generic
   field_map: {}

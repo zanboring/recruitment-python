@@ -24,6 +24,7 @@ from sqlalchemy import select, update
 from app.config import settings
 from app.models.job import Job
 from app.utils.timeutil import utc_now
+from app.utils.url_safety import UnsafeURLError, safe_get
 
 logger = logging.getLogger(__name__)
 
@@ -53,22 +54,29 @@ async def check_job_url(job: Job) -> bool:
     用 httpx 轻量请求（详情页多为静态可读），失败视为不可判定（False），
     不因网络抖动把在线岗位误判为下线。
     """
-    import httpx
-
     url = (job.url or "").strip()
     if not url.startswith(("http://", "https://")):
         return False  # 无 URL 无法核查，保持现状
 
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
     try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "zh-CN,zh;q=0.9",
-        }
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
-            resp = await client.get(url)
+        # 必须走 safe_get：`Job.url` 是**用户可写**的（URL 导入 / 手动新增 / CSV 导入），
+        # 直接用 follow_redirects=True 请求，等于让后台定时任务替人去打内网地址 ——
+        # 与之前修掉的 url-import 是同一个 SSRF。safe_get 内部强制不自动重定向，
+        # 每一跳都先校验再发（**先判后发**）。
+        resp = await safe_get(url, headers=headers, timeout=15)
+    except UnsafeURLError as e:
+        # 语义边界：不安全 ≠ 下线，仍返回 False（不误判在线岗位）。
+        # 但必须用 warning 明确写「不安全、跳过」——
+        # 降级成 debug 会和「网络抖动」长得一样，排查时直接被忽略。
+        logger.warning("岗位 %s 的 URL 不安全，跳过核查：%s", job.id, e)
+        return False
     except Exception as e:
         logger.debug("核查 %s 请求失败（不计为下线）：%s", url, e)
         return False

@@ -168,6 +168,7 @@ export function skillProfile(data: { skills: string; city?: string; limit?: numb
 export interface JobDetailHtmlResult {
   id: number;
   detailHtml: string;
+  url?: string;
 }
 
 export function getJobDetailHtml(jobId: number): Promise<JobDetailHtmlResult> {

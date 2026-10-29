@@ -17,6 +17,7 @@ DeepSeek 与智谱 GLM 都实现 OpenAI Chat Completions 协议 —— 相同的
 `delta.reasoning_content`（思维链），本层只取 `delta.content`（最终答案），
 因为招聘问答场景不需要把思维链透出给用户；需要展示推理过程时在调用方按需扩展即可。
 """
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -167,29 +168,50 @@ async def stream_chat(
         "Authorization": f"Bearer {provider.api_key}",
     }
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream("POST", provider.api_url, headers=headers, json=payload) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
+    # ---- 熔断记账（W-3）----
+    # 此前这里只「查状态」不「上报结果」：provider 连续失败时熔断器永远停在 CLOSED，
+    # 每个请求照样硬打一遍 —— 而聊天主入口 /api/ai/chat-stream 走的正是这条流式路径。
+    #
+    # 为什么用 try/except/else 而不是 finally：
+    #   - 正常跑完（含收到 [DONE] 后 break）→ record_success()；
+    #   - 连接错误 / 超时 / HTTP 状态异常 → record_failure()；
+    #   - **GeneratorExit / CancelledError 一律不上报**：那是客户端断开或任务取消，
+    #     不是 provider 的故障。记成失败会让「用户关掉页面」把熔断器打开，
+    #     进而把正常用户全部挡在降级链之外。
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", provider.api_url, headers=headers, json=payload) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
 
-                usage = chunk.get("usage")
-                if usage and on_usage:
-                    on_usage(_normalize_usage(usage))
+                    usage = chunk.get("usage")
+                    if usage and on_usage:
+                        on_usage(_normalize_usage(usage))
 
-                choices = chunk.get("choices") or [{}]
-                delta = choices[0].get("delta") or {}
-                content = delta.get("content")   # 思考模式下另有 reasoning_content，此处不透出
-                if content:
-                    yield content
+                    choices = chunk.get("choices") or [{}]
+                    delta = choices[0].get("delta") or {}
+                    content = delta.get("content")   # 思考模式下另有 reasoning_content，此处不透出
+                    if content:
+                        yield content
+    except (GeneratorExit, asyncio.CancelledError):
+        # 消费方提前 break / 任务被取消：不是上游故障，不做任何记账
+        raise
+    except Exception:
+        if breaker_enabled():
+            _cloud_breaker.record_failure()
+        raise
+    else:
+        if breaker_enabled():
+            _cloud_breaker.record_success()
 
 
 async def complete_chat(

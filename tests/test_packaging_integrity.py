@@ -28,7 +28,7 @@
 """
 
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -249,3 +249,69 @@ def test_打包版数据库落在可执行文件同目录(tmp_path):
     assert Path(db_name).parent == exe_dir, (
         f"库文件应落在 exe 同目录 {exe_dir}，实际落在 {Path(db_name).parent}"
     )
+
+
+# ---------------------------------------------------------------------------
+# sqlite 库路径判定：不能只认 C 盘
+#
+# 上一节那两个 frozen 探针**抓不到这个缺陷**：`tmp_path` 永远在 C 盘
+# （`C:\Users\...\Temp\...`），而旧实现的白名单恰好包含 `C:\`。
+# 绿色软件装到 **D 盘** 时 `db_name` 形如 `D:\Apps\RecSys\recsys.db`，
+# 不在白名单里 → 被拼成 `sqlite+aiosqlite:///./D:\Apps\RecSys\recsys.db`
+# → Windows 文件名不允许冒号 → **双击 exe 直接起不来**。
+# 所以这里用纯函数级断言，不依赖"测试目录在哪块盘"。
+# ---------------------------------------------------------------------------
+
+from app.database import is_absolute_db_path, sqlite_target  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "D:/apps/RecSys/recsys.db",
+        "D:\\apps\\RecSys\\recsys.db",
+        "e:/data/recsys.db",
+        "/data/recsys.db",
+        "\\\\fileserver\\share\\recsys.db",
+    ],
+)
+def test_绝对路径在各种平台语法下都被识别(name):
+    """D 盘 / 小写盘符 / POSIX 根 / UNC 共享都必须判成绝对路径。"""
+    assert is_absolute_db_path(name) is True, f"{name!r} 应判为绝对路径"
+    url, path = sqlite_target(name)
+    assert ":///./" not in url, f"绝对路径被拼成了相对路径：{url}"
+    assert path == name
+
+
+@pytest.mark.parametrize("name", ["recsys.db", "./recsys.db", "data/recsys.db"])
+def test_相对路径仍然挂到当前目录(name):
+    """相对路径的行为不能变 —— 它靠 `./` 前缀避免落到启动目录之外的怪位置。"""
+    url, path = sqlite_target(name)
+    assert ":///./" in url
+    assert path.startswith("./")
+
+
+@pytest.mark.parametrize("name", [":memory:", "file::memory:?cache=shared"])
+def test_内存库不会被拼成文件名(name):
+    """`:memory:` 若被拼成 `./:memory:` 就变成了一个真实文件，语义完全变了。"""
+    url, path = sqlite_target(name)
+    assert ":///./" not in url, f"内存库被当成了文件：{url}"
+    assert path == name
+
+
+def test_d_盘打包路径不再退化成相对路径():
+    """缺陷复现：打包版 db_name 由 exe 所在目录拼出，换到 D 盘就触发。
+
+    旧判据 `startswith(("/", "\\\\", "./", "C:\\\\", "c:\\\\"))` 对这个值返回 False，
+    于是 URL 变成 `sqlite+aiosqlite:///./D:\\Apps\\RecSys\\recsys.db` ——
+    SQLite 会拿着带冒号的"文件名"去创建，Windows 直接拒绝。
+    """
+    frozen_db_name = "D:\\Apps\\RecSys\\recsys.db"
+    url, path = sqlite_target(frozen_db_name)
+
+    assert url == f"sqlite+aiosqlite:///{frozen_db_name}", url
+    # 判据必须用 **Windows 语义**，不能用 Path(...).is_absolute()：
+    # 后者跟随运行平台，CI 跑在 Linux 上会把 "D:\Apps\..." 判成相对路径
+    # （PosixPath 只认 "/" 开头），于是这条断言在 CI 红、本地绿。
+    # 2026-10-29 实测踩过：这正是本仓库反复出现的「本地永远复现不出」。
+    assert PureWindowsPath(path).is_absolute()

@@ -149,14 +149,28 @@ def update_on(monkeypatch):
     monkeypatch.setattr(settings, "update_repo", "zanboring/recruitment-python")
 
 
-def release_payload(tag="v1.0.1", assets=None):
+def _next_patch(version: str = APP_VERSION) -> str:
+    """返回比 `version` 高一个 patch 的版本号（不带 v 前缀）。
+
+    **为什么不用写死的 "1.0.1"**：版本号一旦升到 1.1.0，所有写死的"更高版本"
+    就变成了"更低版本"，`has_update` 断言集体失败。那不是发现了缺陷，
+    而是**测试把「当前版本」这个变量编码成了常量** ——
+    每次发版都要改测试，最后就会有人图省事去改断言。
+    这里从 APP_VERSION 推导，断言的含义（"线上有更新版本时必须提示"）不变。
+    """
+    major, minor, patch = (int(x) for x in version.split(".")[:3])
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def release_payload(tag=None, assets=None):
+    tag = tag or f"v{_next_patch()}"
     return {
         "tag_name": tag,
         "html_url": f"https://github.com/zanboring/recruitment-python/releases/tag/{tag}",
         "published_at": "2026-09-20T10:00:00Z",
         "body": "修复若干问题",
         "assets": assets if assets is not None else [
-            {"name": "RecSys-v1.0.1.zip", "browser_download_url": "https://example.com/a.zip"},
+            {"name": f"RecSys-{tag}.zip", "browser_download_url": "https://example.com/a.zip"},
         ],
     }
 
@@ -187,14 +201,15 @@ async def test_仓库配置非法时不发请求(fake_github, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_发现新版本(fake_github, update_on):
-    calls = fake_github(payload=release_payload("v1.0.1"))
+    newer = f"v{_next_patch()}"
+    calls = fake_github(payload=release_payload(newer))
 
     result = await update_service.check_for_update()
 
     assert result["status"] == "ok"
     assert result["has_update"] is True
-    assert result["latest_version"] == "1.0.1"
-    assert result["asset_name"] == "RecSys-v1.0.1.zip"
+    assert result["latest_version"] == newer.lstrip("v")
+    assert result["asset_name"] == f"RecSys-{newer}.zip"
     assert "releases/tag" in result["release_url"]
     # 请求必须带 User-Agent，否则 GitHub 直接 403
     assert calls[0]["headers"].get("User-Agent")
@@ -202,7 +217,7 @@ async def test_发现新版本(fake_github, update_on):
 
 @pytest.mark.asyncio
 async def test_已是最新版本(fake_github, update_on):
-    fake_github(payload=release_payload("v1.0.0"))
+    fake_github(payload=release_payload(f"v{APP_VERSION}"))
     result = await update_service.check_for_update()
     assert result["status"] == "ok"
     assert result["has_update"] is False
@@ -255,7 +270,7 @@ async def test_响应结构异常时不得抛出(fake_github, update_on):
 
 @pytest.mark.asyncio
 async def test_没有附件时也能正常返回(fake_github, update_on):
-    fake_github(payload=release_payload("v1.0.2", assets=[]))
+    fake_github(payload=release_payload(assets=[]))
     result = await update_service.check_for_update()
     assert result["status"] == "ok"
     assert result["has_update"] is True
@@ -264,7 +279,7 @@ async def test_没有附件时也能正常返回(fake_github, update_on):
 
 @pytest.mark.asyncio
 async def test_有多个附件时优先挑_zip(fake_github, update_on):
-    fake_github(payload=release_payload("v1.0.3", assets=[
+    fake_github(payload=release_payload(assets=[
         {"name": "checksums.txt"},
         {"name": "RecSys.zip"},
     ]))
@@ -274,7 +289,7 @@ async def test_有多个附件时优先挑_zip(fake_github, update_on):
 
 @pytest.mark.asyncio
 async def test_超长版本说明被截断(fake_github, update_on):
-    payload = release_payload("v1.0.4")
+    payload = release_payload()
     payload["body"] = "长" * 9000
     fake_github(payload=payload)
     result = await update_service.check_for_update()
@@ -319,7 +334,8 @@ async def test_更新检查接口要求登录(client):
 
 @pytest.mark.asyncio
 async def test_更新检查接口可用(fake_github, update_on, admin_client):
-    fake_github(payload=release_payload("v1.0.5"))
+    newer = f"v{_next_patch()}"
+    fake_github(payload=release_payload(newer))
 
     resp = await admin_client.get("/api/system/update-check")
 
@@ -327,7 +343,7 @@ async def test_更新检查接口可用(fake_github, update_on, admin_client):
     data = resp.json()["data"]
     assert data["status"] == "ok"
     assert data["has_update"] is True
-    assert data["latest_version"] == "1.0.5"
+    assert data["latest_version"] == newer.lstrip("v")
 
 
 @pytest.mark.asyncio

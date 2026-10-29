@@ -284,7 +284,9 @@ async def ingest_browser_jobs(db: AsyncSession, jobs: list, source_site: str, ci
 async def _crawl_platform(db: AsyncSession, keyword: str, city: str, platform: str) -> tuple:
     """抓取并入库单个平台。
 
-    返回 (新增条数, 本次抓到的 job_key 列表)。
+    返回 (新增条数, 本次抓到的 job_key 列表, 说明条目)。
+    说明条目用于解释「抓到了但没入库」的情况（generic 数据源 / 缺 job_key），
+    会原样并入任务 message —— 否则前端只看到「已完成 / 0 条」，无从判断原因。
 
     在真正发起请求之前依次过三道「任务之间」的闸：
     合规（robots）→ 配额（今日还剩多少次）→ 域名节流（同一域名串行且保底间隔）。
@@ -319,7 +321,27 @@ async def _crawl_platform(db: AsyncSession, keyword: str, city: str, platform: s
     # 走带指数退避的 retry 包装，而不是裸调用 crawl()：
     # 否则目标站点一次抖动就会让整个任务 FAILED。
     jobs = await crawler.crawl_with_retry(keyword, city)
-    jobs = deduplicate_jobs(jobs)
+
+    # 声明式数据源可能是 generic（分析用）或缺少 job_key 的行。
+    # ``deduplicate_jobs`` 只保留有 job_key 的条目 —— 不先把这两类挑出来，
+    # 它们会被静默吞掉，症状是「YAML 配好了、抓到了、库里一条没有」。
+    notes: list = []
+    # 详情页抓取的失败条数 / 风控即停 / 预算截断由执行器自行记录，
+    # 这里并进同一条任务 message —— 不另造返回结构。
+    notes.extend(getattr(crawler, "detail_notes", []) or [])
+    generic_rows = [j for j in jobs if j.get("_target") == "generic"]
+    if generic_rows:
+        notes.append(
+            f"平台 {platform} 是通用（generic）数据源：本次抓到 {len(generic_rows)} 条"
+            f"分析用数据，未写入岗位表"
+        )
+    job_rows = [j for j in jobs if j.get("_target") != "generic"]
+    missing_key = [j for j in job_rows if not j.get("job_key")]
+    if missing_key:
+        notes.append(
+            f"平台 {platform} 有 {len(missing_key)} 条记录缺少 job_key，无法去重入库已跳过"
+        )
+    jobs = deduplicate_jobs(job_rows)
 
     saved = 0
     seen_keys: list = []
@@ -352,7 +374,7 @@ async def _crawl_platform(db: AsyncSession, keyword: str, city: str, platform: s
                 await db.commit()
 
     await db.commit()
-    return saved, seen_keys
+    return saved, seen_keys, notes
 
 
 async def _mark_offline(
@@ -473,9 +495,10 @@ async def run_crawl(
             if platform not in SUPPORTED_PLATFORMS:
                 logger.warning("平台 %s 尚未实现，跳过", platform)
                 continue
-            saved, keys = await _crawl_platform(db, keyword, city, platform)
+            saved, keys, platform_notes = await _crawl_platform(db, keyword, city, platform)
             total_saved += saved
             seen_keys.extend(keys)
+            skipped_notes.extend(platform_notes)
             crawled_platforms.append(platform)
 
         # 本次一条岗位都没抓到（例如全部被清洗规则过滤）时不触发下架判定，

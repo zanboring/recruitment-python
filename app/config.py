@@ -273,12 +273,14 @@ class Settings(BaseSettings):
     rag_retrieval_strategy: str = "auto"
 
     # ---- 本地模型（Ollama）----
-    # 本地不是「一个备胎」，而是按能力分工的两类模型：
-    #   ollama_model       语言类 —— 对话生成、分析报告（语言理解与表达更强）
-    #   ollama_code_model  代码类 —— 工具识别、JSON 结构化抽取（小而快）
+    # 本地模型不是「一个备胎」，而是同一套本地推理，通过两个配置项分别服务于不同用途：
+    #   ollama_model       对话生成、分析报告等语言类用途
+    #   ollama_code_model  工具识别、JSON 结构化抽取等代码类用途
     #   ollama_tool_model  显式指定工具识别模型；留空则自动用 code_model，再回退 model
-    # 分工依据见 app/services/ollama_client.py 的实测对比表，
-    # 可用 scripts/bench_local_models.py 在本机复现。
+    # 说明：当前 ollama_model 与 ollama_code_model 默认指向同一个实装模型（qwen3.5:4b）——
+    # 历史默认值均已停止使用且本机未安装，故两项统一指向该实装模型；两个配置项仍各自独立，
+    # 需要时可将不同用途分别指向不同模型。模型比对的实测数据（历史留痕）见
+    # app/services/ollama_client.py，可用 scripts/bench_local_models.py 在本机复现。
     ollama_enabled: bool = True
     ollama_base_url: str = "http://localhost:11434"
     # 同 ollama_embedding_model：默认值必须与实装模型一致，否则静默降级。

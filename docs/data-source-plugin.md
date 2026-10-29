@@ -88,13 +88,118 @@ mapping:
 
 ---
 
-## 五、能力边界（重要，别抱不切实际的期待）
+## 五、输出映射：generic / job
+
+`mapping.target` 决定这个数据源的产物进哪张表。
+
+### `target: generic`（默认）
+
+原样输出抽取到的字段，**不写岗位表**，适合先看效果或接自定义分析。
+
+每条记录带 `_target: generic` 标记。入库链路会把它们计数并写进任务说明
+（「平台 X 是通用（generic）数据源：本次抓到 N 条分析用数据，未写入岗位表」），
+**不会静默丢弃** —— 这也是历史缺陷的修复点：没有这个标记时，
+`deduplicate_jobs()` 只保留有 `job_key` 的行，generic 数据会被无声吞掉，
+表现为「YAML 配好了、抓到了、库里一条没有」。
+
+### `target: job`
+
+按 `field_map` 映射成标准岗位字典，然后走**既有入库契约**：
+`crawler_service.normalize_job()` 补薪资 → `save_job()` 按 `job_key` 去重。
+
+`field_map` 的方向是 **标准字段 → 抽取字段**（左边是固定 schema，右边引用
+`list.fields` 里的键；`detail.fields` 也可以引用，但必须先满足 §六 的启用条件，
+否则加载期报错）：
+
+```yaml
+mapping:
+  target: job
+  field_map:
+    title: job_name
+    company_name: company
+    city: city
+    salary: salary_text
+    experience: exp
+    education: edu
+    url: link
+```
+
+规则：
+
+| 项 | 说明 |
+|---|---|
+| 标准字段全集 | `title` / `company_name` / `city` / `experience` / `education` / `salary` / `min_salary` / `max_salary` / `description` / `url` / `skills` |
+| 不写 `field_map` | 按**同名字段**取（`title` 找 `title`，`company_name` 找 `company_name`） |
+| 加载期校验 | 左边写不存在的标准字段、或右边引用不存在的抽取字段 → **直接报错**，不会等到入库才发现字段全空 |
+| `title` | 唯一硬性要求：没有它生成不了 `job_key`，该条被跳过并记 warning（不是静默丢弃） |
+| 薪资（二选一） | 写 `salary` 文本（如 `15-25K`，交给既有解析器）**或** `min_salary` / `max_salary` 数值（单位：元/月，不做单位推断；只写 min 时 max 同上限） |
+| `city` | 未抽到时回退到调用方传入的城市 |
+| `url` | 未抽到时回退到当前页地址；相对链接会补成绝对地址 |
+| `job_key` | 由统一实现 `app.utils.job_key.generate_job_key(平台, 标题, 公司, 城市)` 生成，**禁止另算一套**（否则同一岗位会因入口不同而重复入库） |
+
+> 说明：早期版本文档已写「`target: job` 能映射进岗位表」，但代码里
+> `field_map` 从未被消费 —— 配了 job 也一条都进不了库。本版把这条承诺补成实现，
+> 上面的规则即实际行为。
+
+---
+
+## 六、详情页抓取（列表 + 详情）
+
+列表里只给链接、正文在另一个页面的站点，用 `detail` 声明详情页：
+
+```yaml
+detail:
+  enabled: true                    # 关闭（默认）时行为与「只有列表」完全一致
+  link_field: link                 # 必填：list.fields 里存详情页链接的字段名
+  max_items: 10                    # 本次最多抓几个详情页；0 = 不抓
+  fields:
+    description: "div.job-desc::text"
+    company: "div.company::text"   # 与列表同名字段 → 详情页的值覆盖列表
+```
+
+执行顺序：解析列表页 → 逐条按 `link_field` 取链接 → `urljoin` 成绝对地址 →
+抓详情页 → 按 `detail.fields` 用**与列表页相同的抽取语法**抽字段 →
+合并 → 再走 `mapping` 映射。
+
+合并规则：**详情页字段覆盖列表同名字段**（详情页更细）；详情页取不到（空串 /
+无匹配 / 空列表）时**保留列表页原值**，不会用空值把已有数据洗掉。
+
+### 三个必须知道的约束
+
+1. **请求量有两层闸门**。`detail.max_items`（默认 10）与 `limits.max_items`
+   取较小者 —— 前者管"详情页最多抓几条"，后者管"整个任务最多要多少条"。
+   `detail.max_items: 0` 或整块不写 = **不抓详情**，与历史行为完全一致。
+   这就是防「列表 100 条 × 每条详情」把目标站点打爆的那道闸。
+2. **每条详情请求前都等 `_interval()`**。复用的是翻页那套节流
+   （spec `min_interval` 与风控后的自适应降速取较大者），不另造 sleep，
+   也不因"就十条"跳过。
+3. **详情页命中风控立即停手**。详情页同样过 `detect_blocked()` / `mark_blocked()`
+   （含 HTTP 429）；一旦命中就停止后续**所有**请求，而不是跳过这条接着打。
+   已经抓到的列表数据照常返回。
+
+### 单条失败怎么办
+
+详情页超时 / 404 / 解析不到任何字段 → **只丢这一条的详情**，保留列表页字段，
+继续下一条。本次抓取的详情页情况会写进任务说明（`crawler_service` 的说明条目
+机制），例如：
+
+- `平台 X 详情页：成功 8 条，失败 2 条（失败条目保留列表页字段）`
+- `平台 X 详情页抓取已停止：详情页命中风控信号…（已抓到的列表数据照常保留，未再发出新请求）`
+- `平台 X 详情页请求已达上限 10 条，其余条目仅保留列表页字段`
+
+> `mapping.field_map` 引用 `detail.fields` 的前提是 `enabled: true` + `link_field` +
+> `max_items > 0` 三者齐全；缺一条会在**加载期**报错，而不是让你拿到一列空值。
+
+---
+
+## 七、能力边界（重要，别抱不切实际的期待）
 
 **纯配置就能做：**
-- 静态页 或 JS 渲染页的列表 + 详情
+- 静态页 或 JS 渲染页的**列表页**；需要时按 `detail.*` 逐条补齐**详情页**（见 §六）
 - 分页：页码参数 / 下一页链接
 - CSS 选择器字段抽取 + 正则后处理
 - 限速、单次上限、robots 合规检查
+- 输出映射：`generic` 原样输出 / `job` 按 `field_map` 映射进岗位表（见 §五）
 
 **必须写 Python 类（放 `app/crawlers/`，在 `registry.CRAWLER_REGISTRY` 注册）：**
 - 需要登录 / 人工过验证的站点（如 BOSS 直聘 → 见 `boss.py`）
@@ -107,7 +212,7 @@ mapping:
 
 ---
 
-## 六、已知坑
+## 八、已知坑
 
 ### 1. 请求头不要声明自己解不了的编码
 
@@ -131,9 +236,30 @@ mapping:
 加载时逐文件捕获异常，坏文件记 error 后跳过。
 但如果 `site` 标识重复，**后加载的会被忽略**（日志会写明两个文件名）。
 
+### 4. 「配了 target: job 却一条都不入库」
+
+按顺序查三处：
+
+1. `field_map` 的右边是否指向真实存在的抽取字段：`list.fields` 恒可用，
+   `detail.fields` 需要 `detail.enabled` + `link_field` + `max_items > 0` 齐全
+   （写错或缺条件都会在**加载期**报错，服务起不来）；
+2. `title` 是否真的抽到了非空值（缺标题的行会被跳过并记 warning）；
+3. 任务说明里是否写着「有 N 条记录缺少 job_key」或「通用（generic）数据源」——
+   这两类都不会入库，但会明说，不再静默。
+
+### 5. 「配了 detail 却没补到详情字段」
+
+按顺序查四处：
+
+1. `detail.enabled` 是否为 `true`、`detail.max_items` 是否 > 0（0 等于关掉）；
+2. `detail.link_field` 是否真的抽到了链接（相对路径会自动 `urljoin`，空值会跳过该条）；
+3. 任务说明里是否写着「详情页：成功 X 条，失败 Y 条」—— 失败条目保留列表页字段；
+4. 是否写着「详情页请求已达上限 N 条」—— 这是 `detail.max_items` /
+   `limits.max_items` 的闸门生效了，不是 bug。
+
 ---
 
-## 七、与"通用数据分析"的关系
+## 九、与"通用数据分析"的关系
 
 本机制解决的是**数据源通用**：同一套分析链路，数据可以从任意站点/文件进来。
 

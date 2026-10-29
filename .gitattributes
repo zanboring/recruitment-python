@@ -1,0 +1,4 @@
+# 钩子脚本必须保持 LF。
+# 本机 core.autocrlf=true，若不做约束，checkout 后 shebang 会变成
+# "#!/bin/sh\r" → "bad interpreter" → 钩子静默失效（装了但没生效）。
+.githooks/* text eol=lf

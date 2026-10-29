@@ -18,7 +18,14 @@ import re
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.schemas.job import JOB_TEXT_LIMITS
 from app.services.vision_service import _parse_json_reply, _normalize_job
+from app.utils.url_safety import (
+    UnsafeURLError,
+    assert_safe_url,
+    assert_safe_url_async,
+    safe_get,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,25 +68,23 @@ async def _fetch_page_via_http(url: str) -> tuple:
     纯静态或服务端渲染的招聘详情页可直接抓到内容；前端渲染的页面
     拿到的只是空壳，由 open_page_text 依据内容长度判断后回退渲染。
     """
-    import httpx
-
     headers = {
         "User-Agent": settings_crawler_ua(),
         "Accept-Language": "zh-CN,zh;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
     try:
-        timeout = httpx.Timeout(max(settings.crawl_timeout, 10))
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
-            resp = await client.get(url)
-            if resp.status_code != 200:
-                logger.debug("链接导入 HTTP 抓取状态码 %s，回退渲染", resp.status_code)
-                return None, None
-            html = resp.text or ""
-            text = extract_page_text(html)
-            if not text:
-                return None, None
-            return text, html
+        # safe_get 内部强制 follow_redirects=False 并逐跳校验（见 app/utils/url_safety.py）：
+        # 自动跟随会在请求已经打到内网之后才给出最终 URL，事后校验无效。
+        resp = await safe_get(url, headers=headers, timeout=max(settings.crawl_timeout, 10))
+        if resp.status_code != 200:
+            logger.debug("链接导入 HTTP 抓取状态码 %s，回退渲染", resp.status_code)
+            return None, None
+        html = resp.text or ""
+        text = extract_page_text(html)
+        if not text:
+            return None, None
+        return text, html
     except Exception as e:
         logger.warning("链接导入 HTTP 抓取失败（回退渲染）：%s", e)
         return None, None
@@ -95,7 +100,10 @@ async def open_page_text(url: str) -> tuple:
          两者都没有则抛 RuntimeError。
 
     返回 HTML 快照用于持久化（核查时可比对“内容变化”）；正文用于 LLM 抽取。
+
+    ⚠️ 入口先做 SSRF 校验：浏览器同样会跟随重定向，不能等到抓完再判。
     """
+    url = await assert_safe_url_async(url)
     http_text, http_html = await _fetch_page_via_http(url)
 
     try:
@@ -121,6 +129,12 @@ async def open_page_text(url: str) -> tuple:
         try:
             page = await browser.new_page(user_agent=settings_crawler_ua(), viewport={"width": 1440, "height": 900})
             await page.goto(url, timeout=settings.crawl_timeout * 1000, wait_until="domcontentloaded")
+            # 浏览器也会自动跟随重定向：落地页一旦落到内网，立即放弃（结果不返回、不入库）。
+            # 注：这是「事后」检查，只能止损；真正的防线是入口校验 + HTTP 路径的逐跳校验。
+            # getattr 兜底是为了兼容测试里的极简 page 替身（真实 Page 一定有 .url）。
+            final_url = getattr(page, "url", "")
+            if final_url:
+                await assert_safe_url_async(final_url)
             # 给前端渲染留时间（详情页多为 SPA/异步加载）
             await page.wait_for_timeout(3000)
             html = await page.content()
@@ -204,20 +218,84 @@ def _rule_extract(text: str) -> dict:
     return result
 
 
+# 仅「系统抽取」的字段参与截断：url / source_site 由系统赋值，
+# 截断 url 会直接把链接毁掉（存进去也打不开），所以不在其列。
+_EXTRACTED_TEXT_FIELDS = (
+    "title", "company_name", "city", "experience", "education", "skills", "job_desc",
+)
+
+
+def _stringify(value) -> str:
+    """把 LLM 可能返回的非字符串收敛成可入库文本。
+
+    模型常见越界返回：`skills: ["Python", "Java"]`、`experience: 3`、
+    `company_name: {"name": "某公司"}`。
+    直接 `str()` 会得到 `"['Python', 'Java']"`（带方括号与引号）—— 能入库，
+    但会污染技能匹配与页面展示；列表按逗号拼接才符合本项目 `skills` 的约定。
+    """
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(str(item.get("name") or item.get("skill") or item.get("value") or ""))
+            else:
+                parts.append(str(item))
+        return ",".join(p.strip() for p in parts if p and p.strip())
+    if isinstance(value, dict):
+        return str(value.get("name") or value.get("value") or "").strip()
+    return str(value)
+
+
+def _clamp_extracted(job_data: dict, url: str) -> None:
+    """把**系统抽取**的文本截断到 schema 上限（原地修改），超限时 warning 留痕。
+
+    与 API 层「超长一律 422」是两种不同语义，不能混：
+    - 用户直接提交超长 → 用户有能力改小重提，422 是正确反馈；
+    - 抽取结果是模型产物 → 用户没有「改小再提交」的入口，422 只会表现为
+      「页面明明抓成功了，点确认入库却失败」，完全无法理解。此处截断 + 留痕才可运维。
+
+    上限取自 `app.schemas.job.JOB_TEXT_LIMITS`（唯一真源），本文件不重复任何数字。
+    """
+    for field in _EXTRACTED_TEXT_FIELDS:
+        limit = JOB_TEXT_LIMITS[field]
+        raw = job_data.get(field)
+        if raw is None:
+            job_data[field] = ""
+            continue
+        text = raw if isinstance(raw, str) else _stringify(raw)
+        if len(text) > limit:
+            logger.warning(
+                "链接导入：字段 %s 超长（原长 %s > 上限 %s），已截断后入库：%s",
+                field, len(text), limit, url,
+            )
+            text = text[:limit]
+        job_data[field] = text
+
+
 async def import_job_from_url(db: AsyncSession, url: str, validate: bool = True) -> dict:
     """链接导入主编排：打开页面 → 抽取 → （可选）入库。
 
     返回 {"result": {...}, "saved": bool, "job_id": id|None, "page_html": bool}
     """
     url = (url or "").strip()
-    if not url.startswith(("http://", "https://")):
-        raise RuntimeError("请输入合法的 http/https 链接")
+    # SSRF 防护：不只是 scheme 白名单 —— 域名解析到 10.x / 127.x / 169.254.x 同样拒绝，
+    # 否则「http://internal.example.com」这种公网域名就能指到内网。
+    url = await assert_safe_url_async(url)
 
     page_text, page_html = await open_page_text(url)
     if not page_text:
         raise RuntimeError("未能从页面提取到文本内容")
 
     job_data = await extract_job_from_text(page_text)
+
+    # 键名收敛：规则兜底用 `description`，复用的 `_normalize_job`（视觉链路）返回 `job_desc`。
+    # 此前这里只读 `description`，导致 LLM 抽取的岗位描述**被静默丢弃**（落库恒为空）。
+    if not job_data.get("job_desc"):
+        job_data["job_desc"] = job_data.get("description") or ""
+
+    # 模型不保证遵守「200 字内」这类提示词约束：超长在此**截断 + 留痕**，
+    # 不要让用户在「确认入库」环节收到 422（那不是用户的输入错误）。
+    _clamp_extracted(job_data, url)
 
     if not validate:
         return {"result": job_data, "saved": False, "job_id": None,
@@ -238,7 +316,7 @@ async def import_job_from_url(db: AsyncSession, url: str, validate: bool = True)
             min_salary=job_data.get("min_salary") or None,
             max_salary=job_data.get("max_salary") or None,
             skills=job_data.get("skills") or "",
-            job_desc=job_data.get("description") or "",
+            job_desc=job_data.get("job_desc") or "",
             url=url,
         )
         created = await JobService.create_job(db, create_req)

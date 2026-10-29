@@ -2,9 +2,18 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # 只列镜像库真会收到的三条分支。
+    # 曾写过 'dev-merge/**'，想"隔离合并分支也过门禁" —— 但那是**不可能触发的**：
+    # 本工作流跑在 GitHub 私有镜像库，而镜像脚本（push-ci-mirror.sh）只送
+    # main / uat / dev，dev-merge/* 只存在于 Gitee。留着它等于在配置里写一句
+    # "合并分支有 CI 兜着"，实际没有 —— 假判据的典型形态。
+    # dev-merge/* 的验证责任在集成端的固定 SHA 复现（AGENTS.md §4.7 第三层），
+    # 工具：bash D:/Dev/_backup/verify-sha.sh <sha> <期望通过数>。
+    # 若将来真要给合并分支加 CI，先让镜像脚本支持 dev-merge/* 与失效分支清理，
+    # 再把这里加回来 —— 顺序不能反。
+    branches: [main, uat, dev]
   pull_request:
-    branches: [main]
+    branches: [main, uat, dev]
   workflow_dispatch:
 
 jobs:
@@ -49,4 +58,42 @@ jobs:
         run: python -m compileall -q app scripts
 
       - name: 跑测试
-        run: pytest -q
+        # 用 `python -m` 而不是裸 `pytest`：两者 sys.path[0] 不同，裸 pytest
+        # 找不到 app 包。pytest.ini 的 pythonpath 已兜底，这里再对齐本地命令。
+        run: python -m pytest -q
+
+  frontend:
+    name: 前端（类型 / 消毒 / 构建）
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          # 对齐本地开发环境（v22）。曾配 20，jsdom@30 依赖的 undici 在 Node 20
+          # 上加载失败 → `XSS 消毒验证` 红，而本地跑不出来（本地就是 22）。
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      # --skipLibCheck：element-plus 的 .d.ts 与 TS 5.x 有已知不兼容告警，
+      # 不跳过第三方声明会把 CI 钉死在一堆库告警上，反而看不见自己的错。
+      # 代价是库的类型不被校验 —— 换取"自研代码一旦类型不符即红"。
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: XSS 消毒验证
+        run: npm run check:xss
+
+      - name: 生产构建
+        run: npm run build

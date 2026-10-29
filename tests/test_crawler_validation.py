@@ -110,7 +110,7 @@ async def test_全部平台未实现时任务失败并写明原因(db_session):
 async def test_部分平台未实现时完成但说明跳过项(db_session, monkeypatch):
     """有可用平台时任务照常完成，但必须说明哪些被跳过了。"""
     async def fake_crawl_platform(db, keyword, city, platform):
-        return 3, [f"{platform}_k1"]
+        return 3, [f"{platform}_k1"], []
 
     monkeypatch.setattr(crawler_service, "_crawl_platform", fake_crawl_platform)
     monkeypatch.setattr(crawler_service, "_mark_offline", _noop_async)
@@ -129,7 +129,7 @@ async def test_部分平台未实现时完成但说明跳过项(db_session, monk
 async def test_全部平台可用时不产生多余的提示信息(db_session, monkeypatch):
     """只在真的有跳过项时才写 message，避免给正常任务塞无意义文案。"""
     async def fake_crawl_platform(db, keyword, city, platform):
-        return 2, [f"{platform}_k1"]
+        return 2, [f"{platform}_k1"], []
 
     monkeypatch.setattr(crawler_service, "_crawl_platform", fake_crawl_platform)
     monkeypatch.setattr(crawler_service, "_mark_offline", _noop_async)

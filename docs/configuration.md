@@ -57,11 +57,14 @@ ZHIPUAI_API_URL=https://open.bigmodel.cn/api/paas/v4/chat/completions
 ZHIPUAI_MODEL=glm-4-flash
 
 # ========== Ollama 本地大模型 ==========
-# 本地不是「一个备胎」，而是按能力分工的两个模型：
-#   OLLAMA_MODEL       语言类 —— 对话生成、分析报告（语言表达与事实准确性更好）
-#   OLLAMA_CODE_MODEL  代码类 —— 工具识别、JSON 结构化抽取（准确率相同但快一倍）
+# 本地模型不是「一个备胎」，而是同一套本地推理，通过两个配置项分别服务于不同用途：
+#   OLLAMA_MODEL       对话生成、分析报告等语言类用途
+#   OLLAMA_CODE_MODEL  工具识别、JSON 结构化抽取等代码类用途
 #   OLLAMA_TOOL_MODEL  显式指定工具识别模型；留空则自动用 CODE_MODEL，再回退 MODEL
-# 分工依据来自实测，可执行 `python scripts/bench_local_models.py` 在本机复现。
+# 说明：当前 OLLAMA_MODEL 与 OLLAMA_CODE_MODEL 默认指向同一个实装模型（qwen3.5:4b）——
+# 历史默认值均已停止使用且本机未安装，故两项统一指向该实装模型；
+# 两个配置项仍各自独立，需要时可将不同用途分别指向不同模型。权威默认值见 app/config.py，
+# `python scripts/bench_local_models.py` 可在本机复现相关数据。
 OLLAMA_ENABLED=true
 OLLAMA_BASE_URL=http://localhost:11434
 # ⚠️ 这里的模型名必须与本机 `ollama list` 里**真实存在**的完全一致。

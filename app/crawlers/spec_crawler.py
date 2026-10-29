@@ -30,7 +30,13 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from app.crawlers.base import BaseCrawler
-from app.crawlers.spec_schema import CrawlSpec, FieldSpec
+from app.crawlers.cleaner import generate_job_key
+from app.crawlers.spec_schema import (
+    JOB_SALARY_FIELDS,
+    JOB_STANDARD_FIELDS,
+    CrawlSpec,
+    FieldSpec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +65,23 @@ def _supported_encodings() -> str:
     return ", ".join(encodings)
 
 
+def _as_int(value: Any) -> Optional[int]:
+    """把抽取到的薪资数值转成整数元；转不了返回 None。
+
+    不做单位推断（"15" 到底是 15 元还是 15K 无法从文本判断）：
+    YAML 里 ``min_salary`` / ``max_salary`` 约定直接写月薪元数，
+    拿不准就用 ``salary`` 文本交给既有薪资解析器。
+    """
+    text = str(value or "").replace(",", "").strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        logger.warning("薪资字段不是数值，已忽略：%r（请改用 salary 文本或写月薪元数）", value)
+        return None
+
+
 class SpecCrawler(BaseCrawler):
     """按 YAML 规格执行抓取的通用爬虫。"""
 
@@ -66,6 +89,14 @@ class SpecCrawler(BaseCrawler):
         super().__init__(spec.site)
         self.spec = spec
         self._browser = None
+        # 详情页抓取的说明条目（失败条数 / 风控即停 / 预算截断）。
+        # 由 ``crawler_service._crawl_platform`` 并入任务 message，不另造返回结构。
+        self.detail_notes: List[str] = []
+        self._detail_requests = 0
+        self._detail_ok = 0
+        self._detail_failed = 0
+        self._detail_stopped = False
+        self._detail_block_reason = ""
 
     # ------------------------------------------------------------------ 入口
 
@@ -78,15 +109,33 @@ class SpecCrawler(BaseCrawler):
         """按任意参数抓取（将来通用调度走这里，不限于关键词+城市）。"""
         spec = self.spec
         items: List[Dict] = []
+        self._reset_detail_state()
 
         page = int(params.get("page", spec.pagination_start) or spec.pagination_start)
         pages_done = 0
+        # next_link 模式必须跨迭代维护「当前页地址」：
+        # 原来每轮都回到循环顶部按 page 重渲染 URL，于是 max_pages 轮里反复抓
+        # 「第 1 页 → 第 2 页」，第 3 页永远到不了，条目成倍重复。
+        current_url: Optional[str] = None
+        visited: set = set()
 
         try:
             while pages_done < spec.max_pages:
-                params["page"] = page
-                url = spec.render_url(params)
-                logger.info("[%s] 抓取第 %s 页：%s", spec.site, page, url)
+                if spec.pagination_type == "next_link" and current_url is not None:
+                    url = current_url
+                else:
+                    params["page"] = page
+                    url = spec.render_url(params)
+
+                # 真实站点「下一页」翻到末页时常仍指向自己；不设这道门会死循环。
+                if url in visited:
+                    logger.warning(
+                        "[%s] 翻页目标重复（已抓过），停止：%s", spec.site, url
+                    )
+                    break
+                visited.add(url)
+
+                logger.info("[%s] 抓取第 %s 页：%s", spec.site, pages_done + 1, url)
 
                 html = await self._fetch(url)
 
@@ -99,8 +148,16 @@ class SpecCrawler(BaseCrawler):
                     )
 
                 batch = self.parse_page(html, keyword=str(params.get("keyword", "")))
-                items.extend(batch)
+                # 先补详情、再映射：详情页字段可能覆盖列表同名字段，
+                # 而 field_map / title 也可能只存在于详情页。
+                await self._enrich_batch(batch, url)
+                items.extend(self._shape_records(batch, params, url))
                 pages_done += 1
+
+                # 详情页命中风控：已抓到的列表数据照常返回，
+                # 但不再发出任何新请求（继续打只会让封禁升级）。
+                if self._detail_stopped:
+                    break
 
                 if len(items) >= spec.max_items:
                     items = items[: spec.max_items]
@@ -120,23 +177,9 @@ class SpecCrawler(BaseCrawler):
 
                 if spec.pagination_type == "next_link":
                     nxt = self._find_next_link(html, url)
-                    if not nxt:
+                    if not nxt or nxt == url:
                         break
-                    params["page"] = nxt          # next_link 模式直接带完整 URL
-                    spec_url_backup = spec.url
-                    try:
-                        spec.url = nxt
-                        html = await self._fetch(nxt)
-                    finally:
-                        spec.url = spec_url_backup
-                    if self.detect_blocked(html):
-                        self.mark_blocked()
-                        raise CrawlBlockedError(f"[{spec.site}] 翻页时命中风控信号")
-                    items.extend(self.parse_page(html, keyword=str(params.get("keyword", ""))))
-                    pages_done += 1
-                    # 翻页前必须等：spec 下限与自适应降速取较大者（见 _interval）。
-                    # 不按 min_interval 是否 >0 决定跳过节流 —— 默认 0 时也要走
-                    # 基类的基础延迟，否则默认配置就是无间隔连打对方站点。
+                    current_url = nxt
                     await asyncio.sleep(self._interval())
                     continue
 
@@ -144,6 +187,7 @@ class SpecCrawler(BaseCrawler):
         finally:
             await self._close_browser()
 
+        self._finalize_detail_notes()
         logger.info("[%s] 抓取完成，共 %s 条", spec.site, len(items))
         return items
 
@@ -169,6 +213,220 @@ class SpecCrawler(BaseCrawler):
             if any(v not in (None, "", []) for v in row.values()):
                 records.append(row)
         return records
+
+    # ------------------------------------------------------------ 详情页抓取
+    #
+    # 详情页是「列表里只给链接、正文在另一页」的站点的必需品。这里只有三条
+    # 约束，缺任何一条都会把一个小功能变成对目标站点的压测（详见
+    # docs/data-source-plugin.md「详情页」一节）：
+    #   1. 两层闸门：``detail.max_items`` 与 ``limits.max_items`` 取较小者；
+    #   2. 每条详情请求前等 ``_interval()``，不因"就几条"跳过；
+    #   3. 命中风控立即停止，不是跳过这一条接着打。
+
+    def _detail_active(self) -> bool:
+        """详情页是否真的会被抓取（三要素齐全且预算 > 0）。"""
+        spec = self.spec
+        return bool(
+            spec.detail_enabled
+            and spec.detail_link_field
+            and spec.detail_fields
+            and spec.detail_max_items > 0
+        )
+
+    def _detail_budget(self) -> int:
+        cap = min(self.spec.detail_max_items, self.spec.max_items)
+        return max(0, cap)
+
+    def _reset_detail_state(self) -> None:
+        self.detail_notes = []
+        self._detail_requests = 0
+        self._detail_ok = 0
+        self._detail_failed = 0
+        self._detail_stopped = False
+        self._detail_block_reason = ""
+
+    def parse_detail_page(self, page_content) -> Dict[str, Any]:
+        """按 ``detail.fields`` 解析详情页，返回 {字段名: 值}（同步，不涉及 IO）。
+
+        与列表页共用同一个 ``_extract`` —— 两种页面只差"容器节点是哪一个"，
+        抽取语义（text/attr/html/multi/regex/default）没有理由分叉。
+        """
+        if not page_content:
+            return {}
+        soup = BeautifulSoup(page_content, "lxml")
+        return {f.name: self._extract(soup, f) for f in self.spec.detail_fields}
+
+    def _detail_link(self, row: Dict[str, Any]) -> str:
+        value = row.get(self.spec.detail_link_field)
+        if isinstance(value, list):
+            value = value[0] if value else None
+        return str(value or "").strip()
+
+    async def _enrich_batch(self, batch: List[Dict], page_url: str) -> None:
+        """用详情页补齐这一页的记录（原地修改，不新增记录）。
+
+        单条失败（超时/404/解析不到）只影响这一条：保留列表页字段、计数，
+        然后继续下一条 —— 否则一条 404 会让整页数据全部作废。
+        """
+        spec = self.spec
+        if not self._detail_active() or not batch:
+            return
+
+        budget = self._detail_budget() - self._detail_requests
+        if budget <= 0:
+            return
+
+        for row in batch:
+            if budget <= 0 or self._detail_stopped:
+                break
+
+            href = self._detail_link(row)
+            if not href:
+                continue
+            url = urljoin(page_url, href)
+
+            # 每条详情请求之间必须等：复用既有节流（spec 下限与自适应降速取较大者），
+            # 不另造 sleep，也不因为"就十条"跳过。
+            await asyncio.sleep(self._interval())
+            self._detail_requests += 1
+            budget -= 1
+
+            try:
+                html = await self._fetch(url)
+            except CrawlBlockedError as exc:
+                # 429 这类「明确的限流」由 _fetch_plain 抛上来并已 mark_blocked
+                self._detail_block_reason = str(exc)
+                self._detail_stopped = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                # 超时 / 404 / 非 HTML 响应：只丢这一条的详情，不影响整页
+                self._detail_failed += 1
+                logger.warning(
+                    "[%s] 详情页抓取失败（保留列表页字段）：%s（%s）",
+                    spec.site, url, exc,
+                )
+                continue
+
+            if self.detect_blocked(html):
+                self.mark_blocked()
+                self._detail_block_reason = "详情页命中风控信号（验证码/限流/人机校验）"
+                self._detail_stopped = True
+                break
+
+            detail = self.parse_detail_page(html)
+            merged = 0
+            for name, value in detail.items():
+                # 详情页字段覆盖列表同名字段（详情页更细）；
+                # 取不到的一律保留列表原值 —— 不要用空值把已有数据洗掉。
+                if value in (None, "", []):
+                    continue
+                row[name] = value
+                merged += 1
+
+            if merged:
+                self._detail_ok += 1
+            else:
+                self._detail_failed += 1
+                logger.warning(
+                    "[%s] 详情页解析不到任何字段（保留列表页字段）：%s", spec.site, url
+                )
+
+    def _finalize_detail_notes(self) -> None:
+        """把这一次抓取的详情页情况写进说明条目（并入任务 message）。"""
+        if not self._detail_active():
+            return
+        if self._detail_requests:
+            self.detail_notes.append(
+                f"平台 {self.spec.site} 详情页：成功 {self._detail_ok} 条，"
+                f"失败 {self._detail_failed} 条（失败条目保留列表页字段）"
+            )
+        if self._detail_stopped:
+            self.detail_notes.append(
+                f"平台 {self.spec.site} 详情页抓取已停止：{self._detail_block_reason}"
+                f"（已抓到的列表数据照常保留，未再发出新请求）"
+            )
+        elif self._detail_requests >= self._detail_budget() > 0:
+            self.detail_notes.append(
+                f"平台 {self.spec.site} 详情页请求已达上限 "
+                f"{self._detail_budget()} 条，其余条目仅保留列表页字段"
+            )
+
+    # ---------------------------------------------------------- 输出映射
+    #
+    # 为什么映射放在执行器里而不是服务层：``mapping`` 写在 YAML 里，是
+    # **这个数据源自己的输出契约**；服务层只认标准化岗位字典，不该知道
+    # 某个站点把标题叫 ``job_name`` 还是 ``position``。
+
+    def _shape_records(self, batch: List[Dict], params: Dict[str, Any], page_url: str) -> List[Dict]:
+        """按 spec.target 决定这一页记录的输出形态。"""
+        if self.spec.target == "job":
+            mapped = [self._map_to_job(row, params, page_url) for row in batch]
+            return [m for m in mapped if m]
+
+        # generic：保持原样（分析用、不进岗位表），但显式打标 ——
+        # 下游 ``deduplicate_jobs`` 只保留有 job_key 的行，没有标记就会被
+        # 静默吞掉，表现成「YAML 配好了、抓到了、库里一条没有」。
+        for row in batch:
+            row["_target"] = "generic"
+        return batch
+
+    def _map_to_job(self, row: Dict[str, Any], params: Dict[str, Any], page_url: str) -> Optional[Dict[str, Any]]:
+        """把一条抽取结果按 ``mapping.field_map`` 映射成标准岗位字典。
+
+        缺少 ``title`` 时返回 None（无法生成 job_key，入库没有意义）；
+        其余字段缺失一律留空串，由服务层 ``normalize_job`` 决定怎么补。
+        """
+        spec = self.spec
+
+        def pick(name: str) -> str:
+            source = spec.field_map.get(name) or name
+            value = row.get(source)
+            if isinstance(value, list):
+                value = "、".join(str(v) for v in value)
+            return "" if value is None else str(value).strip()
+
+        mapped: Dict[str, Any] = {
+            name: pick(name)
+            for name in JOB_STANDARD_FIELDS
+            if name not in JOB_SALARY_FIELDS
+        }
+
+        salary = pick("salary")
+        if salary:
+            mapped["salary"] = salary
+        # 数值薪资：按「元 / 月」直接取，不猜单位；只给下限时上限同上限。
+        lo = _as_int(pick("min_salary"))
+        hi = _as_int(pick("max_salary"))
+        if lo is not None and hi is None:
+            hi = lo
+        if lo is not None:
+            mapped["min_salary"] = lo
+        if hi is not None:
+            mapped["max_salary"] = hi
+
+        if not mapped["city"]:
+            mapped["city"] = str(params.get("city") or "").strip()
+        if not mapped["url"]:
+            mapped["url"] = page_url
+        elif not mapped["url"].startswith(("http://", "https://")):
+            mapped["url"] = urljoin(page_url, mapped["url"])
+
+        mapped["source_site"] = spec.site
+        mapped["_target"] = "job"
+
+        if not mapped["title"]:
+            logger.warning(
+                "[%s] 一条记录缺少 title（field_map 期望字段 %r），无法入库已跳过",
+                spec.site, spec.field_map.get("title", "title"),
+            )
+            return None
+
+        # job_key 走统一实现（平台 + 标题 + 公司 + 城市），
+        # 不能在这里另算一套 —— 否则同一岗位经不同入口入库会出现两行。
+        mapped["job_key"] = generate_job_key(
+            spec.site, mapped["title"], mapped["company_name"], mapped["city"]
+        )
+        return mapped
 
     # ------------------------------------------------------------- 字段抽取
 

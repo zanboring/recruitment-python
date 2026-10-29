@@ -216,7 +216,9 @@ const showLocalDetail = async () => {
   // 否则从后端获取详情HTML
   try {
     const res = await getJobDetailHtml(props.job.id);
-    localDetailHtml.value = res.data?.detailHtml || '';
+    // 拦截器（api/http.ts）已 `return res.data`，拿到的就是业务对象本身，
+    // 这里再 `.data` 会恒为 undefined —— 可选链不报错，表现为「详情弹窗永远空白」。
+    localDetailHtml.value = res?.detailHtml || '';
     localDetailVisible.value = true;
   } catch (err) {
     console.error('获取本地详情失败：', err);

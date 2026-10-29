@@ -17,10 +17,12 @@
  * 这个脚本能在 CI 里以 `node scripts/xss-check.mjs` 跑，退出码非 0 即失败。
  */
 import { JSDOM } from 'jsdom';
-import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost' });
 // DOMPurify 的 Node 入口会读取全局 window；必须在 import 之前挂好
@@ -32,24 +34,22 @@ globalThis.HTMLElement = dom.window.HTMLElement;
 const outDir = mkdtempSync(join(tmpdir(), 'xss-check-'));
 const bundle = join(outDir, 'sanitize.mjs');
 
-// Windows 下直接用 execFile 调 .cmd 会 EINVAL（Node 20+ 不再隐式走 shell），
-// 所以统一用 node 去执行 esbuild 的 JS 入口 —— 跨平台且不依赖 shell。
-const esbuildBin = join('node_modules', 'esbuild', 'bin', 'esbuild');
+// 走 esbuild 的 **JS API**，不用它的命令行入口。
+// 原因：`node_modules/esbuild/bin/esbuild` 在 Windows 上是个 JS shim，用 `node`
+// 执行没问题；但在 Linux 上它是**原生 ELF 二进制**，`node <那个文件>` 直接
+// `SyntaxError: Invalid or unexpected token`（2026-10-28 CI 就栽在这，本地永远复现不出）。
+// JS API 只要求 Node 环境，不碰二进制路径、不依赖 shell，两个平台行为一致。
+const esbuild = require('esbuild');
 
-execFileSync(
-  process.execPath,
-  [
-    esbuildBin,
-    'src/views/utils/sanitize.ts',
-    '--bundle',
-    '--format=esm',
-    '--platform=browser',
-    // 连 dompurify 一起打进来：bundle 落在临时目录，若保留 external，
-    // Node 在该目录下解析不到 node_modules。打包后体积约 30KB，无所谓。
-    `--outfile=${bundle}`,
-  ],
-  { stdio: 'inherit' },
-);
+esbuild.buildSync({
+  entryPoints: ['src/views/utils/sanitize.ts'],
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  // 连 dompurify 一起打进来：bundle 落在临时目录，若保留 external，
+  // Node 在该目录下解析不到 node_modules。打包后体积约 30KB，无所谓。
+  outfile: bundle,
+});
 
 const { sanitizeChatHtml, sanitizeSnapshotHtml } = await import(`file://${bundle}`);
 
