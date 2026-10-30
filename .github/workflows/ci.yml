@@ -57,10 +57,25 @@ jobs:
       - name: 3.11 语法闸门
         run: python -m compileall -q app scripts
 
-      - name: 跑测试
+      - name: 跑测试（含覆盖率门禁）
         # 用 `python -m` 而不是裸 `pytest`：两者 sys.path[0] 不同，裸 pytest
         # 找不到 app 包。pytest.ini 的 pythonpath 已兜底，这里再对齐本地命令。
-        run: python -m pytest -q
+        #
+        # 覆盖率门禁（W-9）：--cov=app **只统计源码**，不把 tests/ 算进来。
+        # 阈值以 **CI 这个平台**的实测值为基准，不用本地值：
+        #   本地（Windows）TOTAL 7185 语句 / 1376 未覆盖 → 80.85%
+        #   CI  （Ubuntu） TOTAL 7243 语句 / 1562 未覆盖 → 78.43%
+        # 同一份代码差 58 语句 / 2.42 个百分点（POSIX-only 分支、按平台 skip 的
+        # 用例），所以拿本地值设阈值必然偏松，且"本地量过就能过"是假的。
+        # 78.43 向下取整 = 78，再减去实测的跨平台漂移 2.4 → 76。
+        # 留这段余量不是放水：卡到 78 会让门禁时红时绿，最后人都学会忽略它，
+        # 那比没有门禁更糟。
+        run: |
+          python -m pytest -q \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=76
 
   frontend:
     name: 前端（类型 / 消毒 / 构建）

@@ -8,6 +8,9 @@ venv/
 # 测试
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # 数据库
 *.db

@@ -42,3 +42,7 @@ apscheduler==3.10.4
 pytest==8.4.2
 pytest-asyncio==0.24.0
 aiosqlite==0.20.0
+# 覆盖率门禁：CI 的 test job 用 `--cov=app` + `--cov-fail-under` 兜住覆盖率倒退。
+# 只统计 app/（源码），不统计 tests/。**不引入 .coveragerc / pyproject.toml 等配置文件**——
+# 仓库根目录条目数是「只减不增」的硬基线，覆盖率配置全部走命令行参数。
+pytest-cov==7.1.0

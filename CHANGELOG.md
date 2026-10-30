@@ -289,11 +289,17 @@ GitHub Release 的 tag 必须与之一致（`v1.0.0`）—— 更新检查就是
 
 ---
 
-## 计划中（未排期）
+## 更正：上一版误标为「计划中（未排期）」的两项（2026-10-29）
 
-> 这两条**没有实现**，只是方向。写在这里是为了避免"文档写了就当做了"。
+> 上一版把它们列进「计划中（未排期）」，并说明只是方向 —— **事实上两项都已在
+> [1.0.0]（2026-09-17）随发布落地**。本节改为指认实现位置，避免后来人
+> （包括面试官）读到"文档说没做"就认为能力缺失。
 
-- 浏览器扩展 / 油猴脚本采集通道：在真实登录态的浏览器里按人操作节奏采集，
-  从原理上规避无头浏览器指纹与 IP 集中访问（详见 README「采集通道」一节）
-- robots.txt 实际接入：`BaseCrawler.check_robots_allowed()` 已实现解析逻辑，
-  但**从未被任何调用方使用**，目前等于没有合规检查
+- **浏览器扩展 / 油猴脚本采集通道**：已于 **1.0.0** 实现，见
+  `userscript/recsys-collector.user.js`（真实登录态的浏览器里按人操作节奏采集）；
+  回传入口 `POST /api/crawler/ingest`（令牌头 `X-Collect-Token`），
+  用例 `tests/test_browser_ingest.py`（23 项，含平台标识一致性与"采集不得触发下架判定"）
+- **robots.txt 实际接入**：已于 **1.0.0** 实现，见 `app/crawlers/robots.py`
+  （按域名缓存 1 小时、`crawl_robots_strict` 严格 / 宽松两种处置）；
+  调用点是 `app/services/crawler_service.py` 的 `robots.gate(platform, probe)`，
+  用例 `tests/test_throttle.py`
