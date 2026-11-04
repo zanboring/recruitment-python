@@ -9,9 +9,10 @@ APScheduler 定时任务都调用 start_crawl。
 现在统一收敛到这里，scheduler 只负责按计划调用。
 """
 import logging
+import re
 from datetime import timedelta
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -27,7 +28,9 @@ from app.crawlers.cleaner import (
     is_senior_job,
 )
 from app.crawlers.registry import SUPPORTED_PLATFORMS, display_label, get_crawler, probe_url
+from app.crawlers.spec_schema import REGISTERED_SPEC_SITES
 from app.crawlers.throttle import await_domain_slot, daily_quota
+from app.models.company import Company
 from app.models.crawl_task import CrawlTask
 from app.models.job import Job
 
@@ -78,6 +81,83 @@ PLATFORM_ALIASES = {
 # 而 ``SUPPORTED_PLATFORMS`` 仍然是「能不能启动一次爬取任务」的判据：
 # 它必须与 ``get_crawler()`` 能实例化的范围一致，否则接口会把用户引向必然失败的任务。
 KNOWN_PLATFORMS = frozenset(PLATFORM_META)
+
+# ---------------------------------------------------------------- 数据来源（source_site）
+#
+# 允许入库的来源，三个集合的并集：
+#   1. 服务端已实现爬虫 `SUPPORTED_PLATFORMS`（boss / 51job / 声明式数据源）
+#   2. 浏览器采集能上报、但服务端没有爬虫的平台 `KNOWN_PLATFORMS`（zhaopin / liepin）
+#   3. 演示数据 `seed`（scripts/seed_demo_data.py 专用）
+#
+# **为什么要有白名单**：`source_site` 是判断「这条数据是真是假」的唯一依据。
+# 一旦出现空值或拼错的平台名，下游按来源做的隔离就漏了 —— 而 seed 数据混进
+# 真实统计后，谁也没法再从数据本身看出来。
+VALID_SOURCE_SITES = frozenset(SUPPORTED_PLATFORMS) | KNOWN_PLATFORMS | {"seed"}
+
+# 演示数据标记：下游「真实 / 演示」的划分只认这一个值，不要另造同义词
+DEMO_SOURCE_SITE = "seed"
+
+
+def valid_source_sites() -> frozenset:
+    """此刻允许入库的来源集合。
+
+    **每次调用现算，不用导入时的快照**：`SUPPORTED_PLATFORMS` 是启动时由
+    `specs/` 目录算出的，而声明式数据源可以在运行期加载（`load_spec_file`）。
+    用快照会让「加一个 yaml 就接入新源」在入库环节被拒 —— 抓到了却存不进去，
+    排查时看到的是「采集成功 0 条」，根因却在来源校验。
+    """
+    return VALID_SOURCE_SITES | frozenset(REGISTERED_SPEC_SITES)
+
+
+def normalize_source_site(raw) -> str:
+    """归一化来源标识；空值或未知值**抛 ValueError**（拒绝入库）。
+
+    与 `normalize_platform()` 的关键区别（不要混用）：
+    `normalize_platform("")` 会**回退到 boss** —— 那是「用户没选平台」时给 UI 用的兜底。
+    入库场景绝不能这样：把未知来源写成 boss，等于把「来源不可信」这条信息永久抹掉，
+    数据之后再也分不出真假。所以这里宁可拒绝，也不猜。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("source_site 为空，无法判断数据来源")
+
+    key = PLATFORM_ALIASES.get(text) or PLATFORM_ALIASES.get(text.lower()) or text.lower()
+    allowed = valid_source_sites()
+    if key not in allowed:
+        raise ValueError(
+            f"未知 source_site={text!r}（允许：{', '.join(sorted(allowed))}）"
+        )
+    return key
+
+
+async def count_jobs_by_source(db: AsyncSession) -> dict:
+    """按来源统计岗位数（只读）。
+
+    返回::
+
+        {"by_source": {"seed": 196, "boss": 1}, "total": 197,
+         "demo": 196, "real": 1, "unknown": 0}
+
+    **为什么需要它**：项目此前的状态是「196 条岗位全部来自 seed 脚本」，
+    但没有任何口径能回答「这批里有多少是真的」—— 图表把演示数据与真实采集
+    混在一起，面试被问「这些数据哪来的」答不上来。有了这个统计，
+    「真实 / 演示」的边界就是一次查询，而不是靠人记得。
+    """
+    rows = (
+        await db.execute(select(Job.source_site, func.count()).group_by(Job.source_site))
+    ).all()
+    by_source = {(source or ""): int(count) for source, count in rows}
+    total = sum(by_source.values())
+    demo = by_source.get(DEMO_SOURCE_SITE, 0)
+    unknown = by_source.get("", 0)
+    return {
+        "by_source": by_source,
+        "total": total,
+        "demo": demo,
+        # 「真实」= 非 seed 且来源非空。非 0 的 unknown 说明有绕过校验的历史写入。
+        "real": total - demo - unknown,
+        "unknown": unknown,
+    }
 
 
 def normalize_platform(raw) -> str:
@@ -182,24 +262,123 @@ def normalize_job(job_data: dict) -> dict:
     return clean_job_data(safe)
 
 
+# ---------------------------------------------------------------------------
+# 公司实体：`job.company_id` 的解析规则
+#
+# **为什么之前公司表是空的**：`Company` 模型一直存在，但全仓库没有任何一处代码
+# 创建过它 —— `save_job`（本文件）只写 `company_name` 文本，`scripts/seed_demo_data.py`
+# 同样只写文本；而 `company_id` 唯一的赋值入口是 `job_service.create_job` 里
+# `request.company_id`（管理端手填），实际没人填。于是 `company` 表 0 行、
+# `job.company_id` 全为 NULL，公司维度分析只能退化到按 `company_name` 字符串聚合。
+# ---------------------------------------------------------------------------
+
+# 与 `Company.name` 的列宽一致（String(200)）
+COMPANY_NAME_MAX = 200
+
+
+def normalize_company_name(raw) -> str:
+    """公司名归一化：全角空格转半角、压缩连续空白、去掉首尾、按列宽截断。
+
+    为什么必须归一化：同一个公司名从不同站点/浏览器上报进来时常带首尾空格
+    （"字节跳动 " / "字节跳动"），不归一化就会在 `company` 表里分裂成两条，
+    公司维度统计随之失真 —— 而且这种脏数据不会报错，只会让报表"看起来不太对"。
+    """
+    text = str(raw or "").replace("\u3000", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:COMPANY_NAME_MAX]
+
+
+async def resolve_company_id(db: AsyncSession, company_name, city=None):
+    """按公司名查/建 `company` 记录，返回其 id；公司名为空时返回 None。
+
+    **重名规则（这是本函数唯一需要判断的地方，改动前先读完）**
+
+    1. **唯一性按名称判定，不区分城市。** 同一家公司在多个城市招人
+       （字节跳动 北京/上海/深圳）必须归为同一家公司，否则「按公司聚合岗位数」
+       会把它拆成三份，公司排行榜直接失真。
+    2. **代价**：同名的两家不同公司会被合并（例如两家都叫「云图科技」的空壳公司）。
+       招聘数据里这是**可接受**的取舍 —— 误合并只影响少量同名的中小公司，
+       而按 (名称, 城市) 拆表会把大公司的跨城招聘**系统性**拆散，后者伤害更大。
+    3. **创建时把本次岗位城市记为 `Company.city`**，它只代表「首次出现的城市」，
+       **不是公司总部**，不要拿它做总部判断。
+    4. **库里若已有同名多条**（历史数据或并发写入造成），**不静默取第一条**：
+       优先取城市匹配的那条，否则取 id 最小者，并打 warning 列出全部候选 id ——
+       让「数据分裂」这件事在日志里可见，而不是被悄悄吞掉。
+
+    返回 None 表示这条岗位没有公司名，调用方应把 `company_id` 留空。
+    """
+    name = normalize_company_name(company_name)
+    if not name:
+        return None
+
+    rows = (await db.execute(select(Company).where(Company.name == name))).scalars().all()
+    if rows:
+        if len(rows) == 1:
+            return rows[0].id
+        same_city = [c for c in rows if (c.city or "") == (city or "")]
+        chosen = (same_city or sorted(rows, key=lambda c: c.id))[0]
+        logger.warning(
+            "公司名 %s 在 company 表有 %s 条重复记录（ids=%s），本次使用 id=%s（依据：%s）",
+            name, len(rows), [c.id for c in rows], chosen.id,
+            "城市匹配" if same_city else "最小 id",
+        )
+        return chosen.id
+
+    company = Company(name=name, city=(city or None))
+    db.add(company)
+    # flush 而不是 commit：拿自增 id，同时把提交时机交还给调用方（与 save_job
+    # 的现有事务边界一致，避免这里偷偷提交掉半批数据）。
+    await db.flush()
+    return company.id
+
+
 async def save_job(db: AsyncSession, job_data: dict) -> bool:
     """保存单个岗位。已存在则只刷新状态与 last_seen_at，返回 False。
 
     :param job_data: 必须已过 :func:`normalize_job`（含 min_salary / max_salary）。
         这里仍用 ``.get`` 兜底而不是下标：一次字段缺失不该让整批 50 条全部回滚，
         但缺字段本身要留 warn 以便定位是哪个爬虫没遵守契约。
+
+    副作用：会按 ``company_name`` 建/复用 ``Company`` 并回填 ``company_id``
+    （规则见 :func:`resolve_company_id`）。这是所有入库路径的唯一汇合点，
+    因此公司实体只在这里维护一份。
     """
+    # 来源校验放在任何写库动作之前：来源不明的数据宁可拒绝，也不落库。
+    # 拒绝时留 error 日志并抛 ValueError —— 静默写一个空来源或默认平台，
+    # 会让「演示数据 vs 真实采集」这条边界永久失效（这是本项的修复目标）。
+    try:
+        source_site = normalize_source_site(job_data.get("source_site"))
+    except ValueError as e:
+        logger.error(
+            "岗位入库被拒（job_key=%s，title=%s）：%s",
+            job_data.get("job_key"), job_data.get("title"), e,
+        )
+        raise
+
     existing = await db.execute(select(Job).where(Job.job_key == job_data["job_key"]))
     job = existing.scalar_one_or_none()
     if job:
         job.job_status = "ACTIVE"
         job.last_seen_at = _utc_now()
+        # 存量岗位的 company_id 为空时顺手补上：重爬一次就自愈，不必等运维
+        # 手动跑回填脚本。规则与新建分支完全相同（同一个 resolve_company_id）。
+        if job.company_id is None:
+            job.company_id = await resolve_company_id(
+                db,
+                job.company_name or job_data.get("company_name"),
+                job.city or job_data.get("city"),
+            )
         return False
 
     job = Job(
         title=job_data.get("title", ""),
         company_name=job_data.get("company_name", ""),
-        source_site=job_data.get("source_site", ""),
+        # 公司实体在这里建/复用 —— 这是全部入库路径（服务端爬虫、浏览器上报、
+        # 声明式数据源）的唯一汇合点，所以只在这一处做即可。
+        company_id=await resolve_company_id(
+            db, job_data.get("company_name"), job_data.get("city")
+        ),
+        source_site=source_site,
         job_key=job_data["job_key"],
         job_status="NEW",
         city=job_data.get("city", ""),
@@ -235,6 +414,16 @@ async def ingest_browser_jobs(db: AsyncSession, jobs: list, source_site: str, ci
        过滤规则）单一来源留在服务端，否则两个入口的口径必然漂移。
     """
     result = {"received": len(jobs or []), "saved": 0, "duplicate": 0, "filtered": 0, "invalid": 0}
+
+    # 整批来源先校验：来源为空 / 未知时**一条都不入**，并留一条 error 日志。
+    # 为什么整批而不是逐条：逐条会打印 N 条同样的日志，反而把真正的原因淹没；
+    # 而「平台传错」本来就是调用方的整批参数错误，不是某条数据的属性。
+    try:
+        source_site = normalize_source_site(source_site)
+    except ValueError as e:
+        logger.error("浏览器上报整批被拒（received=%s）：%s", result["received"], e)
+        result["invalid"] = result["received"]
+        return result
 
     for raw in jobs or []:
         if not isinstance(raw, dict):
@@ -272,10 +461,16 @@ async def ingest_browser_jobs(db: AsyncSession, jobs: list, source_site: str, ci
             result["filtered"] += 1
             continue
 
-        if await save_job(db, cleaned):
-            result["saved"] += 1
-        else:
-            result["duplicate"] += 1
+        try:
+            if await save_job(db, cleaned):
+                result["saved"] += 1
+            else:
+                result["duplicate"] += 1
+        except ValueError as e:
+            # 单条被 save_job 拒绝（例如来源在清洗后变空）：拒绝这一条，
+            # 但不让整批回滚 —— 浏览器一次可能上报几百条，一条脏数据不该拖累全部。
+            result["invalid"] += 1
+            logger.warning("浏览器上报条目被拒：%s", e)
 
     await db.commit()
     return result
@@ -329,6 +524,12 @@ async def _crawl_platform(db: AsyncSession, keyword: str, city: str, platform: s
     # 详情页抓取的失败条数 / 风控即停 / 预算截断由执行器自行记录，
     # 这里并进同一条任务 message —— 不另造返回结构。
     notes.extend(getattr(crawler, "detail_notes", []) or [])
+    # 爬虫报告「被风控/登录页拦下」时必须把原因写进任务说明。
+    # 否则任务显示「已完成 / 0 条」，看起来像"这批关键词没数据"，
+    # 实际是被拦了 —— 这类静默失败最难排查（2026-11-03 在 BOSS 上实测到此形态）。
+    blocked_reason = getattr(crawler, "blocked_reason", "") or ""
+    if blocked_reason:
+        notes.append(f"平台 {platform} 未取到岗位：{blocked_reason}")
     generic_rows = [j for j in jobs if j.get("_target") == "generic"]
     if generic_rows:
         notes.append(

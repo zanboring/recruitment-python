@@ -36,6 +36,48 @@ def test_parse_json_empty_raises():
         vision_service._parse_json_reply("")
 
 
+# 真实模型返回样本（2026-11-04 用 GLM-4V-Flash 实拍抓取，**不要"美化"它**）：
+# 三个特征同时出现——Markdown 围栏、缩进 4 空格、最后一个字段后带尾逗号。
+# 这条用例存在的意义：之前所有用例喂的都是手写的标准 JSON，于是线上必然复现的
+# 「尾逗号导致整条视觉导入失败」在测试里一次都没暴露过。
+REAL_MODEL_REPLY = """```json
+{
+    "title": "AI应用开发工程师",
+    "company_name": "深圳智元科技有限公司",
+    "city": "深圳",
+    "salary_min_k": 25,
+    "salary_max_k": 40,
+    "experience": "3-5年",
+    "education": "本科",
+    "skills": "Python, FastAPI, RAG, LangChain, Milvus, K8s",
+    "description": "负责AI应用后端服务设计与开发。",
+}
+```"""
+
+
+def test_parse_real_model_reply_with_trailing_comma():
+    """真实返回带尾逗号时仍能解析（否则视觉导入 100% 失败）。"""
+    data = vision_service._parse_json_reply(REAL_MODEL_REPLY)
+    assert data["title"] == "AI应用开发工程师"
+    assert data["salary_min_k"] == 25
+    assert data["salary_max_k"] == 40
+    assert data["skills"].startswith("Python")
+
+
+def test_parse_json_trailing_comma_inside_array():
+    """尾逗号出现在数组里同样要容忍。"""
+    reply = '{"skills": ["Python", "FastAPI", ], "city": "深圳"}'
+    data = vision_service._parse_json_reply(reply)
+    assert data["skills"] == ["Python", "FastAPI"]
+    assert data["city"] == "深圳"
+
+
+def test_parse_json_truncated_still_raises():
+    """尾逗号容错不能顺带把"真的坏了"的输出也放过去。"""
+    with pytest.raises(ValueError):
+        vision_service._parse_json_reply('{"title": "X", "city": ')
+
+
 def test_to_int_handles_k_suffix():
     assert vision_service._to_int("20K") == 20
     assert vision_service._to_int("20") == 20

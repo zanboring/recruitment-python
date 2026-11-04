@@ -37,6 +37,7 @@ EXTRACT_PROMPT = (
     "  skills: 技能要点，逗号分隔（如 Python, LLM, RAG）；"
     "  description: 岗位职责/要求的原文摘要（200 字以内）。"
     "无法识别或图片中没有的字段留空字符串或 null。只输出 JSON 对象本身。"
+    "注意：必须是标准 JSON——键和字符串用双引号，最后一个字段后面不要加逗号。"
 )
 
 
@@ -46,8 +47,24 @@ def _encode_image(image_bytes: bytes, mime: str = "image/jpeg") -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def _strip_trailing_commas(text: str) -> str:
+    """去掉 `}` / `]` 前多余的逗号。
+
+    GLM-4V-Flash 实测会输出 JSON5 风格的尾逗号（`"description": "...",\\n}`），
+    标准 `json.loads` 直接报错。这不是识别出错，只是模型对 JSON 语法宽松，
+    不应该让它把整条视觉导入链路判死。
+    """
+    import re
+
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(r",(\s*[}\]])", r"\1", text)
+    return text
+
+
 def _parse_json_reply(reply: str) -> dict:
-    """容错解析模型输出：剥离 Markdown 代码块与前后文本，再取 JSON。"""
+    """容错解析模型输出：剥离 Markdown 代码块、前后文本与尾逗号，再取 JSON。"""
     text = (reply or "").strip()
     if not text:
         raise ValueError("模型返回为空")
@@ -64,10 +81,16 @@ def _parse_json_reply(reply: str) -> dict:
         start, end = text.find("{"), text.rfind("}")
         if start != -1 and end > start:
             text = text[start:end + 1]
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"模型输出非合法 JSON：{text[:200]}") from e
+    last_error: json.JSONDecodeError | None = None
+    # 先按标准 JSON 解析；失败再容忍尾逗号（真实模型输出的常见形态）
+    for candidate in (text, _strip_trailing_commas(text)):
+        try:
+            data = json.loads(candidate)
+            break
+        except json.JSONDecodeError as e:
+            last_error = e
+    else:
+        raise ValueError(f"模型输出非合法 JSON：{text[:200]}") from last_error
     if not isinstance(data, dict):
         raise ValueError("模型输出非对象")
     return data

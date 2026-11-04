@@ -51,6 +51,17 @@ async def lifespan(app: FastAPI):
         from app.schema_sync import sync_missing_columns
         sync_result = await sync_missing_columns(conn)
 
+        # 一次性把库从 WAL 切回 DELETE 日志模式（幂等）。
+        # WAL 在本机并发写下会随机 SQLITE_READONLY，busy_timeout 无法救；
+        # 而 journal_mode 是持久属性，光撤掉「每连接设 WAL」不足以转换已有库。
+        # 必须在启动阶段、并发尚未开始时做 —— 见 app/database.py 的隔离实测。
+        from app.database import ensure_delete_journal_mode
+        journal_mode = await ensure_delete_journal_mode(conn)
+        if journal_mode and journal_mode != "delete":
+            logging.getLogger("app.startup").warning(
+                "SQLite journal_mode=%s（期望 delete）：并发写可能出现 readonly", journal_mode
+            )
+
     if sync_result.has_added or sync_result.skipped:
         # 逐列的补齐/失败已在 schema_sync 内按级别记录，这里补一条汇总，
         # 便于在启动日志里一眼确认「数据库结构是否落后于代码」。

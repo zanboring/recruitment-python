@@ -122,6 +122,10 @@ def find_all_elements(soup, selectors):
 class BossCrawler(BaseCrawler):
     def __init__(self):
         super().__init__("boss")
+        # 本次抓取被风控/登录页拦下的原因（空串 = 没被拦）。
+        # 服务层会把它写进任务说明 —— 否则任务只显示「已完成 / 0 条」，
+        # 看起来像「没抓到数据」，实际是被拦了（这正是 D-5 的表现）。
+        self.blocked_reason = ""
 
     async def _wait_for_any_selector(self, page, selectors, timeout=10000):
         for selector in selectors:
@@ -193,9 +197,29 @@ class BossCrawler(BaseCrawler):
                         html = await page.content()
                         # 风控检测：验证码/安全验证等信号出现时标记降速并跳过该页，
                         # 绝不把「验证码页」当「无岗位结果」静默入库。
-                        if self.detect_blocked(html, 200):
+                        #
+                        # URL 与标题也要一起看（2026-11-03 实测）：BOSS 被风控时
+                        # 重定向到 /web/user/?..._security_check=6_... 并渲染一个
+                        # 不含任何风控关键词的空壳页 —— 只扫正文会漏判，
+                        # 那一页就会被当成「这页没有岗位」，任务显示 0 条。
+                        #
+                        # 用 getattr 而不是 page.url：这里的 page 可能是测试替身，
+                        # 未必有 url 属性 —— 读属性失败不该让整次抓取崩掉。
+                        final_url = getattr(page, "url", "") or ""
+                        try:
+                            page_title = await page.title()
+                        except Exception:  # noqa: BLE001 - 标题取不到不影响判定
+                            page_title = ""
+                        if self.detect_blocked(html, 200, final_url, page_title):
                             self.mark_blocked()
-                            logger.warning(f"Page {page_num} 触发风控信号，跳过并自适应降速")
+                            self.blocked_reason = (
+                                f"页面被重定向到登录/安全校验页（{final_url}）—— "
+                                "无登录态或已被风控拦截，本次未取到任何岗位"
+                            )
+                            logger.warning(
+                                "Page %s 触发风控信号，跳过并自适应降速：%s",
+                                page_num, self.blocked_reason,
+                            )
                             break
                         page_results = await self.parse_page(html, keyword)
                         if not page_results:

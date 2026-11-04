@@ -36,7 +36,7 @@ app/crawlers/registry.py    ← 自动注册（不用改）
 2. 改 `site`（小写标识）、`label`（中文名）、`url`
 3. 用浏览器 DevTools 找到**列表项**的 CSS 选择器，填进 `list.container`
 4. 把要抽的字段写成 `字段名: "CSS选择器::取值方式"`
-5. 重启服务。`/api/crawler/platforms` 里就会出现这个平台，`implemented: true`
+5. 重启服务。`/api/crawler/options` 里就会出现这个平台，`implemented: true`
 
 不需要注册、不需要 import、不需要动任何 `.py`。
 

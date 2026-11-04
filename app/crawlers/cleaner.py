@@ -45,16 +45,75 @@ _SKILL_MATCHERS = {skill: _build_skill_matcher(skill) for skill in SKILL_KEYWORD
 SKILL_PATTERNS = list(_SKILL_MATCHERS.values())
 
 
+# 资深岗的年限门槛：**经验区间的下界** ≥ 该值才算资深。
+SENIOR_MIN_YEARS = 5
+
+# 经验文本里的「明确不设门槛」措辞。命中即视为 0 年要求（不是资深岗）。
+_NO_REQUIREMENT_KEYWORDS = ("应届", "在校", "实习", "无经验", "无需经验", "经验不限", "不限")
+
+# 区间：「3-5年」「3~5年」「3－5年」「3至5年」「3到5年」「3--5年」
+_EXP_RANGE_RE = re.compile(r"(\d+)\s*(?:\.\d+)?\s*(?:-{1,2}|[~～－—–]|至|到)\s*(\d+)\s*年")
+# 上界封顶：「5年以下」「5年以内」「3年及以下」—— 门槛不是 5，不能算资深
+_EXP_AT_MOST_RE = re.compile(r"(\d+)\s*年\s*(?:及)?\s*以\s*(?:内|下)")
+# 下界敞开：「5年以上」「5年及以上」「5年+」
+_EXP_AT_LEAST_RE = re.compile(r"(\d+)\s*年\s*(?:及)?\s*以\s*上|(\d+)\s*年\s*\+")
+# 单个数字：「8年」「3 年」
+_EXP_SINGLE_RE = re.compile(r"(\d+)\s*年")
+
+
+def _experience_lower_bound(experience) -> "int | None":
+    """从经验要求文本解析「下界年限」；没有年限信息时返回 None。
+
+    **只取下界**：招聘语境里「3-5年」的门槛是 3 年，不是 5 年。
+    原实现 ``"5" in experience`` 把上界当门槛 —— 只要文本里出现字符 5 就整条丢弃，
+    于是「3-5年」「1-5年」这种下界只有 1~3 年的岗位被整批误杀；
+    「15年」这类含 5 的写法也会误判。
+
+    解析优先级（先行者胜）：
+      1. 明确不设门槛的措辞（应届 / 不限 / 无经验 …）→ 0
+      2. 上界封顶（5年以下 / 3年以内）→ 0（门槛很低，不是资深）
+      3. 区间（3-5年）→ 取前一个数
+      4. 下界敞开（5年以上 / 5年+）→ 取该数
+      5. 单个年限（8年）→ 取该数
+    """
+    text = str(experience or "").strip()
+    if not text:
+        return None
+    if any(kw in text for kw in _NO_REQUIREMENT_KEYWORDS):
+        return 0
+
+    m = _EXP_AT_MOST_RE.search(text)
+    if m:
+        return 0
+    m = _EXP_RANGE_RE.search(text)
+    if m:
+        return int(m.group(1))
+    m = _EXP_AT_LEAST_RE.search(text)
+    if m:
+        return int(m.group(1) or m.group(2))
+    m = _EXP_SINGLE_RE.search(text)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 def is_senior_job(title: str, experience: str) -> bool:
-    text = title + experience
+    """判定是否为「资深岗」（采集时会被丢弃）。两条独立判据，任一命中即算。
+
+    1. **职级词**（高级 / 资深 / 架构师 / 团队负责人 …）—— 这一层是对的，保留原样；
+    2. **经验年限下界 ≥ 5 年**（5-10年 / 8年 / 5年以上）。
+
+    反例（**都不是**资深岗，必须放行）：应届、1年以内、1-3年、3-5年、1-5年、经验不限。
+
+    为什么不能用 ``"5" in experience``：那只要求文本里出现字符 5，
+    与「门槛是否 5 年」无关 —— 采集条数远低于页面可见数，根因就是它。
+    """
+    text = f"{title or ''}{experience or ''}"
     for kw in SENIOR_KEYWORDS:
         if kw in text:
             return True
-    if "5" in experience and "年" in experience:
-        return True
-    if "10" in experience and "年" in experience:
-        return True
-    return False
+    lower = _experience_lower_bound(experience)
+    return lower is not None and lower >= SENIOR_MIN_YEARS
 
 
 def is_invalid_job(title: str, description: str) -> bool:

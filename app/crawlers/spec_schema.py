@@ -47,6 +47,14 @@ SPEC_DIR = Path(__file__).parent / "specs"
 # 站点标识只允许字母数字下划线中划线，避免被当作路径或注入
 _SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,48}$")
 
+# 运行期加载过的声明式数据源标识（`source_site` 白名单的一部分）。
+#
+# 为什么需要可变集合：`registry.SUPPORTED_PLATFORMS` 是**导入时**由 `specs/`
+# 目录算出的静态快照，而 `load_spec_file()` 允许在运行期单独加载一个 yaml
+# （测试、自定义目录、将来热加载）。这类源不在快照里，若白名单只认快照，
+# 就会出现「抓取成功、入库被拒」—— 症状看起来像数据丢了，其实是来源校验过严。
+REGISTERED_SPEC_SITES: set = set()
+
 # ``mapping.field_map`` 的取值域：Job 入库链路能接收的标准字段。
 # 键 = 标准字段名（左），值 = YAML ``list.fields`` / ``detail.fields`` 里的字段名（右）。
 # 方向选「标准字段 → 抽取字段」而不是反过来：目标 schema 是固定的，
@@ -276,6 +284,14 @@ class CrawlSpec:
                     "%smapping.target=job 但没有任何字段映射到 title（期望抽取字段 %r），"
                     "运行期所有条目都会因缺标题而无法入库", where, effective_title,
                 )
+
+        # 登记这个站点标识：`crawler_service` 的来源白名单要认「此刻确实存在的
+        # 数据源」，而 `specs/` 目录是**启动时**加载的，运行期用 `load_spec_file()`
+        # 加载的源（测试、自定义目录、将来热加载）不在那份静态快照里。不登记的话，
+        # 「加一个 yaml 就能接入新数据源」这条承诺会在入库环节被白名单拒掉。
+        # 登记点放在唯一构造入口（yaml 与 dict 两种来源都经过这里），
+        # 且放在全部校验之后，避免一个非法 spec 也把标识占进白名单。
+        REGISTERED_SPEC_SITES.add(site)
 
         return cls(
             site=site,

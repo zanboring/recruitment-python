@@ -100,6 +100,9 @@ async def update_knowledge(
         item = await KnowledgeService.update(db, knowledge_id, request)
     except ValueError as e:
         raise AppException(str(e), 404)
+    # commit 后 `updated_at`（onupdate 列）处于 expired 状态，序列化时会触发惰性加载
+    # → 异步会话下抛 MissingGreenlet → 500。先显式 refresh，保证响应可序列化。
+    await db.refresh(item)
     return Result.success(KnowledgeBaseResponse.model_validate(item))
 
 
@@ -128,6 +131,7 @@ async def toggle_knowledge(
         item = await KnowledgeService.toggle_status(db, knowledge_id)
     except ValueError as e:
         raise AppException(str(e), 404)
+    await db.refresh(item)
     return Result.success(KnowledgeBaseResponse.model_validate(item))
 
 
@@ -143,6 +147,7 @@ async def set_knowledge_score(
         item = await KnowledgeService.set_score(db, knowledge_id, score)
     except ValueError as e:
         raise AppException(str(e), 404)
+    await db.refresh(item)
     return Result.success(KnowledgeBaseResponse.model_validate(item))
 
 

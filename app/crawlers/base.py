@@ -173,14 +173,31 @@ class BaseCrawler(ABC):
         await asyncio.sleep(self._adaptive_delay())
 
     @staticmethod
-    def detect_blocked(content: str, status_code: int = 200) -> bool:
+    def detect_blocked(content: str, status_code: int = 200, url: str = "", title: str = "") -> bool:
         """检测响应中是否出现风控信号。
 
         返回 True 时调用方应：1) 调用 mark_blocked() 自适应降速；
         2) 对整页结果判定为不可用（不把验证码页当空列表入库）。
+
+        **为什么 URL 与标题也要参与判定**（2026-11-03 实测）：
+        BOSS 被风控时会把搜索页**重定向**到
+            https://www.zhipin.com/web/user/?from=passport-zp&...&_security_check=6_...
+        再渲染一个 9.5KB 的空壳页。那个页面里**没有任何**风控关键词
+        （没有「验证码」「安全验证」「captcha」），标题也只是 `<title>BOSS直聘</title>`，
+        只有真正等过选择器才会看到它 15 秒不出岗位卡片。
+        只扫正文的实现会判成「没被风控」，于是这一页被当成「这页没有岗位」，
+        任务显示 COMPLETED / 0 条 —— 看起来像没数据，实际是被拦了。
+        风控的证据留在 URL 与标题里，所以这两个信号也必须一起看。
         """
         if status_code == 429:
             return True
+
+        # 重定向类信号：BOSS 的安全校验 / 登录页跳转
+        redirect_signals = ("_security_check", "passport-zp")
+        probe = f"{url or ''} {title or ''}".lower()
+        if any(s in probe for s in redirect_signals):
+            return True
+
         if not content:
             return False
         low = content.lower()[:4000]

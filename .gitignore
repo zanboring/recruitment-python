@@ -15,6 +15,12 @@ htmlcov/
 # 数据库
 *.db
 *.sqlite3
+# SQLite WAL 模式的副文件：开启 WAL 后库文件旁边会多出 -wal / -shm 两个文件，
+# 不忽略的话每个开发者的 git status 都是脏的（而且它们是运行期产物，不该入库）
+*.db-wal
+*.db-shm
+*.sqlite3-wal
+*.sqlite3-shm
 
 # 日志
 logs/

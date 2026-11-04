@@ -6,6 +6,11 @@
     python scripts/seed_demo_data.py          # 默认生成 200 条
     python scripts/seed_demo_data.py 500      # 自定义条数
 
+⚠️ **仅用于演示环境**。数据是「按真实岗位画像组合」合成的，``source_site='seed'``。
+一旦进入真实采集阶段（爬虫 / 油猴 / 视觉导入），**不要再跑本脚本** ——
+合成行与真实行混在一起，所有统计口径都会失去意义，也没法回答
+「这些岗位是哪来的」。清掉 seed 用 ``scripts/purge_seed_data.py``（默认 dry-run）。
+
 设计：
 - 幂等：job_key（平台+标题+公司+城市）已存在则跳过，重复执行不会产生重复数据；
 - 真实性：按真实岗位画像组合（AI应用 / Python后端 / 前端 / 运维 / 数据），
