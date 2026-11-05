@@ -165,6 +165,7 @@ def check_branches(root: str, rep: Report) -> None:
 
     stale_merged: list[str] = []
     unmerged: list[str] = []
+    merge_only: list[str] = []
     no_upstream: list[str] = []
 
     for ln in out.splitlines():
@@ -184,7 +185,14 @@ def check_branches(root: str, rep: Report) -> None:
             if not name.startswith(KEEP_PREFIXES):
                 stale_merged.append(f"{name}@{sha}")
         else:
-            unmerged.append(f"{name}@{sha}")
+            # 「不是 dev 的祖先」≠「有独有工作」。开发者按纪律 merge 过 dev 之后，
+            # 分支头就是一个合并提交，它永远不可能是 dev 的祖先，但一点独有内容都没有。
+            # 判据要看**非 merge 的独有提交数** —— 为 0 就是纯合并/落后，不是独有。
+            cnt, out_cnt = git(["rev-list", "--count", f"dev..{name}", "--no-merges"], root)
+            if cnt == 0 and (out_cnt or "").strip() == "0":
+                merge_only.append(f"{name}@{sha}")
+            else:
+                unmerged.append(f"{name}@{sha}")
 
     if stale_merged:
         for b in stale_merged:
@@ -196,6 +204,10 @@ def check_branches(root: str, rep: Report) -> None:
         for b in no_upstream:
             if not b.startswith("chore/legacy"):
                 rep.line(YELLOW, f"本地独有分支（无远端对照）：{b}")
+
+    if merge_only:
+        for b in merge_only:
+            rep.line(GREEN, f"已对齐 dev（仅合并提交，无独有内容）：{b}")
 
     if unmerged:
         for b in unmerged:
