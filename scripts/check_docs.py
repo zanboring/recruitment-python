@@ -153,7 +153,15 @@ def count_collected_tests() -> int:
 def _report(label: str, documented: int, measured: int, must_equal: bool = True) -> bool:
     ok = (documented == measured) if must_equal else (measured >= documented)
     mark = "OK  " if ok else "FAIL"
-    print(f"[{mark}] {label}：文档值 {documented} / 实测值 {measured}")
+    # 「不少于」模式下两个数可以不相等。光看「文档值 1031 / 实测值 1032」+ OK，
+    # 会让人以为判据坏了（一度真的怀疑过）。把判据写进输出，省掉这次怀疑。
+    detail = ""
+    if not must_equal:
+        if measured >= documented:
+            detail = "（判据：实测 ≥ 文档；文档是当时的基线，新增用例不必回改）"
+        else:
+            detail = f"（判据：实测 ≥ 文档；实测少了 {documented - measured} 条 = 有用例被删）"
+    print(f"[{mark}] {label}：文档值 {documented} / 实测值 {measured}{detail}")
     return ok
 
 

@@ -238,16 +238,11 @@ async def intelligent_recommend(
 
 
 
-class VisionImportRequest(BaseModel):
-    # 兼容两段式：先 POST preview 识别（不入库），确认后再带 validate=true 入库
-    validate: bool = False
-
-
 @router.post("/vision-import")
 @log_action("视觉识别导入岗位")
 async def vision_import(
     file: UploadFile,
-    request: VisionImportRequest = Body(default=None),
+    validate: bool = False,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_admin),
 ):
@@ -256,6 +251,12 @@ async def vision_import(
     用智谱 GLM-4V-Free 识别图片中的招聘信息并结构化：
     - 首次调用（validate=false，默认）只返回识别结果，不写库，供前端预览确认；
     - 前端确认后带 validate=true 再次提交，识别并入库（job_key 幂等去重）。
+
+    ``validate`` 是 **query 参数**（前端调的是 ``?validate=true``）。此处曾写成
+    ``request: VisionImportRequest = Body(default=None)``，与 multipart 上传混用：
+    multipart 请求没有 JSON body，``request`` 恒为 None，于是入库分支永远走不到，
+    前端点「确认入库」只会一直返回 ``saved: false``。接口层此前没有任何用例覆盖，
+    所以该缺陷长期未被发现（2026-11-04 由 codebuddy 联调时发现）。
     """
     from app.services.vision_service import recognize_job_image
     from app.schemas.job import JobCreateRequest
@@ -277,7 +278,7 @@ async def vision_import(
     if not job_data.get("title"):
         raise AppException("未能在图片中识别到岗位信息，请换更清晰的截图重试", 400)
 
-    if not request or not request.validate:
+    if not validate:
         return Result.success({"result": job_data, "saved": False})
 
     # 确认入库：走既有 create_job 校验与 job_key 去重口径
@@ -304,7 +305,7 @@ async def vision_import(
 @log_action("视觉批量导入岗位")
 async def vision_batch_import(
     files: list[UploadFile] = File(...),
-    request: VisionImportRequest = Body(default=None),
+    validate: bool = False,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_admin),
 ):
@@ -313,6 +314,9 @@ async def vision_batch_import(
     - 逐张识别，单张失败不影响其余（异常隔离）；
     - validate=false（默认）：只返回识别结果供预览，不写库；
     - validate=true：成功识别的逐条入库（job_key 幂等去重），失败条返回错误原因。
+
+    ``validate`` 是 **query 参数**，与 ``vision_import`` 同源同因（原写法用了
+    JSON body，multipart 请求下恒为 None，入库分支永远走不到）。
     """
     from app.services.vision_service import recognize_job_images_batch
     from app.schemas.job import JobCreateRequest
@@ -337,7 +341,7 @@ async def vision_batch_import(
     results = await recognize_job_images_batch(images)
 
     # 预览模式：只返回结果
-    if not request or not request.validate:
+    if not validate:
         return Result.success({"results": results, "saved": False})
 
     # 确认入库：成功条逐条入库，返回每条的 saved/job_id

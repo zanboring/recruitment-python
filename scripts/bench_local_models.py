@@ -9,7 +9,7 @@
 用法::
 
     python scripts/bench_local_models.py                      # 对比全部已安装模型
-    python scripts/bench_local_models.py --models qwen2.5:14b # 只测指定模型
+    python scripts/bench_local_models.py --models qwen3.5:4b # 只测指定模型
     python scripts/bench_local_models.py --output docs/reports/local-model-benchmark.md
 
 设计说明：
@@ -290,7 +290,7 @@ async def main() -> None:
         return
 
     if not models:
-        print("没有可测试的模型。可先执行：ollama pull qwen2.5:14b")
+        print("没有可测试的模型。可先执行：ollama pull qwen3.5:4b")
         return
 
     print(f"待测模型：{', '.join(models)}")

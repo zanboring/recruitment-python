@@ -36,6 +36,26 @@ from app.models.job import Job
 
 logger = logging.getLogger(__name__)
 
+# 失败状态兜底回写用的会话工厂（测试可注入，默认 app.database.async_session）。
+# 与 ``log_decorator.set_session_factory`` 同一模式：测试库是内存库，
+# 若兜底路径直连生产 engine，用例会把 FAILED 写进真实 data/recsys.db。
+_failure_session_factory = None
+
+
+def set_failure_session_factory(factory) -> None:
+    """注入「任务失败状态兜底回写」的会话工厂（测试用）。"""
+    global _failure_session_factory
+    _failure_session_factory = factory
+
+
+def _get_failure_session_factory():
+    if _failure_session_factory is not None:
+        return _failure_session_factory
+
+    from app.database import async_session
+
+    return async_session
+
 # 岗位被判定下架前允许的「未再出现」宽限期（秒）。
 OFFLINE_GRACE_SECONDS = 6 * 3600
 
@@ -630,6 +650,49 @@ async def create_pending_task(db: AsyncSession, keyword: str, city: str, platfor
     return task
 
 
+async def _mark_task_failed(db: AsyncSession, task_id: int, exc: BaseException) -> None:
+    """把任务置为 FAILED —— **保证 session 已不可用时也写得进去**。
+
+    为什么需要这个函数（原来直接在 except 里 commit）：
+    抛异常的地方通常就在同一 session 的 flush/commit 上（唯一约束冲突、
+    列宽超限、SQLite readonly）。此时 session 已被标记 needs-rollback，
+    再 commit 会抛 ``PendingRollbackError``：状态根本没写进库，任务永久停在
+    ``RUNNING``（前端只会显示"进行中"，永远不会结束），而且向上抛出的是这个
+    新异常，``str(e)`` 里的原始原因被替换掉，排查时看不到真实报错。
+
+    所以：先 rollback 让 session 可用，再写状态；连 rollback 都救不回来时，
+    用独立会话兜底（与 ``log_action`` 同一思路）。
+    """
+    reason = (str(exc) or exc.__class__.__name__)[:1000]
+
+    try:
+        await db.rollback()
+        task = await db.get(CrawlTask, task_id)
+        if task is not None:
+            task.status = "FAILED"
+            task.message = reason
+            await db.commit()
+            return
+    except Exception:
+        logger.warning("任务 %s 状态回写失败，改用独立会话兜底", task_id, exc_info=True)
+
+    try:
+        async with _get_failure_session_factory()() as session:
+            task = await session.get(CrawlTask, task_id)
+            if task is not None:
+                task.status = "FAILED"
+                task.message = reason
+                await session.commit()
+                return
+    except Exception:
+        logger.error(
+            "任务 %s 最终状态回写失败，将停留在 RUNNING，需人工修正为 FAILED：%s",
+            task_id,
+            reason,
+            exc_info=True,
+        )
+
+
 async def run_crawl(
     db: AsyncSession,
     task: CrawlTask,
@@ -644,6 +707,9 @@ async def run_crawl(
     """
     task.status = "RUNNING"
     await db.commit()
+    # 先把 id 取出来：后面 session 一旦需要 rollback，task 实例会过期，
+    # 再访问 task.id 会触发一次 IO，而此时连接可能正是坏的那个。
+    task_id = task.id
 
     # ---- 前置校验：把「必然失败」的请求拦在爬取之前 ----
     # 这些失败重试不会变好，却要白等 4 次指数退避（2+4+8 秒），
@@ -715,9 +781,10 @@ async def run_crawl(
         await db.commit()
         return total_saved
     except Exception as e:
-        task.status = "FAILED"
-        task.message = str(e)
-        await db.commit()
+        # 不在这里直接 commit：抛异常的位置很可能就是同一 session 的 flush，
+        # session 已 needs-rollback，直接 commit 会抛 PendingRollbackError，
+        # 把「任务 FAILED」这件事本身也搞丢（见 _mark_task_failed 的说明）。
+        await _mark_task_failed(db, task_id, e)
         raise
 
 

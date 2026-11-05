@@ -162,12 +162,15 @@ async def _isolate_operation_log(engine):
     与 ``usage_service.set_session_factory`` 同一模式。
     """
     from app.utils import log_decorator
+    from app.services import crawler_service
 
-    log_decorator.set_session_factory(
-        async_sessionmaker(engine, expire_on_commit=False)
-    )
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    log_decorator.set_session_factory(maker)
+    # 爬虫任务失败时的状态兜底回写同样用独立会话；不注入就会打穿到真实库。
+    crawler_service.set_failure_session_factory(maker)
     yield
     log_decorator.set_session_factory(None)
+    crawler_service.set_failure_session_factory(None)
 
 
 @pytest_asyncio.fixture

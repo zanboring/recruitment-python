@@ -565,14 +565,29 @@ _KNOWN_WEAK_JWT_SECRETS = frozenset({
 })
 
 
+def is_weak_jwt_secret(secret: str | None) -> bool:
+    """判据：命中已知默认值 / 含弱特征片段 / 长度不足 32，任一成立即弱。
+
+    抽成公共函数是刻意的 —— 生产校验（``validate_production_settings``）与
+    「监听非回环时拒绝启动」（``run_entry.py``）必须用**同一套判据**，
+    否则两处各自演化，就会出现「生产拦了、局域网没拦」这种半开状态。
+    """
+    value = (secret or "").strip()
+    if len(value) < 32:
+        return True
+    if value in _KNOWN_WEAK_JWT_SECRETS:
+        return True
+    lowered = value.lower()
+    return any(marker in lowered for marker in _WEAK_SECRET_MARKERS)
+
+
 def validate_production_settings() -> None:
     """生产环境启动前做 fail-fast 校验，而不是带着演示密钥对外服务。"""
     if settings.app_env.lower() not in {"production", "prod"}:
         return
 
     secret = (settings.jwt_secret or "").strip()
-    lowered = secret.lower()
-    if secret in _KNOWN_WEAK_JWT_SECRETS or any(m in lowered for m in _WEAK_SECRET_MARKERS):
+    if secret in _KNOWN_WEAK_JWT_SECRETS or any(m in secret.lower() for m in _WEAK_SECRET_MARKERS):
         raise RuntimeError(
             "JWT_SECRET 仍是仓库中公开的默认值，生产环境必须替换。"
             "生成方式：python -c \"import secrets;print(secrets.token_urlsafe(48))\""

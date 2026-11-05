@@ -1,15 +1,34 @@
 """前程无忧（51job）爬虫。
 
-## 为什么用 JSON 接口而不是解析 HTML
+## 两条取数路径：JSON 接口优先，渲染后的 DOM 兜底
 
-51job 的搜索结果页是**前端渲染**的：直接抓 HTML 拿到的 DOM 里没有岗位卡片，
+51job 的搜索结果页是**前端渲染**的：直接 HTTP 抓 HTML 拿到的 DOM 里没有岗位卡片，
 真实数据由页面 JS 再调一次搜索接口后填充。因此按 HTML 选择器解析会得到
 「看起来正常但永远是空列表」的结果 —— 属于最难排查的静默失败。
 
-所以这里直接请求它前端自己在用的搜索接口
+所以主路径是直接请求它前端自己在用的搜索接口
 （``https://we.51job.com/api/job/search-pc``），拿 JSON 再结构化。
 顺带的好处是字段是语义化的（``provinceName`` / ``provideSalaryString`` …），
 不必依赖易变的 CSS 类名。
+
+### 为什么还需要 DOM 兜底（2026-11-04 实测补充）
+
+搜索接口在没有配套 ``sign`` 请求头时，会返回 **HTTP 200 但正文是纯文本**
+（``当前时间: 2026-11-04 20:38:08`` + ``TraceID: …``），JSON 解析必然失败。
+此时 ``extract_items`` 返回 ``None``，老代码只能「结构不符预期 → 停止翻页」，
+结果就是**任务 COMPLETED / 0 条**，看起来像「这个城市没有岗位」。
+
+而**同一个浏览器上下文打开搜索页**却能正常渲染出岗位卡片
+（实测 20 张 ``.joblist-item``）。所以这里加了一条兜底：
+接口拿不到 JSON 时，回到搜索页等 DOM 渲染完，直接读卡片上的结构化属性
+（``sensorsdata`` 里带 jobTitle / jobSalary / jobArea / jobYear / jobDegree / jobId）。
+
+两条路径最终都汇到同一个 :meth:`Job51Crawler._map_item`，
+**字段口径只有一份**，不会因为入口不同而漂移。
+
+⚠️ 已知限制：搜索页的 ``pageNum`` 查询参数**不生效**（实测第 2 页与第 1 页重叠 16/20），
+所以 DOM 兜底只取第 1 页（约 20 条）。要更多数据请换关键词/城市组合，
+不要靠改这个参数「翻页」。
 
 ## 城市编码的来源与纪律
 
@@ -42,6 +61,26 @@ SOURCE_SITE = "51job"
 # 51job 搜索接口。api_key=51job 是它前端公开使用的固定值（非私密凭据）。
 SEARCH_API = "https://we.51job.com/api/job/search-pc"
 PAGE_SIZE = 20
+
+# 搜索页与岗位详情页（DOM 兜底路径用）。
+# 详情页形态是实测出来的：``jobs.51job.com/all/<jobId>.html`` 返回 200 但正文是错误页，
+# 而 ``we.51job.com/pc/jobdetail?jobId=<jobId>`` 返回 200 且带真实 <title>。
+# 列表卡片里的 <a href> 指向的是**公司页**（``/all/coXXXX.html``），不是岗位页，别混用。
+SEARCH_PAGE = "https://we.51job.com/pc/search"
+JOB_DETAIL = "https://we.51job.com/pc/jobdetail?jobId={job_id}"
+
+# 卡片上的岗位信息在 ``[sensorsdata]`` 元素的 sensorsdata 属性里（JSON 字符串）。
+# 这是站点自己的埋点数据，字段比可见文本稳定，也比 CSS 类名稳定。
+DOM_CARD_JS = """
+() => Array.from(document.querySelectorAll('.joblist-item')).map((el) => {
+  const holder = el.querySelector('[sensorsdata]');
+  const cname = el.querySelector('.cname');
+  return {
+    data: holder ? holder.getAttribute('sensorsdata') : null,
+    company: cname ? (cname.getAttribute('title') || cname.textContent || '') : '',
+  };
+})
+"""
 
 CITY_AREA_MAP = {
     "北京": "010000",
@@ -182,6 +221,38 @@ def _pick(item: Dict, field: str) -> str:
     return ""
 
 
+def card_to_item(card: Dict) -> Optional[Dict]:
+    """把一张 DOM 卡片（sensorsdata JSON + 公司名）转成与接口条目**同形**的 dict。
+
+    为什么转成同形而不是另写一套映射：字段口径只能有一份。
+    两条取数路径（JSON 接口 / 渲染后的 DOM）最终都进 :meth:`Job51Crawler._map_item`，
+    否则「薪资怎么解析」「城市取第一段」这类规则会在两处慢慢分叉 ——
+    本项目已经吃过一次同样的亏（job51 与 cleaner 各持一套薪资解析）。
+
+    返回 ``None`` 表示这张卡片不可用（sensorsdata 缺失或不是合法 JSON）。
+    """
+    raw = card.get("data")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    job_id = str(data.get("jobId") or "").strip()
+    return {
+        "jobName": data.get("jobTitle"),
+        "companyName": (card.get("company") or "").strip(),
+        "provideSalaryString": data.get("jobSalary"),
+        "workAreaString": data.get("jobArea"),
+        "workYearString": data.get("jobYear"),
+        "degreeString": data.get("jobDegree"),
+        "jobHref": JOB_DETAIL.format(job_id=job_id) if job_id else "",
+    }
+
+
 class Job51Crawler(BaseCrawler):
     """前程无忧爬虫。"""
 
@@ -270,11 +341,21 @@ class Job51Crawler(BaseCrawler):
                     payload = self._load_payload(body)
                     items = extract_items(payload) if payload is not None else None
                     if items is None:
-                        logger.warning(
-                            "51job 第 %s 页响应结构不符预期（status=%s），停止翻页。"
-                            "响应片段：%s",
-                            page_num, status, (body or "")[:200],
-                        )
+                        # 接口拿不到 JSON（无 sign 时返回 200 + 纯文本反爬正文）：
+                        # 回到搜索页，等 DOM 渲染完直接读卡片。只在第 1 页做，
+                        # 因为 pageNum 在那个页面上不生效（见模块文档）。
+                        dom_jobs = await self._crawl_rendered_dom(browser, keyword, area_code, city)
+                        if dom_jobs:
+                            logger.info(
+                                "51job 搜索接口未返回 JSON，已改用渲染后 DOM 取到 %s 条", len(dom_jobs)
+                            )
+                            results.extend(dom_jobs)
+                        else:
+                            logger.warning(
+                                "51job 第 %s 页响应结构不符预期（status=%s），且 DOM 兜底也没取到岗位，"
+                                "停止翻页。响应片段：%s",
+                                page_num, status, (body or "")[:200],
+                            )
                         break
 
                     page_results = [self._map_item(item, city) for item in items]
@@ -289,6 +370,78 @@ class Job51Crawler(BaseCrawler):
                 await browser.close()
 
         return deduplicate_jobs(results)
+
+    async def _crawl_rendered_dom(
+        self, browser, keyword: str, area_code: str, city: str
+    ) -> List[Dict]:
+        """兜底取数：**干净的浏览器上下文**打开搜索页 → 等卡片渲染完 → 读 ``sensorsdata``。
+
+        只在搜索接口拿不到 JSON 时调用（见模块文档「为什么还需要 DOM 兜底」）。
+
+        **为什么必须另起一个干净上下文**（2026-11-04 逐项隔离实测）：
+
+        | 上下文配置 | 渲染结果 |
+        |---|---|
+        | 爬虫的完整伪装头（`get_random_headers()`） | 0 张卡片，标题只剩「51job」空壳 |
+        | 同上但去掉 `Accept-Encoding` | 0 张卡片 |
+        | 同上但去掉全部 `Sec-*` | 0 张卡片，且标题变成「全国招聘」——查询参数被丢掉 |
+        | 只留 `Accept-Language` | **20 张卡片** |
+
+        也就是说：**这套「更像浏览器」的伪装头反而把 51job 的 SPA 打回空壳**，
+        连 `keyword`/`jobArea` 都不生效。UA 与它无关（原生 / Chrome120 / Firefox /
+        iPhone 四种 UA 都能渲染），问题出在 `Accept` / `Sec-Fetch-*` 这一组头。
+        兜底路径用最小头即可，不要试图「更真」。
+
+        对页面对象做**能力探测**再动手：测试里的替身只有 ``goto`` / ``evaluate``，
+        没有 ``wait_for_selector``。直接调用会让既有用例从「0 条」变成 AttributeError ——
+        所以这里返回空列表，保持原行为，也不去关闭别人的浏览器。
+        """
+        from urllib.parse import quote
+
+        context = None
+        page = None
+        try:
+            context = await browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                locale="zh-CN",
+                extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9"},
+            )
+            page = await context.new_page()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("51job DOM 兜底：无法创建浏览器上下文：%s", exc)
+            return []
+
+        if not hasattr(page, "wait_for_selector"):
+            return []
+
+        url = (
+            f"{SEARCH_PAGE}?jobArea={area_code}"
+            f"&keyword={quote(keyword)}&searchType=2&sortType=0"
+        )
+        try:
+            await await_domain_slot(url, settings.crawl_domain_min_interval)
+            await page.goto(url, timeout=settings.crawl_timeout * 1000)
+            # 卡片是前端渲染的，goto 返回时 DOM 里还没有岗位 —— 必须等
+            await page.wait_for_selector(".joblist-item", timeout=20000)
+            cards = await page.evaluate(DOM_CARD_JS)
+        except Exception as exc:  # noqa: BLE001 - 兜底失败不该让整次采集炸掉
+            logger.warning("51job DOM 兜底失败：%s", exc)
+            cards = []
+        finally:
+            try:
+                await context.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        jobs = []
+        for card in cards or []:
+            item = card_to_item(card)
+            if not item:
+                continue
+            job = self._map_item(item, city)
+            if job:
+                jobs.append(job)
+        return deduplicate_jobs(jobs)
 
     async def parse_page(self, page_content, keyword: str) -> List[Dict]:
         """解析一页内容（JSON 字符串或已解析的 dict）。

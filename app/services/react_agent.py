@@ -12,7 +12,7 @@
 1. **工具集独立**于单步 Function Calling 的 ``TOOLS``（Agent 需要推荐/分布等
    更丰富的动作，而单步链路只识别「要不要查库」这一种意图，两者职责不同）。
 2. **文本格式而非纯 JSON**：ReAct 用 ``Thought / Action / Final Answer`` 文本标签，
-   本地小模型（qwen2.5:14b）也能稳定输出；Action 参数仍用 JSON 便于解析。
+   本地小模型（qwen3.5:4b）也能稳定输出；Action 参数仍用 JSON 便于解析。
 3. **max_steps 硬上限 + 兜底**：每步都是一次 LLM 调用（有成本、有延迟），
    必须给循环一个上界；达到上限仍无 Final Answer 时，强制模型基于已有
    Observation 收尾，绝不无限循环。

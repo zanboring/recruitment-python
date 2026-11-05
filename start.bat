@@ -58,6 +58,6 @@ echo     访问地址 http://localhost:8080
 echo     停止服务：关闭本窗口即可
 echo.
 start "" http://localhost:8080
-"%PY%" -m uvicorn app.main:app --host 0.0.0.0 --port 8080
+"%PY%" -m uvicorn app.main:app --host 127.0.0.1 --port 8080
 
 endlocal

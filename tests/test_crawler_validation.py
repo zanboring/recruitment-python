@@ -16,8 +16,10 @@ import logging
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.models.company import Company
+from app.models.crawl_task import CrawlTask
 from app.models.job import Job
 from app.crawlers.cleaner import is_senior_job
 from app.crawlers.city_map import (
@@ -806,6 +808,132 @@ async def test_没有登录态时任务说明要写明被拦的原因(db_session
 
 
 # ==========================================================================
+# 51job：搜索接口拿不到 JSON 时的「渲染后 DOM」兜底
+#
+# 2026-11-04 实测：搜索接口在无 sign 请求头时返回 **HTTP 200 + 纯文本**：
+#     当前时间: 2026-11-04 20:38:08
+#     TraceID: ac11000117937958887308354e00a5
+# 于是 extract_items 返回 None，老代码只能「停止翻页」→ 任务 COMPLETED / 0 条，
+# 看起来像「这个城市没有岗位」，实际是被拦了。
+# 而同一个浏览器上下文打开搜索页能渲染出 20 张 `.joblist-item` 卡片。
+# ==========================================================================
+
+# 真实卡片的 sensorsdata（从渲染页原样摘下来，只保留判断所需的键）
+_CARD_SENSORSDATA = (
+    '{"jobId":"166113883","jobTitle":"Python开发工程师","jobSalary":"1-1.5万·13薪",'
+    '"jobArea":"长沙·岳麓区","jobYear":"2年及以上","jobDegree":"本科",'
+    '"jobTime":"2026-09-28 14:35:12"}'
+)
+
+
+def test_51job卡片被转换成与接口同形的条目():
+    from app.crawlers.job51 import card_to_item
+
+    item = card_to_item({"data": _CARD_SENSORSDATA, "company": " 湖南匡安网络技术有限公司 "})
+    assert item is not None
+    # 键名必须与接口条目一致，才能共用同一个 _map_item（字段口径只有一份）
+    assert item["jobName"] == "Python开发工程师"
+    assert item["companyName"] == "湖南匡安网络技术有限公司"
+    assert item["provideSalaryString"] == "1-1.5万·13薪"
+    assert item["workAreaString"] == "长沙·岳麓区"
+    assert item["workYearString"] == "2年及以上"
+    assert item["degreeString"] == "本科"
+    # 卡片里的 <a> 指向公司页，岗位详情要自己拼（实测这个形态返回 200 且带 title）
+    assert item["jobHref"] == "https://we.51job.com/pc/jobdetail?jobId=166113883"
+
+
+def test_51job卡片数据坏掉时返回None而不是抛异常():
+    from app.crawlers.job51 import card_to_item
+
+    assert card_to_item({"data": None, "company": "x"}) is None
+    assert card_to_item({"data": "不是JSON", "company": "x"}) is None
+    assert card_to_item({"data": '["数组不是对象"]', "company": "x"}) is None
+
+
+@pytest.mark.asyncio
+async def test_51job_DOM兜底在不支持选择器等待的页面上直接跳过():
+    """测试替身只有 goto/evaluate，能力探测必须让它保持原行为（返回空）。"""
+    from app.crawlers.job51 import Job51Crawler
+
+    class _BarePage:
+        async def goto(self, url, timeout=None):
+            raise AssertionError("不该发起导航")
+
+        async def evaluate(self, expr):
+            raise AssertionError("不该执行 JS")
+
+    class _BareContext:
+        async def new_page(self):
+            return _BarePage()
+
+        async def close(self):
+            pass
+
+    class _BareBrowser:
+        async def new_context(self, **kwargs):
+            return _BareContext()
+
+    jobs = await Job51Crawler()._crawl_rendered_dom(
+        _BareBrowser(), "python", "190200", "长沙"
+    )
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_51job_DOM兜底能产出可入库的岗位字典():
+    """端到端（不联网）：渲染出的卡片 → _map_item → 与 save_job 同口径的字典。"""
+    from app.crawlers.job51 import Job51Crawler
+
+    seen = {}
+
+    class _RenderedPage:
+        def __init__(self):
+            self.visited = []
+
+        async def goto(self, url, timeout=None):
+            self.visited.append(url)
+            return None
+
+        async def wait_for_selector(self, selector, timeout=None):
+            assert selector == ".joblist-item"
+
+        async def evaluate(self, expr):
+            return [{"data": _CARD_SENSORSDATA, "company": "湖南匡安网络技术有限公司"}]
+
+    class _Ctx:
+        def __init__(self):
+            self.page = _RenderedPage()
+
+        async def new_page(self):
+            return self.page
+
+        async def close(self):
+            seen["closed"] = True
+
+    class _Browser:
+        async def new_context(self, **kwargs):
+            # 兜底必须用**干净的**上下文：伪装请求头会让 51job 只回空壳页
+            seen["context_kwargs"] = kwargs
+            return _Ctx()
+
+    browser = _Browser()
+    jobs = await Job51Crawler()._crawl_rendered_dom(browser, "python", "190200", "长沙")
+
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["title"] == "Python开发工程师"
+    assert job["company_name"] == "湖南匡安网络技术有限公司"
+    assert job["city"] == "长沙"                       # 调用方指定城市优先
+    assert (job["min_salary"], job["max_salary"]) == (10000, 15000)   # 1-1.5万 → 元
+    assert job["source_site"] == "51job"
+    assert job["job_key"]                              # 有指纹才能去重入库
+    # 干净上下文：不带 Sec-Fetch / Accept 那套伪装头（实测会把页面打回空壳）
+    extra = seen["context_kwargs"].get("extra_http_headers") or {}
+    assert set(extra) == {"Accept-Language"}
+    assert seen.get("closed") is True                  # 用完要关掉，别泄漏上下文
+
+
+# ==========================================================================
 # C5｜SQLite 写锁：并发写不能因为 `database is locked` 变成 500
 #
 # 实测（scripts/stress_sqlite_writes.py，10 并发 × 20 轮）：
@@ -904,4 +1032,64 @@ async def test_并发写不会因为写锁冲突失败(tmp_path):
         await eng.dispose()
 
     assert errors == [], f"并发写不应出现锁冲突失败：{errors}"
+
+
+# ---------- 失败路径：任务不能永久停在 RUNNING ----------
+
+@pytest.mark.asyncio
+async def test_flush失败时任务仍被标记FAILED(db_session, monkeypatch):
+    """回归 qoder 审计 P0：失败状态回写被 PendingRollbackError 顶掉。
+
+    原实现在 ``except`` 里先 ``task.status = "FAILED"`` 再 ``await db.commit()``。
+    但异常通常就来自同一 session 的 flush（唯一约束冲突、列宽超限、SQLite
+    readonly），此刻 session 已 needs-rollback —— 这次 commit 会抛
+    ``PendingRollbackError``：状态没写进库（任务永久 RUNNING，前端只显示
+    "进行中"），而且向上抛出的是这个新异常，原始原因被彻底替换。
+    """
+    task = await crawler_service.create_pending_task(db_session, "Java", "长沙", ["boss"])
+    task_id = task.id
+
+    async def boom(db, keyword, city, platform):
+        # 制造真实的 flush 失败：主键重复 → IntegrityError + session needs-rollback
+        db.add(CrawlTask(id=task_id, keyword="dup", city="长沙"))
+        await db.flush()
+        return 0, [], []
+
+    monkeypatch.setattr(crawler_service, "_crawl_platform", boom)
+
+    # 抛出必须是原始异常（IntegrityError），不能变成 PendingRollbackError
+    with pytest.raises(IntegrityError):
+        await crawler_service.run_crawl(db_session, task, "Java", "长沙", ["boss"])
+
+    # 用独立会话读：被回滚过的那条连接不可信
+    factory = crawler_service._get_failure_session_factory()
+    async with factory() as fresh:
+        row = await fresh.get(CrawlTask, task_id)
+        assert row is not None
+        assert row.status == "FAILED", "任务必须落成 FAILED，否则永久停在 RUNNING"
+        assert row.message, "失败原因必须写进 message，否则前端无从排查"
+
+
+@pytest.mark.asyncio
+async def test_失败后原始原因进入message而不是类名占位(db_session, monkeypatch):
+    """``str(e)`` 为空时用类名兜底，不能让 message 变成空串。"""
+
+    class SilentError(Exception):
+        def __str__(self) -> str:
+            return ""
+
+    async def boom(db, keyword, city, platform):
+        raise SilentError()
+
+    monkeypatch.setattr(crawler_service, "_crawl_platform", boom)
+
+    task = await crawler_service.create_pending_task(db_session, "Java", "长沙", ["boss"])
+    with pytest.raises(SilentError):
+        await crawler_service.run_crawl(db_session, task, "Java", "长沙", ["boss"])
+
+    factory = crawler_service._get_failure_session_factory()
+    async with factory() as fresh:
+        row = await fresh.get(CrawlTask, task.id)
+        assert row.status == "FAILED"
+        assert row.message == "SilentError"
 
