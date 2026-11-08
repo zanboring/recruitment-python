@@ -359,6 +359,25 @@
         let currentKeyword = '';
         let currentCity = '';
 
+        // ---------------------------------------------------------------
+        // HTML 转义：这个页面是「没有构建产物时的兜底」，所以不能引 DOMPurify
+        // （塞依赖进来只会让它更难维护）。规则只有一条：**任何来自接口或用户输入的
+        // 字符串，拼进 innerHTML 之前必须过这里。**
+        //
+        // 为什么必须做：岗位标题/公司名来自爬虫（第三方可控），AI 回答来自模型输出，
+        // 搜索框内容来自用户自己——三者都能塞 `<img src=x onerror=...>`。
+        // 而同页面把 JWT 存在 localStorage，一次 XSS 就等于把令牌交出去。
+        // ---------------------------------------------------------------
+        const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+        function esc(value) {
+            return String(value === null || value === undefined ? '' : value)
+                .replace(/[&<>"']/g, ch => ESC_MAP[ch]);
+        }
+        // 纯文本但需要保留换行的场景（AI 流式输出）
+        function escText(value) {
+            return esc(value).replace(/\n/g, '<br>');
+        }
+
         const tabs = ['dashboard', 'jobs', 'stats', 'ai', 'salary'];
         const titles = {
             dashboard: '数据概览',
@@ -455,11 +474,11 @@
                 const tbody = document.getElementById('recent-jobs-body');
                 tbody.innerHTML = jobsResult.data.list.map(job => `
                     <tr class="border-b border-gray-100 hover:bg-gray-50">
-                        <td class="py-3 px-4 text-sm font-medium text-blue-600">${job.title}</td>
-                        <td class="py-3 px-4 text-sm text-gray-600">${job.company_name}</td>
-                        <td class="py-3 px-4 text-sm text-gray-600">${job.city}</td>
+                        <td class="py-3 px-4 text-sm font-medium text-blue-600">${esc(job.title)}</td>
+                        <td class="py-3 px-4 text-sm text-gray-600">${esc(job.company_name)}</td>
+                        <td class="py-3 px-4 text-sm text-gray-600">${esc(job.city)}</td>
                         <td class="py-3 px-4 text-sm font-medium text-orange-600">
-                            ¥${job.min_salary || 0}-${job.max_salary || 0}K
+                            ¥${esc(job.min_salary || 0)}-${esc(job.max_salary || 0)}K
                         </td>
                         <td class="py-3 px-4">
                             <span class="px-2 py-1 text-xs rounded-full ${job.job_status === 'ACTIVE' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700'}">
@@ -495,15 +514,15 @@
                 const tbody = document.getElementById('jobs-table-body');
                 tbody.innerHTML = result.data.list.map(job => `
                     <tr class="border-b border-gray-100 hover:bg-gray-50">
-                        <td class="py-3 px-4 text-sm text-gray-500">${job.id}</td>
-                        <td class="py-3 px-4 text-sm font-medium text-blue-600">${job.title}</td>
-                        <td class="py-3 px-4 text-sm text-gray-600">${job.company_name}</td>
-                        <td class="py-3 px-4 text-sm text-gray-600">${job.city}</td>
+                        <td class="py-3 px-4 text-sm text-gray-500">${esc(job.id)}</td>
+                        <td class="py-3 px-4 text-sm font-medium text-blue-600">${esc(job.title)}</td>
+                        <td class="py-3 px-4 text-sm text-gray-600">${esc(job.company_name)}</td>
+                        <td class="py-3 px-4 text-sm text-gray-600">${esc(job.city)}</td>
                         <td class="py-3 px-4 text-sm font-medium text-orange-600">
-                            ¥${job.min_salary || 0}-${job.max_salary || 0}K
+                            ¥${esc(job.min_salary || 0)}-${esc(job.max_salary || 0)}K
                         </td>
-                        <td class="py-3 px-4 text-sm text-gray-600">${job.experience}</td>
-                        <td class="py-3 px-4 text-sm text-gray-600">${job.education}</td>
+                        <td class="py-3 px-4 text-sm text-gray-600">${esc(job.experience)}</td>
+                        <td class="py-3 px-4 text-sm text-gray-600">${esc(job.education)}</td>
                         <td class="py-3 px-4">
                             <span class="px-2 py-1 text-xs rounded-full ${job.job_status === 'ACTIVE' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700'}">
                                 ${job.job_status === 'ACTIVE' ? '活跃' : '已关闭'}
@@ -541,7 +560,7 @@
                 const maxCount = Math.max(...cityResult.data.map(d => d.count));
                 document.getElementById('city-chart').innerHTML = cityResult.data.map(d => `
                     <div class="flex items-center gap-3">
-                        <span class="w-20 text-sm text-gray-600">${d.name}</span>
+                        <span class="w-20 text-sm text-gray-600">${esc(d.name)}</span>
                         <div class="flex-1 bg-gray-200 rounded-full h-6 overflow-hidden">
                             <div class="bg-blue-600 h-full rounded-full" style="width: ${(d.count / maxCount) * 100}%"></div>
                         </div>
@@ -554,7 +573,7 @@
                 const maxCount = Math.max(...expResult.data.map(d => d.count));
                 document.getElementById('experience-chart').innerHTML = expResult.data.map(d => `
                     <div class="flex items-center gap-3">
-                        <span class="w-24 text-sm text-gray-600">${d.name}</span>
+                        <span class="w-24 text-sm text-gray-600">${esc(d.name)}</span>
                         <div class="flex-1 bg-gray-200 rounded-full h-6 overflow-hidden">
                             <div class="bg-green-600 h-full rounded-full" style="width: ${(d.count / maxCount) * 100}%"></div>
                         </div>
@@ -567,7 +586,7 @@
                 const maxCount = Math.max(...eduResult.data.map(d => d.count));
                 document.getElementById('education-chart').innerHTML = eduResult.data.map(d => `
                     <div class="flex items-center gap-3">
-                        <span class="w-20 text-sm text-gray-600">${d.name}</span>
+                        <span class="w-20 text-sm text-gray-600">${esc(d.name)}</span>
                         <div class="flex-1 bg-gray-200 rounded-full h-6 overflow-hidden">
                             <div class="bg-purple-600 h-full rounded-full" style="width: ${(d.count / maxCount) * 100}%"></div>
                         </div>
@@ -581,7 +600,7 @@
                 document.getElementById('skill-cloud').innerHTML = skillResult.data.map(d => {
                     const size = Math.max(14, Math.min(24, 14 + (d.count / maxCount) * 10));
                     const opacity = 0.6 + (d.count / maxCount) * 0.4;
-                    return `<span class="px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-sm" style="font-size: ${size}px; opacity: ${opacity};">${d.name} (${d.count})</span>`;
+                    return `<span class="px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-sm" style="font-size: ${size}px; opacity: ${opacity};">${esc(d.name)} (${d.count})</span>`;
                 }).join('');
             }
         }
@@ -597,7 +616,7 @@
             chatContainer.innerHTML += `
                 <div class="chat-message flex gap-3 justify-end">
                     <div class="bg-blue-600 rounded-lg rounded-tr-none px-4 py-3 shadow-sm text-white">
-                        <p>${message}</p>
+                        <p>${esc(message)}</p>
                     </div>
                     <div class="w-8 h-8 rounded-full bg-gray-600 flex items-center justify-center flex-shrink-0">
                         <i class="fa fa-user text-white"></i>
@@ -644,7 +663,11 @@
                         if (chunk.startsWith('data: ')) {
                             const data = chunk.slice(6);
                             if (data.trim() !== '[DONE]') {
-                                responseDiv.innerHTML += data;
+                                // 模型输出按**纯文本**处理：转义后保留换行。
+                                // 原来直接 innerHTML += data，等于把模型返回的任意 HTML
+                                // 交给浏览器执行（同页面 token 在 localStorage）。
+                                // 代价是不再渲染 Markdown —— 兜底页可以接受这个退化。
+                                responseDiv.innerHTML += escText(data);
                                 chatContainer.scrollTop = chatContainer.scrollHeight;
                             }
                         }

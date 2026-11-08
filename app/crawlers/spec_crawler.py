@@ -37,6 +37,7 @@ from app.crawlers.spec_schema import (
     CrawlSpec,
     FieldSpec,
 )
+from app.utils.url_safety import UnsafeURLError, assert_safe_url_async, safe_get
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +299,12 @@ class SpecCrawler(BaseCrawler):
                 self._detail_block_reason = str(exc)
                 self._detail_stopped = True
                 break
+            except UnsafeURLError as exc:
+                # 页面里的详情链接指向内网 —— 这不是"这一条抓失败"，是页面被投毒。
+                # 继续抓剩下的链接等于继续替对方探测内网，必须止损停下。
+                self._detail_block_reason = f"详情链接指向不安全目标，已停止：{exc}"
+                self._detail_stopped = True
+                break
             except Exception as exc:  # noqa: BLE001
                 # 超时 / 404 / 非 HTML 响应：只丢这一条的详情，不影响整页
                 self._detail_failed += 1
@@ -469,8 +476,6 @@ class SpecCrawler(BaseCrawler):
         return await self._fetch_plain(url)
 
     async def _fetch_plain(self, url: str) -> str:
-        import httpx
-
         headers = self.get_random_headers()
         # 🔴 关键修正（2026-10-26 实测踩坑）：
         # BaseCrawler.get_random_headers() 固定声明 "Accept-Encoding: gzip, deflate, br"。
@@ -480,24 +485,29 @@ class SpecCrawler(BaseCrawler):
         headers["Accept-Encoding"] = _supported_encodings()
         headers.update(self.spec.headers)
 
-        async with httpx.AsyncClient(
-            timeout=self.spec.timeout, follow_redirects=True
-        ) as client:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code == 429:
-                self.mark_blocked()
-                raise CrawlBlockedError(f"[{self.spec.site}] HTTP 429 限流")
-            resp.raise_for_status()
+        # 🔴 SSRF 闸门（2026-11-08 补）：声明式爬虫抓的是**任意站点**，而 URL 来自
+        # 页面里的 href（`urljoin(page_url, href)`），属于第三方可影响的输入。
+        #
+        # 原来这里是 `httpx.AsyncClient(follow_redirects=True)` —— 典型的"事后校验"：
+        # 重定向已经打到内网（169.254.169.254、127.0.0.1、10.x）之后才拿到最终 URL，
+        # 那时再判等于没判。`safe_get` 强制 follow_redirects=False，
+        # 每一跳在**发出请求之前**做 scheme 白名单 + DNS 解析后判内网。
+        resp = await safe_get(url, headers=headers, timeout=self.spec.timeout)
 
-            # 拿到的如果不是 HTML（比如被代理替换成 JSON 错误页），直接报错，
-            # 不要留到解析阶段变成「0 条」—— 那是最难查的一类假数据。
-            ctype = (resp.headers.get("content-type") or "").lower()
-            if ctype and not any(t in ctype for t in ("html", "xml", "text/plain")):
-                raise RuntimeError(
-                    f"[{self.spec.site}] 响应不是 HTML（content-type={ctype}），"
-                    f"可能被代理/CDN 拦截或需要登录"
-                )
-            return resp.text
+        if resp.status_code == 429:
+            self.mark_blocked()
+            raise CrawlBlockedError(f"[{self.spec.site}] HTTP 429 限流")
+        resp.raise_for_status()
+
+        # 拿到的如果不是 HTML（比如被代理替换成 JSON 错误页），直接报错，
+        # 不要留到解析阶段变成「0 条」—— 那是最难查的一类假数据。
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if ctype and not any(t in ctype for t in ("html", "xml", "text/plain")):
+            raise RuntimeError(
+                f"[{self.spec.site}] 响应不是 HTML（content-type={ctype}），"
+                f"可能被代理/CDN 拦截或需要登录"
+            )
+        return resp.text
 
     async def _fetch_rendered(self, url: str) -> str:
         """用 Playwright 渲染后取 HTML（延迟导入，测试环境无 playwright 也不影响 httpx 路径）。"""
@@ -514,8 +524,26 @@ class SpecCrawler(BaseCrawler):
                 viewport={"width": 1920, "height": 1080},
             )
 
+        # 🔴 主文档先判一次：不安全目标直接抛 UnsafeURLError，
+        # 不要交给浏览器去"试"——那会在内网响应已经回来之后才知道。
+        await assert_safe_url_async(url)
+
         page = await self._context.new_page()
         try:
+            # 光判主 URL 不够：`page.goto` 自己会跟随重定向，
+            # 「主 URL 合法、但站点 302 到 169.254.169.254」是经典绕过手法。
+            # 所以拦 document 级导航，逐跳再判一次；子资源（图片/CSS）不拦——
+            # 它们指向的是同一站点，拦了只会让抓取变慢而不减少实质攻击面。
+            async def _guard_document(route):
+                if route.request.resource_type == "document":
+                    try:
+                        await assert_safe_url_async(route.request.url)
+                    except UnsafeURLError:
+                        await route.abort()
+                        return
+                await route.continue_()
+
+            await page.route("**/*", _guard_document)
             await page.goto(url, timeout=self.spec.timeout * 1000, wait_until="domcontentloaded")
             if self.spec.min_interval > 0:
                 await page.wait_for_timeout(int(self._interval() * 1000))

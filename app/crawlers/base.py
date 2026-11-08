@@ -5,6 +5,14 @@ from abc import ABC, abstractmethod
 from typing import List, Dict
 
 from app.config import settings
+from app.utils.url_safety import UnsafeURLError
+
+# 重试也不会变好的异常：目标本身就是内网/非法 scheme，再试三次只是多等 6 秒退避，
+# 还把日志写成"爬取失败"，掩盖真正的原因。
+#
+# 🔴 这里刻意**只**列 UnsafeURLError：其他异常的重试语义维持原状，动它们要单独评估
+# （例如 CrawlBlockedError 命中风控后重试其实更糟，但那是另一个议题，不在本次改动里一并改）。
+_NON_RETRYABLE = (UnsafeURLError,)
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +90,11 @@ class BaseCrawler(ABC):
                 results = await self.crawl(keyword, city)
                 return results or []
             except Exception as e:
+                if isinstance(e, _NON_RETRYABLE):
+                    logger.error(
+                        "[%s] 目标不安全，已拒绝且不重试：%s", self.source_site, e
+                    )
+                    raise
                 last_error = e
                 if attempt < settings.crawl_retry_times - 1:
                     wait_time = 2 ** (attempt + 1) + random.uniform(0, 1)
