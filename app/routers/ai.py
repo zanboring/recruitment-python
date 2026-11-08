@@ -21,6 +21,23 @@ router = APIRouter(prefix="/api/ai", tags=["AI对话"])
 MAX_MESSAGE_LENGTH = 2000
 
 
+def _encode_sse_data(text: str) -> str:
+    """把一段**可能含换行**的文本编码成一个 SSE 事件（多行 `data:` + 结尾空行）。
+
+    为什么不能直接 `f"data: {text}\\n\\n"`：SSE 规范里每个 `data:` 行是独立字段，
+    接收方用 `\\n` 把同一事件的多行拼回来。text 一旦含裸换行，第二行起就不以
+    `data:` 开头 —— 事件流解析器会把它当非法字段**整段丢弃**。
+
+    症状很隐蔽：「AI 回答只要出现换行，换行之后的正文全部消失」，
+    而前端 `escText` 的 `\\n → <br>` 永远拿不到换行，那条"保留换行"的修复等于空转。
+    （2026-11-08 qoder 复审发现，后端一直是这个写法。）
+
+    用 `split("\\n")` 而不是 `splitlines()`：要**保留末尾空行**，
+    否则两帧之间的换行会被吃掉 —— `"第一行\\n"` + `"第二行"` 会粘成 `"第一行第二行"`。
+    """
+    return "".join(f"data: {line}\n" for line in text.split("\n")) + "\n"
+
+
 def _sse_event(name: str, payload) -> str:
     """构造一个具名 SSE 事件。
 
@@ -73,7 +90,9 @@ async def sse_generator(
                 yield _sse_event("sources", sources_holder)
 
         full_response += chunk
-        yield f"data: {chunk}\n\n"
+        # 见 _encode_sse_data 的说明：chunk 里的换行必须拆成多个 `data:` 行，
+        # 否则换行之后的正文会被事件流解析器整段丢弃。
+        yield _encode_sse_data(chunk)
 
     if session_id:
         clear_cancel(session_id, user_id)

@@ -134,11 +134,22 @@ def test_判据本身能抓到坏样本():
         "esc(job.title)",
         "esc(job.company_name)",
         "esc(message)",
-        "escText(data)",
     ],
 )
 def test_关键位置已转义(page, pattern):
     assert pattern in page, f"关键渲染位置缺少转义：{pattern}"
+
+
+def test_AI输出走转义而不是裸插入(code):
+    """单独一条，**不锁变量名**。
+
+    这里踩过一次：原先断言写死 `escText(data)`，后来 SSE 解析改成按事件聚合、
+    变量名变成 `payload`，守卫就假红了 —— 而代码其实是更安全的。
+    锁行为（`innerHTML += escText(...)`）而不是锁参数名。
+    """
+    assert re.search(r"innerHTML\s*\+=\s*escText\(", code), (
+        "AI 流式输出没有走 escText：模型返回的内容会被当成 HTML 执行"
+    )
 
 
 # ---------------------------------------------------------------------------

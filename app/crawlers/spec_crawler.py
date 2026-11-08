@@ -98,6 +98,11 @@ class SpecCrawler(BaseCrawler):
         self._detail_failed = 0
         self._detail_stopped = False
         self._detail_block_reason = ""
+        # Playwright 的 route handler 里「拒绝」只能用 route.abort() 表达，
+        # 而 abort 之后 page.goto 抛的是 Playwright 自己的 Error（net::ERR_ABORTED），
+        # **不是** UnsafeURLError。不把这个 URL 记下来，上层就只会看到一条普通
+        # 抓取失败 —— 「不安全目标不重试」和「详情链接指向内网就停整批」会同时失效。
+        self._route_rejected_url = ""
 
     # ------------------------------------------------------------------ 入口
 
@@ -534,17 +539,31 @@ class SpecCrawler(BaseCrawler):
             # 「主 URL 合法、但站点 302 到 169.254.169.254」是经典绕过手法。
             # 所以拦 document 级导航，逐跳再判一次；子资源（图片/CSS）不拦——
             # 它们指向的是同一站点，拦了只会让抓取变慢而不减少实质攻击面。
+            self._route_rejected_url = ""
+
             async def _guard_document(route):
                 if route.request.resource_type == "document":
                     try:
                         await assert_safe_url_async(route.request.url)
                     except UnsafeURLError:
+                        self._route_rejected_url = route.request.url
+                        # 记下具体 URL 再 abort。route.abort() 本身不携带原因，
+                        # page.goto 只会抛 net::ERR_ABORTED —— 上层无从区分
+                        # 「目标不安全」和「网络抖动」，止损逻辑会退化。
                         await route.abort()
                         return
                 await route.continue_()
 
             await page.route("**/*", _guard_document)
-            await page.goto(url, timeout=self.spec.timeout * 1000, wait_until="domcontentloaded")
+            try:
+                await page.goto(url, timeout=self.spec.timeout * 1000, wait_until="domcontentloaded")
+            except Exception as exc:
+                if self._route_rejected_url:
+                    raise UnsafeURLError(
+                        f"[{self.spec.site}] 页面跳转到不安全目标，已中止："
+                        f"{self._route_rejected_url}"
+                    ) from exc
+                raise
             if self.spec.min_interval > 0:
                 await page.wait_for_timeout(int(self._interval() * 1000))
             return await page.content()

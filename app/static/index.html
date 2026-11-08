@@ -654,24 +654,32 @@
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
 
+                // 按「空行」切事件，而不是按单行切：一个 SSE 事件可能有多行 data
+                // （后端会把含换行的 chunk 拆成多个 `data:` 行，因为 SSE 不允许
+                //  data 字段里出现裸换行）。按单行切会把它们当成互不相关的片段，
+                // 拼起来就丢了换行。
+                let sseBuffer = '';
+
                 while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
-                    
-                    const chunks = decoder.decode(value).split('\n');
-                    chunks.forEach(chunk => {
-                        if (chunk.startsWith('data: ')) {
-                            const data = chunk.slice(6);
-                            if (data.trim() !== '[DONE]') {
-                                // 模型输出按**纯文本**处理：转义后保留换行。
-                                // 原来直接 innerHTML += data，等于把模型返回的任意 HTML
-                                // 交给浏览器执行（同页面 token 在 localStorage）。
-                                // 代价是不再渲染 Markdown —— 兜底页可以接受这个退化。
-                                responseDiv.innerHTML += escText(data);
-                                chatContainer.scrollTop = chatContainer.scrollHeight;
-                            }
-                        }
-                    });
+
+                    sseBuffer += decoder.decode(value, { stream: true });
+                    const events = sseBuffer.split('\n\n');
+                    sseBuffer = events.pop();   // 末尾可能是不完整事件，留到下一帧
+
+                    for (const evt of events) {
+                        const lines = evt.split('\n').filter(l => l.startsWith('data: '));
+                        if (!lines.length) continue;   // 具名事件（sources / meta）跳过
+                        const payload = lines.map(l => l.slice(6)).join('\n');
+                        if (payload.trim() === '[DONE]') continue;
+                        // 模型输出按**纯文本**处理：转义后保留换行。
+                        // 原来直接 innerHTML += data，等于把模型返回的任意 HTML
+                        // 交给浏览器执行（同页面 token 在 localStorage）。
+                        // 代价是不再渲染 Markdown —— 兜底页可以接受这个退化。
+                        responseDiv.innerHTML += escText(payload);
+                        chatContainer.scrollTop = chatContainer.scrollHeight;
+                    }
                 }
             } catch (error) {
                 responseDiv.innerHTML = '抱歉，AI服务暂时不可用。';

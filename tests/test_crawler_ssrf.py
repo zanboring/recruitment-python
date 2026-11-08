@@ -140,3 +140,115 @@ async def test_detail_link_to_intranet_stops_the_batch():
     crawler._finalize_detail_notes()
     joined = " ".join(crawler.detail_notes)
     assert "不安全" in joined, f"停止原因必须写进任务说明，实际：{joined}"
+
+
+# ---------------------------------------------------------------------------
+# 四、渲染模式（Playwright）：abort 之后异常类型必须还原
+# ---------------------------------------------------------------------------
+
+class _FakeRequest:
+    def __init__(self, url, resource_type="document"):
+        self.url = url
+        self.resource_type = resource_type
+
+
+class _FakeRoute:
+    def __init__(self, request):
+        self.request = request
+        self.aborted = False
+        self.continued = False
+
+    async def abort(self):
+        self.aborted = True
+
+    async def continue_(self):
+        self.continued = True
+
+
+class _FakePage:
+    """最小 Playwright page 替身：注册 route、goto 时模拟一次跳转导航。
+
+    `goto` 刻意在 abort 之后抛 **RuntimeError("net::ERR_ABORTED")** ——
+    真实 Playwright 抛的就是它自己的 Error，而不是我们的 UnsafeURLError。
+    这正是上一版测试漏掉的地方。
+    """
+
+    def __init__(self, redirect_to):
+        self.redirect_to = redirect_to
+        self.handler = None
+
+    async def route(self, pattern, handler):
+        self.handler = handler
+
+    async def goto(self, url, **kwargs):
+        route = _FakeRoute(_FakeRequest(self.redirect_to))
+        await self.handler(route)
+        if route.aborted:
+            raise RuntimeError("net::ERR_ABORTED")
+        return None
+
+    async def content(self):
+        return "<html><body>ok</body></html>"
+
+    async def close(self):
+        pass
+
+    async def wait_for_timeout(self, ms):
+        pass
+
+
+class _FakeContext:
+    def __init__(self, page):
+        self._page = page
+
+    async def new_page(self):
+        return self._page
+
+
+def _install_fake_browser(crawler, page):
+    crawler._browser = object()          # 非 None → 跳过 launch
+    crawler._context = _FakeContext(page)
+
+
+@pytest.mark.asyncio
+async def test_渲染模式跳转到内网仍然抛不安全异常(monkeypatch):
+    """回归 qoder 复审 B：`route.abort()` 会把异常类型吃掉。
+
+    **这是上一版测试的盲区**：那条用例用 `crawler._fetch = _refuse` 把整个
+    `_fetch_rendered` 替换掉，于是「abort 之后 goto 抛什么」根本没被走到 ——
+    测试是绿的，但 render=true 时「不安全目标不重试」和「详情链接指向内网就停整批」
+    两条保障同时失效，止损降级成「记一条失败然后继续抓」。
+    """
+    from app.crawlers import spec_crawler as module
+
+    async def _fake_assert(url):
+        if "169.254" in url or "127.0.0.1" in url:
+            raise UnsafeURLError(f"内网地址：{url}")
+        return url
+
+    monkeypatch.setattr(module, "assert_safe_url_async", _fake_assert)
+
+    crawler = SpecCrawler(make_spec(render=True))
+    _install_fake_browser(crawler, _FakePage(redirect_to="http://169.254.169.254/latest/meta-data/"))
+
+    with pytest.raises(UnsafeURLError, match="不安全"):
+        await crawler._fetch_rendered("https://example.com/list")
+
+
+@pytest.mark.asyncio
+async def test_渲染模式正常跳转不误判(monkeypatch):
+    """闸门不能把正常跳转也判成不安全 —— 否则 render=true 的站点全部抓不了。"""
+    from app.crawlers import spec_crawler as module
+
+    async def _fake_assert(url):
+        if "169.254" in url or "127.0.0.1" in url:
+            raise UnsafeURLError(f"内网地址：{url}")
+        return url
+
+    monkeypatch.setattr(module, "assert_safe_url_async", _fake_assert)
+
+    crawler = SpecCrawler(make_spec(render=True))
+    _install_fake_browser(crawler, _FakePage(redirect_to="https://example.com/page2"))
+
+    html = await crawler._fetch_rendered("https://example.com/list")
+    assert "ok" in html
