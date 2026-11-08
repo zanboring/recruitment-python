@@ -353,7 +353,29 @@ async def resolve_company_id(db: AsyncSession, company_name, city=None):
 
 
 async def save_job(db: AsyncSession, job_data: dict) -> bool:
-    """保存单个岗位。已存在则只刷新状态与 last_seen_at，返回 False。
+    """保存**观察到的**单个岗位。已存在则刷新状态与 last_seen_at，返回 False。
+
+    ## 语义边界：这是「观察」，不是「导入」
+
+    本函数会把 `job_status` 写成 ACTIVE，这个动作的合法性来自一个前提：
+    **调用方确实看到了这个岗位**——爬虫这一次把它抓下来了、活体核查这一次访问通了、
+    用户在浏览器里点「采集本页」时它就显示在屏幕上。
+
+    一份历史导出文件**不满足**这个前提：它只说明「曾经有过」，不说明「它还在」。
+
+    因此：
+
+    - ✅ 爬虫 / 活体核查 / 用户手动采集当前页面 → 可以调用
+    - ❌ CSV / Excel / 旧快照回填 → **不要汇入这里**。
+      汇进来就会把已下架（`job_status="CLOSED"`）的实体批量复活，
+      而这是一次「数据看起来变多了」的静默错误。
+
+    现有保护：`tests/test_csv_import.py::test_csv导入不复活已下架岗位` 锁着这条线。
+    那条测试现在的实现是"导入命中同 job_key 就 skip"，**碰巧**满足约束；
+    谁把它改成汇入本函数，测试会红。
+
+    > 这条与具体行业无关。换成商品、房源、设备台账，结论一样：
+    > **状态只能由观察驱动，不能由「手上还有一份旧数据」驱动。**
 
     :param job_data: 必须已过 :func:`normalize_job`（含 min_salary / max_salary）。
         这里仍用 ``.get`` 兜底而不是下标：一次字段缺失不该让整批 50 条全部回滚，
