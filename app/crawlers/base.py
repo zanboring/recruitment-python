@@ -7,12 +7,25 @@ from typing import List, Dict
 from app.config import settings
 from app.utils.url_safety import UnsafeURLError
 
+
+class DeterministicCrawlerError(Exception):
+    """**确定性失败**：同样的输入再试一次，结果完全相同。
+
+    「拿到 WAF 页」「list.path 写错」「接口结构变了」「字段映射全空」都属于这一类 ——
+    它们不是网络抖动，重试只会多花 14 秒退避（2+4+8），还把日志写成"爬取失败"，
+    把真正的原因埋掉。
+
+    单独成类而不是直接列具体异常，是因为这类失败会随数据源类型增加而变多，
+    而 :data:`_NON_RETRYABLE` 不该每加一种数据源就改一次。
+    """
+
+
 # 重试也不会变好的异常：目标本身就是内网/非法 scheme，再试三次只是多等 6 秒退避，
 # 还把日志写成"爬取失败"，掩盖真正的原因。
 #
-# 🔴 这里刻意**只**列 UnsafeURLError：其他异常的重试语义维持原状，动它们要单独评估
-# （例如 CrawlBlockedError 命中风控后重试其实更糟，但那是另一个议题，不在本次改动里一并改）。
-_NON_RETRYABLE = (UnsafeURLError,)
+# 🔴 `CrawlBlockedError` **不在这里**，这是刻意的：命中风控后重试其实更糟，
+# 但那是另一个议题，动它要单独评估（13 处调用、涉及限流节奏），不在本次改动里一并改。
+_NON_RETRYABLE = (UnsafeURLError, DeterministicCrawlerError)
 
 logger = logging.getLogger(__name__)
 

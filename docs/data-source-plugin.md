@@ -86,6 +86,49 @@ mapping:
 
 示例：从 `"￥15-25K"` 里取最小值 → `"span.salary::text|regex:(\d+)-\d+"` → `15`
 
+### JSON 接口源（`type: api`，2026-11-10 新增）
+
+以上都是 CSS 选择器，只适用于 HTML 页面。**如果目标站点给的是 JSON 接口**
+（招聘/电商类站点的列表大量是接口驱动的），用 `type: api` + `json:` 路径：
+
+```yaml
+site: jobicy
+label: 远程岗位（示例）
+type: api                        # 默认是 html
+request:
+  url: "https://jobicy.com/api/v2/remote-jobs?count={page}"
+list:
+  path: jobs                     # 记录数组在 JSON 里的路径
+  fields:
+    title:   "json:jobTitle"
+    company: "json:companyName"
+    city:    "json:jobGeo"
+    salary_min: "json:salaryMin"
+```
+
+| 写法 | 含义 |
+|---|---|
+| `json:jobName` | 取顶层字段 |
+| `json:job.salary.min` | 点号路径 |
+| `json:items[].jobName` | 数组展开：对每一项取 `jobName`，返回列表 |
+| `json:jobArea \| regex:^([^-]+)` | 取到后接正则（与 CSS 族共用同一条后缀） |
+
+几条**硬约定**（都是踩过之后才写下的）：
+
+1. **缺字段返回空值，不抛异常** —— 接口字段常变，一条缺字段不该让整批失败。
+2. **响应不是 JSON 时报错，绝不返回 0 条** —— 会带响应片段抛 `SpecPayloadError`。
+   WAF 页与登录页都是 **HTTP 200 + HTML**，静默当成「这页没数据」的话，
+   任务会显示 COMPLETED / 0 条，看起来像「这个城市没岗位」。
+3. **`type: api` 与 `render: true` 冲突** —— api 走 httpx 取 JSON；要渲染 JS 页面请用 `type: html`。
+4. **`type: api` 不支持 `detail.*`** —— 详情补齐是 HTML 语义（要 BeautifulSoup 解析）。
+5. **`list.path` 必须写** —— 不像 CSS 那样能"猜"一个 container；猜错只会得到 0 条，
+   而 0 条无法与「接口确实没有数据」区分。
+
+> ⚠️ **实测边界（2026-11-10）**：51job 的搜索接口对非浏览器客户端返回阿里云 WAF 页
+> （HTTP 200 + `_waf_bd8ce2ce37` + `text/html`），`type: api` 拿不到 JSON ——
+> 它需要浏览器上下文（见 `app/crawlers/job51.py`）。**接口被 WAF 挡 ≠ 表达式写错了。**
+> 51job 的接口版规格见 `app/crawlers/specs/_job51.yaml`（下划线开头 = 草稿，默认不加载）。
+
 ---
 
 ## 五、输出映射：generic / job

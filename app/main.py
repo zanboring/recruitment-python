@@ -234,3 +234,28 @@ def _resolve_static_index():
 
 
 app = create_app()
+
+
+if __name__ == "__main__":
+    # ``python -m app.main`` 是新手最自然的起服务方式（比记 uvicorn 参数容易），
+    # README 快速演示一直这么写。但此前这里没有 __main__ 分支 ——
+    # 命令执行完就退出，服务根本不起，而 docs/showcase.md 又写着「没有这个入口」，
+    # 两份文档互相否定。补上它，而不是把 README 里那条命令删掉。
+    import os
+
+    import uvicorn
+
+    # 主机与端口沿用 run_entry.py 已确立的口径（SERVER_HOST / SERVER_PORT），
+    # 默认**只监听回环**：这是单机桌面软件，绑 0.0.0.0 等于把免密登录
+    # 暴露给同网段任意设备（见 tests/test_security_defaults.py）。
+    # 若将来 Settings 里加了 server_port / server_host，这里会自动优先用它，
+    # 免得端口出现第二个来源。
+    port = int(getattr(settings, "server_port", 0) or os.getenv("SERVER_PORT", "8080"))
+    host = getattr(settings, "server_host", "") or os.getenv("SERVER_HOST", "127.0.0.1")
+
+    print(
+        f"[RecSys] 监听 http://{host}:{port}"
+        f"（需要局域网访问请用 run_entry.py：它带「弱密钥拒绝非回环」护栏）"
+    )
+    # 不加 reload：那是开发期热重载，生产不该有
+    uvicorn.run(app, host=host, port=port)

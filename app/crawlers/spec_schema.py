@@ -16,8 +16,10 @@
   · 静态或 JS 渲染的列表页；可选的**详情页补齐**（``detail.*``，受
     ``detail.max_items`` 与 ``limits.max_items`` 双重约束 —— 见
     docs/data-source-plugin.md §六）
+  · **JSON 接口型数据源**（``type: api``，2026-11-10 新增）：直接从接口
+    取 JSON，用 ``json:路径`` 表达式抽字段 —— 见本文档 ``FieldSpec``
   · 分页：页码参数 / 下一页链接（滚动加载尚未实现）
-  · 字段抽取：CSS 选择器、取文本或属性、正则后处理
+  · 字段抽取：CSS 选择器、取文本或属性、正则后处理、JSON 路径
   · 限速、单次上限、合规探针
 
 不能（必须写 Python 类）：
@@ -25,6 +27,11 @@
   · 接口加密、签名校验、token 链
   · 强交互（点击展开、iframe、多步表单）
   · 非列表结构（图关系、递归树）
+
+**一条实测边界（2026-11-10）**：51job 的搜索接口对非浏览器客户端返回
+阿里云 WAF 页（HTTP 200 + ``_waf_bd8ce2ce37`` + ``text/html``），
+``type: api`` + httpx 拿不到 JSON。它需要浏览器上下文（即 ``job51.py`` 的做法），
+**不是** ``type: api`` 能解决的 —— 别把「接口被 WAF 挡」误判成「表达式写错了」。
 
 **这不是缺陷，是分工**：配置化解决「大量结构相似的简单站点」，
 复杂站点仍走子类。两种方式在 ``registry`` 里共存。
@@ -86,12 +93,34 @@ class SpecError(ValueError):
 class FieldSpec:
     """单个字段的抽取规则。
 
-    ``expr`` 语法：
+    ``expr`` 语法（两族，按前缀区分；不写 ``json:`` 的一律按 CSS 处理，向后兼容）：
+
+    CSS 族（``type: html``，默认）：
       ``css::text``          取文本（去空白）
       ``css::attr(href)``    取属性
       ``css::html``          取内部 HTML
       末尾加 ``[]`` 表示取全部匹配（返回列表），如 ``div.tag a::text[]``
-      ``regex:模式``         对已取到的值做二次提取（第一捕获组）
+
+    JSON 族（``type: api``，2026-11-10 新增）：
+      ``json:jobName``        取顶层字段
+      ``json:job.salary.min`` 点号路径
+      ``json:items[].jobName`` 数组展开：路径中任一段末尾写 ``[]`` 表示
+                                「对数组每一项继续取」，返回列表
+    通用后缀：
+      ``|regex:模式``         对已取到的值做二次提取（第一捕获组），两族都可用
+
+    **为什么用 ``json:`` 前缀而不是引入 JSONPath 库**：
+    1. 依赖成本 —— 项目当前没有任何 JSONPath 依赖，为一条路径语法引入一个库
+       不值得；实现一次点号 + ``[]`` 展开只需几十行，且完全可控；
+    2. 与 CSS 族保持同一种「前缀式」语法，学习成本只增加一个前缀；
+    3. 缺字段必须返回 ``None`` 而不是抛异常 —— 接口字段常变，一条缺字段
+       不该让整批失败。JSONPath 库的求值语义（到底返回空列表还是异常）
+       反而需要额外包一层才能保证这一点。
+
+    边界：**不支持下标**（``items[0]``）与过滤器（``[?(@.x)]``）。
+    需要「第 N 项」时请让接口自己给，或用 ``|regex:`` 后处理 ——
+    这两类语义一旦放开，就得回答「越界怎么办、多匹配怎么办」，而它们
+    在抓取场景里几乎用不到。
     """
 
     name: str
@@ -99,18 +128,54 @@ class FieldSpec:
     default: Any = None
 
     def parse_expr(self) -> Dict[str, Any]:
-        """拆解表达式，返回 selector / mode / attr / multi / regex。"""
+        """拆解表达式，返回 kind / selector | path / mode / attr / multi / regex。
+
+        ``kind`` 是 2026-11-10 新增的判别键（``css`` / ``json``）：
+        调用方据此决定「去 DOM 里找」还是「去 JSON 里走路径」。
+        """
         raw = self.expr.strip()
         regex = None
-        m = re.search(r"\|regex:(.+)$", raw)
+        # 容忍管道两侧的空格：YAML 里人几乎一定会写成 `json:x | regex:...`，
+        # 只认 `|regex:` 会让这条表达式被当成「路径里带空格」而整体报错，
+        # 错误信息还会指向"路径无法解析"，离真正原因很远。
+        m = re.search(r"\|\s*regex:(.+)$", raw)
         if m:
-            regex = m.group(1)
+            regex = m.group(1).strip()
             raw = raw[: m.start()].strip()
 
         multi = raw.endswith("[]")
         if multi:
             raw = raw[: -2].strip()
 
+        # ---------------- JSON 族 ----------------
+        if raw.lower().startswith("json:"):
+            path = raw[len("json:"):].strip()
+            if not path:
+                raise SpecError(
+                    f"字段 {self.name} 的 json: 表达式缺少路径：{self.expr!r}"
+                    f"（示例 json:jobName / json:job.salary.min / json:items[].jobName）"
+                )
+            if "::" in path:
+                raise SpecError(
+                    f"字段 {self.name} 的 json: 表达式不接受 ::text / ::attr(x) 后缀：{self.expr!r}"
+                    f"（json: 直接取字段值；要二次提取请用 |regex:）"
+                )
+            if not re.fullmatch(r"[A-Za-z0-9_$]+(\[\])?(\.[A-Za-z0-9_$]+(\[\])?)*", path):
+                raise SpecError(
+                    f"字段 {self.name} 的 json: 路径无法解析：{path!r}"
+                    f"（只支持点号路径与段末的 [] 展开；不支持下标 [0] 与过滤器）"
+                )
+            return {
+                "kind": "json",
+                "path": path,
+                "selector": None,
+                "mode": "json",
+                "attr": None,
+                "multi": multi,
+                "regex": regex,
+            }
+
+        # ---------------- CSS 族 ----------------
         attr = None
         mode = "text"
         if "::" in raw:
@@ -125,14 +190,24 @@ class FieldSpec:
                 attr = tail[5:-1].strip()
             else:
                 raise SpecError(
-                    f"字段 {self.name} 的表达式后缀无法识别：{tail!r}（支持 ::text / ::html / ::attr(x)）"
+                    f"字段 {self.name} 的表达式后缀无法识别：{tail!r}"
+                    f"（CSS 支持 ::text / ::html / ::attr(x)；"
+                    f"JSON 源请用 json:路径，如 json:jobName）"
                 )
             raw = selector.strip()
 
         if not raw:
             raise SpecError(f"字段 {self.name} 缺少 CSS 选择器：{self.expr!r}")
 
-        return {"selector": raw, "mode": mode, "attr": attr, "multi": multi, "regex": regex}
+        return {
+            "kind": "css",
+            "selector": raw,
+            "mode": mode,
+            "attr": attr,
+            "multi": multi,
+            "regex": regex,
+            "path": None,
+        }
 
 
 @dataclass
@@ -144,6 +219,10 @@ class CrawlSpec:
     url: str
     list_container: str
     fields: List[FieldSpec]
+    # 数据源类型：html（默认，CSS 选择器）/ api（JSON 接口，json: 路径表达式）
+    source_type: str = "html"
+    # 仅 type: api：记录数组在响应 JSON 里的路径，如 resultbody.job.items
+    list_path: str = ""
     method: str = "GET"
     render: bool = False           # True = 用 Playwright（JS 渲染页）
     timeout: int = 30
@@ -199,8 +278,48 @@ class CrawlSpec:
 
         lst = data.get("list") or {}
         container = str(lst.get("container") or "").strip()
-        if not container:
-            raise SpecError(f"{where}缺少 list.container（列表项的 CSS 选择器）")
+        list_path = str(lst.get("path") or "").strip()
+
+        # 数据源类型：顶层 type（也容忍写在 request 下，与 url/method 同一个分组）
+        source_type = str(data.get("type") or req.get("type") or "html").strip().lower()
+        if source_type not in ("html", "api"):
+            raise SpecError(
+                f"{where}type 只能是 html（默认，CSS 选择器）或 api（JSON 接口），"
+                f"收到 {source_type!r}"
+            )
+
+        if source_type == "api":
+            # api 源的记录数组位置必须显式写：不像 CSS 那样能"猜"一个 container，
+            # 猜错了只会得到 0 条，而 0 条在这里无法与「接口确实没数据」区分。
+            if not list_path:
+                raise SpecError(
+                    f"{where}type: api 必须写 list.path（记录数组的 JSON 路径），"
+                    f"例如 list.path: resultbody.job.items"
+                )
+            if container:
+                raise SpecError(
+                    f"{where}type: api 不接受 list.container（CSS 选择器）：{container!r}；"
+                    f"JSON 源请用 list.path + json: 表达式"
+                )
+            if list_path and re.search(r"\[\d", list_path):
+                raise SpecError(
+                    f"{where}list.path 不支持下标：{list_path!r}（数组位置由接口决定，不要写死）"
+                )
+            if bool(req.get("render", False)):
+                raise SpecError(
+                    f"{where}type: api 与 render: true 冲突：api 走 httpx 取 JSON；"
+                    f"要渲染 JS 页面请用 type: html + render: true"
+                )
+        else:
+            if not container:
+                raise SpecError(
+                    f"{where}缺少 list.container（列表项的 CSS 选择器）；"
+                    f"如果这是 JSON 接口，请写 type: api + list.path"
+                )
+            if list_path:
+                raise SpecError(
+                    f"{where}list.path 只能用于 type: api，当前 type={source_type!r}"
+                )
 
         raw_fields = lst.get("fields") or {}
         if not isinstance(raw_fields, dict) or not raw_fields:
@@ -238,6 +357,13 @@ class CrawlSpec:
         if detail_enabled and not detail_fields:
             raise SpecError(
                 f"{where}detail.enabled=true 但 detail.fields 为空 —— 抓详情页却没有任何字段要取"
+            )
+        if source_type == "api" and (detail_enabled or detail_fields):
+            # 详情补齐只认 HTML（要 BeautifulSoup 解析）。静默忽略 detail.* 会让作者
+            # 以为「配了就会抓」，实际一条都不抓 —— 那是最难查的一类假配置。
+            raise SpecError(
+                f"{where}type: api 不支持 detail.*（详情页补齐是 HTML 语义）："
+                f"若详情就在接口里，请直接用 json: 路径取；否则请改用 type: html"
             )
 
         pg = data.get("pagination") or {}
@@ -299,6 +425,8 @@ class CrawlSpec:
             url=url,
             list_container=container,
             fields=fields,
+            source_type=source_type,
+            list_path=list_path,
             method=str(req.get("method") or "GET").upper(),
             render=bool(req.get("render", False)),
             timeout=int(req.get("timeout", 30)),

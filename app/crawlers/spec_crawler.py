@@ -9,10 +9,14 @@
    所以这里保留该签名，内部再翻译成 spec 的参数表。这样现有调度链路
    （``CrawlerService.start_crawl``）不需要任何改动就能跑声明式数据源。
 
-2. **两种抓取模式**：
-   · ``render: false`` → httpx 直取 HTML（快、省资源，适合静态页）
-   · ``render: true``  → Playwright 渲染后取 content（适合 JS 渲染页）
+2. **三种抓取模式**：
+   · ``type: html`` + ``render: false`` → httpx 直取 HTML（快、省资源，适合静态页）
+   · ``type: html`` + ``render: true``  → Playwright 渲染后取 content（适合 JS 渲染页）
+   · ``type: api``                      → httpx 取 **JSON 接口**，用 ``json:`` 路径抽字段
    Playwright 是延迟导入的：测试环境没装也不影响 httpx 路径。
+
+   ``type: api`` 是 2026-11-10 新增的：此前规格引擎只会解析 HTML 选择器，
+   而项目里唯一真实跑通的 51job 走的是 JSON 接口 —— 表达能力与真实数据源不匹配。
 
 3. **风控不静默**：命中 ``detect_blocked`` 时抛 ``CrawlBlockedError``，
    让上层把任务标成「被拦」而不是「成功但 0 条」——后者会把验证码页
@@ -22,6 +26,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -29,7 +34,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-from app.crawlers.base import BaseCrawler
+from app.crawlers.base import BaseCrawler, DeterministicCrawlerError
 from app.crawlers.cleaner import generate_job_key
 from app.crawlers.spec_schema import (
     JOB_SALARY_FIELDS,
@@ -50,6 +55,16 @@ class CrawlBlockedError(RuntimeError):
     """
 
 
+class SpecPayloadError(DeterministicCrawlerError, RuntimeError):
+    """``type: api`` 拿到的响应不是可用 JSON（WAF 页 / 登录页 / 参数错 / 结构变了）。
+
+    与 :class:`CrawlBlockedError` 分开：那个是「对方明确在拦你」（429/验证码），
+    这个是「响应根本不是 JSON」。两者都**不能**被当成「这一页没有数据」静默跳过 ——
+    2026-11-10 实测，51job 的接口对非浏览器客户端返回 HTTP 200 + 阿里云 WAF HTML，
+    只按「解析不到就不入库」处理，任务会显示 COMPLETED / 0 条，看起来像「这个城市没岗位」。
+    """
+
+
 def _supported_encodings() -> str:
     """返回当前环境**真正能解码**的 Accept-Encoding。
 
@@ -64,6 +79,57 @@ def _supported_encodings() -> str:
     except ImportError:
         pass
     return ", ".join(encodings)
+
+
+def _json_path(value: Any, path: str) -> Any:
+    """按点号路径从 JSON 里取值；段末 ``[]`` 表示「对数组每一项继续取」。
+
+    语义示例（``value`` 是一页响应解析后的对象）：
+
+    =====================================  ==========================================
+    path                                   结果
+    =====================================  ==========================================
+    ``resultbody.job.items``               数组
+    ``items[].jobName``                    列表（每项的 jobName，空值被剔除）
+    ``job.salary.min``                     末级标量
+    ``job.missing``                        ``None``（**不抛异常**）
+    =====================================  ==========================================
+
+    **缺字段返回 ``None`` 而不是抛异常**：接口字段经常改，一条缺字段不该让整批
+    失败。真正的「结构变了」由 :meth:`SpecCrawler._parse_api_page` 在取记录数组
+    那一层判断（那里拿到 ``None`` 才说明整页不可用）。
+    """
+    segments = [s for s in str(path or "").split(".") if s]
+    return _walk_json(value, segments)
+
+
+def _walk_json(value: Any, segments: List[str]) -> Any:
+    if not segments:
+        return value
+
+    head, rest = segments[0], segments[1:]
+    multi = head.endswith("[]")
+    if multi:
+        head = head[: -2]
+
+    if head:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(head)
+
+    if not multi:
+        return _walk_json(value, rest)
+
+    if not isinstance(value, list):
+        return None
+    collected: List[Any] = []
+    for item in value:
+        got = _walk_json(item, rest)
+        if isinstance(got, list):
+            collected.extend(got)
+        elif got not in (None, ""):
+            collected.append(got)
+    return collected
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -145,8 +211,19 @@ class SpecCrawler(BaseCrawler):
 
                 html = await self._fetch(url)
 
-                # 风控先判，避免把验证码页当空结果
-                if self.detect_blocked(html):
+                # 风控先判，避免把验证码页当空结果。
+                #
+                # ⚠️ `type: api` **不参与正文关键词判定**。信号表是为 HTML 设计的
+                # （验证码壳页、限流文案），而 JSON 响应里根本没有这些特征；
+                # 反过来，岗位正文天然含「风险 / 校验 / 审核 / verify」这类词 ——
+                # 实测 `BaseCrawler.detect_blocked('负责风控模型的数据校验')` 直接命中，
+                # 后果是**把成功当失败**：整页数据丢弃 + mark_blocked() 把后续节奏
+                # 拖慢 8~16 倍 + 外层再重试 4 次。
+                #
+                # api 源的风控改由两条更准的判据承担：
+                #   · HTTP 429（`_fetch_plain` 里已处理并 mark_blocked）
+                #   · 响应不是可用 JSON（`SpecPayloadError`，含 WAF 页/登录页）
+                if spec.source_type != "api" and self.detect_blocked(html):
                     self.mark_blocked()
                     raise CrawlBlockedError(
                         f"[{spec.site}] 命中风控信号（验证码/限流/人机校验），"
@@ -198,9 +275,16 @@ class SpecCrawler(BaseCrawler):
         return items
 
     def parse_page(self, page_content, keyword: str = "") -> List[Dict]:
-        """解析一页 HTML，返回记录列表（同步，不涉及 IO）。"""
+        """解析一页响应，返回记录列表（同步，不涉及 IO）。
+
+        按 ``spec.source_type`` 分派：``api`` 走 JSON 路径，``html`` 走 CSS 选择器。
+        两条路径产出同一种「字段名 → 值」的字典，后续映射/入库完全共用 ——
+        所以 ``type: api`` 不需要另一套 ``_shape_records``。
+        """
         if not page_content:
             return []
+        if self.spec.source_type == "api":
+            return self._parse_api_page(page_content)
         soup = BeautifulSoup(page_content, "lxml")
         nodes = soup.select(self.spec.list_container)
         if not nodes:
@@ -218,6 +302,79 @@ class SpecCrawler(BaseCrawler):
             # 全字段都为空的行通常是占位/广告位，丢掉
             if any(v not in (None, "", []) for v in row.values()):
                 records.append(row)
+        return records
+
+    def _parse_api_page(self, payload) -> List[Dict]:
+        """解析一页 JSON 响应（``type: api``）。
+
+        失败一律抛 :class:`SpecPayloadError` 并**带上响应片段**，不返回空列表：
+        「被 WAF 挡」「参数名写错」「接口结构变了」与「这页确实没有数据」在返回值上
+        长得一模一样，静默返回 0 条等于把故障藏起来（本项目最贵的一类教训）。
+        """
+        spec = self.spec
+
+        if isinstance(payload, (dict, list)):
+            data = payload
+        else:
+            text = str(payload).lstrip("\ufeff").strip()
+            try:
+                data = json.loads(text)
+            except (ValueError, TypeError) as exc:
+                snippet = re.sub(r"\s+", " ", text[:160])
+                raise SpecPayloadError(
+                    f"[{spec.site}] 响应不是合法 JSON（前 160 字符：{snippet!r}）。"
+                    f"常见原因：接口要登录态/Cookie、被 WAF 或 CDN 拦截、参数名写错。"
+                    f"若目标其实是 HTML 页面，请改用 type: html（必要时加 render: true）"
+                ) from exc
+
+        rows = _json_path(data, spec.list_path)
+        if rows is None:
+            keys = list(data)[:8] if isinstance(data, dict) else type(data).__name__
+            raise SpecPayloadError(
+                f"[{spec.site}] 响应里没有 list.path={spec.list_path!r} 指向的记录数组"
+                f"（实际顶层：{keys}）—— 接口结构变了，或路径写错了"
+            )
+        if isinstance(rows, dict):
+            # 单条记录也允许（有些接口不分页、直接返回一个对象）
+            rows = [rows]
+        if not isinstance(rows, list):
+            raise SpecPayloadError(
+                f"[{spec.site}] list.path={spec.list_path!r} 指向的不是数组，"
+                f"而是 {type(rows).__name__}"
+            )
+
+        if not rows:
+            # 空数组是**合法结果**（这一页确实没有岗位），不能当错误抛。
+            # 但必须留痕：「0 条」和「路径写错」在返回值上长得一模一样，
+            # 不记一行日志就永远查不出是哪一种。
+            logger.info(
+                "[%s] list.path=%r 返回空数组（这一页确实没有记录）",
+                spec.site, spec.list_path,
+            )
+            return []
+
+        records: List[Dict] = []
+        dropped = 0
+        for item in rows:
+            if not isinstance(item, dict):
+                dropped += 1
+                continue
+            row: Dict[str, Any] = {f.name: self._extract(item, f) for f in spec.fields}
+            if any(v not in (None, "", []) for v in row.values()):
+                records.append(row)
+            else:
+                dropped += 1
+
+        if not records and dropped:
+            # 数组里有元素，却一条都没映射出来 —— 这不是「没数据」，是**字段路径全错了**。
+            # 与 list.path 写错同属「接口结构变了」，必须显式报错：
+            # 返回 0 条会让任务显示 COMPLETED / 0 条，看起来像「这个城市没岗位」。
+            first = rows[0]
+            keys = list(first)[:10] if isinstance(first, dict) else type(first).__name__
+            raise SpecPayloadError(
+                f"[{spec.site}] {len(rows)} 条记录全部映射为空，字段路径可能变了。"
+                f"第一条记录的键：{keys}"
+            )
         return records
 
     # ------------------------------------------------------------ 详情页抓取
@@ -444,6 +601,8 @@ class SpecCrawler(BaseCrawler):
 
     def _extract(self, node, f: FieldSpec) -> Any:
         p = f.parse_expr()
+        if p["kind"] == "json":
+            return self._extract_json(node, f, p)
         if p["multi"]:
             found = node.select(p["selector"])
             values = [self._value(n, p) for n in found]
@@ -452,6 +611,38 @@ class SpecCrawler(BaseCrawler):
         if one is None:
             return f.default
         return self._value(one, p)
+
+    @staticmethod
+    def _extract_json(record: Dict[str, Any], f: FieldSpec, p: Dict[str, Any]) -> Any:
+        """按 ``json:`` 路径取一个字段（缺字段返回 ``default``，不抛异常）。"""
+        value = _json_path(record, p["path"])
+        if value is None:
+            return f.default
+        if isinstance(value, list):
+            values = [SpecCrawler._apply_regex(v, p["regex"]) for v in value]
+            return [v for v in values if v not in (None, "")]
+        return SpecCrawler._apply_regex(value, p["regex"])
+
+    @staticmethod
+    def _apply_regex(value: Any, pattern: Optional[str]) -> Optional[str]:
+        """把任意 JSON 标量转成字符串并按需做一次正则提取。
+
+        与 CSS 路径的 ``|regex:`` 语义保持一致：有捕获组取第 1 组，
+        无捕获组取整体，**不匹配返回 None**（而不是返回原文）。
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            # JSON 里的 true/false 转成 "True"/"False" 没有意义，
+            # 在字段抽取场景里只会污染数据，直接当缺失处理。
+            return None
+        text = str(value).strip()
+        if not pattern:
+            return text
+        m = re.search(pattern, text)
+        if not m:
+            return None
+        return m.group(1) if m.groups() else m.group(0)
 
     @staticmethod
     def _value(node, p: Dict[str, Any]) -> Any:
@@ -504,12 +695,19 @@ class SpecCrawler(BaseCrawler):
             raise CrawlBlockedError(f"[{self.spec.site}] HTTP 429 限流")
         resp.raise_for_status()
 
-        # 拿到的如果不是 HTML（比如被代理替换成 JSON 错误页），直接报错，
+        # 拿到的如果不是预期类型（比如被代理替换成错误页），直接报错，
         # 不要留到解析阶段变成「0 条」—— 那是最难查的一类假数据。
         ctype = (resp.headers.get("content-type") or "").lower()
-        if ctype and not any(t in ctype for t in ("html", "xml", "text/plain")):
+        allowed = ("html", "xml", "text/plain")
+        if self.spec.source_type == "api":
+            # JSON 接口常见的几种声明；有的站点返回 text/plain 或 text/javascript。
+            # 这里只做「类型是否明显不对」的粗筛，真正的解析校验在 _parse_api_page ——
+            # 51job 的 WAF 页就是 text/html + 200，必须由那一步带响应片段报错。
+            allowed = allowed + ("json", "javascript")
+        if ctype and not any(t in ctype for t in allowed):
+            expected = "JSON" if self.spec.source_type == "api" else "HTML"
             raise RuntimeError(
-                f"[{self.spec.site}] 响应不是 HTML（content-type={ctype}），"
+                f"[{self.spec.site}] 响应类型不符（content-type={ctype}，期望 {expected}），"
                 f"可能被代理/CDN 拦截或需要登录"
             )
         return resp.text

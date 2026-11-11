@@ -87,3 +87,6 @@ reports/*.html
 # ── 本地工具/辅助脚本（不入库）──
 .codebuddy/
 一键推送.bat
+
+# 回填/迁移脚本自动备份的库副本（data/*.db 已忽略，但 .bak- 后缀不匹配 *.db）
+data/*.bak-*

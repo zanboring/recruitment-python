@@ -1,0 +1,86 @@
+# 前程无忧（51job）JSON 接口源 —— 声明式版本（**草稿，默认不加载**）
+#
+# 为什么文件名以下划线开头：`spec_schema.load_all_specs()` 会跳过 `_` 开头的文件
+# （既有约定：下划线 = 禁用/草稿）。这里必须停用，理由有两条，缺一条都不能启用：
+#
+# 1. **站点标识撞车**：`site` 必须是 `51job`，否则 job_key 指纹与
+#    `Job51Crawler` 不一致（`generate_job_key(平台, 标题, 公司, 城市)` 把平台算进指纹），
+#    同一岗位会变成两条入库记录。而 `registry.get_crawler()` 是 **SPECS 优先于
+#    CRAWLER_REGISTRY** 的 —— 一旦本文件被加载，就会立刻顶掉现有那个能用的
+#    `Job51Crawler`，把唯一真实数据通道换成一个必然失败的实现。
+#    启用时机与切换动作归集成端（任务书 §四：registry.py 由集成端负责切换）。
+#
+# 2. **接口对非浏览器客户端返回 WAF 页**（2026-11-10 实测）：
+#       GET https://we.51job.com/api/job/search-pc?...
+#       → HTTP 200，content-type: text/html，正文是阿里云 WAF 页
+#         `<textarea id="renderData">{"_waf_bd8ce2ce37":"..."}</textarea>`
+#    也就是说 `type: api` + httpx 这一层根本拿不到 JSON；51job 需要的是
+#    **浏览器上下文**（现有 `job51.py` 用 Playwright 打开搜索页读卡片）。
+#    这不是表达式写错，也不是本规格的参数问题 —— 换多少个字段映射都一样。
+#
+# 所以本文件的定位是：**把 546 行硬编码爬虫里的「字段口径」用配置表达出来**，
+# 供复核与将来切换；真正抓取仍走 `app/crawlers/job51.py`。
+# 启用前必须先在目标环境验证接口能返回 JSON（可用 `scripts/probe_spec_api.py`）。
+
+site: 51job
+label: 前程无忧（接口源·草稿）
+type: api
+
+request:
+  # {area} 是 51job 的城市编码（见 app/crawlers/job51.py::CITY_AREA_MAP），
+  # {keyword} 与 {page} 由执行器注入（page 来自 pagination.start）。
+  url: "https://we.51job.com/api/job/search-pc?api_key=51job&jobArea={area}&keyword={keyword}&pageNum={page}&pageSize=20&sortType=0&searchType=2&source=1"
+  timeout: 30
+  headers:
+    Accept: "application/json, text/plain, */*"
+    Referer: "https://we.51job.com/pc/search"
+
+inputs:
+  keyword:
+    label: 关键词
+    required: true
+    default: python
+  area:
+    label: 城市编码（51job jobArea）
+    required: true
+    default: "190200"
+
+list:
+  # 51job 的响应层级：resultbody.job.items（接口改过名，job51.py 里还有
+  # resultbody.items / resultbody.jobList.items 两个兜底变体；
+  # 声明式这边只认一种，变了就要改 YAML —— 这是配置化的固有代价）。
+  path: resultbody.job.items
+  fields:
+    title: "json:jobName"
+    company: "json:companyName"
+    salary: "json:provideSalaryString"
+    # workAreaString 形如「长沙-岳麓区」/「长沙·岳麓区」；截到第一个分隔符前，
+    # 与 Job51Crawler 的 `area.split("-")[0]` 口径一致 —— 否则 job_key 会不同。
+    city: "json:workAreaString | regex:^([^-·]+)"
+    experience: "json:workYearString"
+    education: "json:degreeString"
+    href: "json:jobHref"
+    welfare: "json:attributeText"
+    publish: "json:issueDateString"
+
+pagination:
+  type: page_param
+  start: 1
+  max_pages: 1          # 单任务最多翻几页；列表接口 pageSize=20，按需调大
+limits:
+  max_items: 20
+  min_interval: 2.0     # 同域名相邻请求间隔（秒）；接口源也不要贴着打
+
+mapping:
+  target: job
+  field_map:
+    title: title
+    company_name: company
+    city: city
+    salary: salary        # 文本薪资交给 app/utils/salary.py 归一，不在 YAML 里算
+    experience: experience
+    education: education
+    url: href
+    description: welfare  # 表里没有独立描述字段时，用福利标签占位（与 crawler 的 title+welfare 拼接近似）
+    # skills 故意不映射：服务层已有一条「缺 skills 时用 extract_skills(title, description)」
+    # 的兜底，在这里再写一套只会有两个口径。

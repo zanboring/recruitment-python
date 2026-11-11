@@ -115,7 +115,18 @@ async def recommend_jobs(
     limit: int = 10
 ) -> list:
     MAX_CANDIDATES = 500
-    stmt = select(Job).where(Job.job_status == "ACTIVE")
+    # 候选池 = **在架**，不是"已二次确认"。
+    #
+    # 原来这里写的是 `== "ACTIVE"`，而爬虫新建岗位写的是 `NEW`
+    # （`crawler_service.py:425`），`NEW → ACTIVE` 的唯一路径是**重爬同一岗位并命中**
+    # （`save_job:403`）。555 条真实数据都是一次性抓的，于是全部停在 NEW，
+    # 推荐候选池实际只有 42 条 —— 而这 42 条里只有 13 条有 skills。
+    #
+    # `job_status` 的四个取值里，只有 `OFFLINE`（存活核查判离线）和 `CLOSED`（人工下架）
+    # 才是"不在架"。`NEW` 表示"新发现、尚未被二次观察"，不是"已失效"。
+    # `crawler_service.py:643` 的存活核查用的也是 `in_(["NEW", "ACTIVE"])`，
+    # 这里与它对齐，避免同一份数据在两个地方有两种"在架"定义。
+    stmt = select(Job).where(Job.job_status.in_(["NEW", "ACTIVE"]))
 
     if city:
         stmt = stmt.where(Job.city == city)

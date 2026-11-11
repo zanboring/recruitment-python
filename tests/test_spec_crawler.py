@@ -3,6 +3,8 @@
 全部用本地 HTML，不联网 —— 网络与反爬永远测不稳定，
 这里只保证「规格解析正确」与「字段抽取正确」两件事。
 """
+import json
+
 import pytest
 
 from app.crawlers.spec_crawler import CrawlBlockedError, SpecCrawler
@@ -510,3 +512,379 @@ def test_detail_enabled_without_link_field_raises():
             "enabled": True,
             "fields": {"description": "div.desc::text"},
         })
+
+
+# ==========================================================================
+# type: api —— JSON 接口源（2026-11-10）
+#
+# 为什么需要这一族：规格引擎原本只会解析 HTML 选择器，而项目里唯一真实跑通的
+# 数据源（51job）走的是 JSON 接口。表达能力与真实数据源不匹配，于是「写一份
+# YAML 就能接新源」这句话在真实站点上一个都兑现不了。
+#
+# 这里的用例全部离线（喂 JSON 字符串 / 打桩 safe_get），不联网：
+# 网络与反爬永远测不稳定，联网验证放在报告里单独贴原始输出。
+# ==========================================================================
+
+API_PAYLOAD = {
+    "resultbody": {
+        "job": {
+            "items": [
+                {
+                    "jobName": "Python 后端工程师",
+                    "companyName": "某某科技有限公司",
+                    "provideSalaryString": "1-1.5万",
+                    "workAreaString": "长沙-岳麓区",
+                    "workYearString": "3-4年经验",
+                    "degreeString": "本科",
+                    "jobHref": "https://jobs.51job.com/changsha-ylq/123456.html",
+                    "attributeText": "五险一金 Python FastAPI",
+                },
+                {
+                    "jobName": "Java 开发工程师",
+                    "companyName": "另一家公司",
+                    "provideSalaryString": "8千-1.2万·13薪",
+                    "workAreaString": "长沙·雨花区",
+                    "workYearString": "1-3年经验",
+                    "degreeString": "大专",
+                    "jobHref": "//jobs.51job.com/changsha-yhq/654321.html",
+                },
+            ]
+        }
+    }
+}
+
+
+def make_api_spec(**over):
+    """一个最小的 type: api 规格（字段与 51job 同形，便于复用断言）。"""
+    data = {
+        "site": "job51",
+        "label": "接口源演示",
+        "type": "api",
+        "url": "https://example.com/api/search?keyword={keyword}&pageNum={page}",
+        "list": {
+            "path": "resultbody.job.items",
+            "fields": {
+                "title": "json:jobName",
+                "company": "json:companyName",
+                "salary": "json:provideSalaryString",
+                "city": "json:workAreaString | regex:^([^-·]+)",
+                "experience": "json:workYearString",
+                "education": "json:degreeString",
+                "href": "json:jobHref",
+            },
+        },
+        "pagination": {"type": "none", "start": 1, "max_pages": 1},
+        "limits": {"max_items": 100, "min_interval": 0},
+        "mapping": {
+            "target": "job",
+            "field_map": {
+                "title": "title",
+                "company_name": "company",
+                "city": "city",
+                "salary": "salary",
+                "experience": "experience",
+                "education": "education",
+                "url": "href",
+            },
+        },
+    }
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(data.get(key), dict):
+            merged = dict(data[key])
+            merged.update(value)
+            data[key] = merged
+        else:
+            data[key] = value
+    return CrawlSpec.from_dict(data)
+
+
+# ---------------------------------------------------------------- 表达式解析
+
+
+def test_json表达式解析单层与多层路径():
+    assert FieldSpec("f", "json:jobName").parse_expr()["path"] == "jobName"
+    single = FieldSpec("f", "json:jobName").parse_expr()
+    assert single["kind"] == "json" and single["selector"] is None
+
+    nested = FieldSpec("f", "json:job.salary.min").parse_expr()
+    assert nested["kind"] == "json" and nested["path"] == "job.salary.min"
+
+
+def test_json表达式支持数组展开():
+    p = FieldSpec("tags", "json:items[].jobName").parse_expr()
+    assert p["kind"] == "json" and p["path"] == "items[].jobName"
+
+
+def test_json表达式拒绝css后缀并说清可用后缀():
+    """写 `json:x::text` 是常见误解（以为和 CSS 一样要声明取值方式）。"""
+    with pytest.raises(SpecError, match="regex"):
+        FieldSpec("f", "json:jobName::text").parse_expr()
+
+
+def test_json表达式拒绝下标与过滤器():
+    for bad in ("json:items[0].name", "json:items[?(@.x)].name", "json:", "json:..job"):
+        with pytest.raises(SpecError):
+            FieldSpec("f", bad).parse_expr()
+
+
+def test_css表达式判别键仍是css_且解析结果不变():
+    """回归：不写 json: 的一律按 CSS 处理，旧规格一个字都不用改。"""
+    p = FieldSpec("text", "span.text::text").parse_expr()
+    assert p["kind"] == "css"
+    assert p["selector"] == "span.text"
+    assert p["mode"] == "text"
+    assert p["multi"] is False
+
+    p_multi = FieldSpec("tags", "a.tag::text[]").parse_expr()
+    assert p_multi["kind"] == "css" and p_multi["multi"] is True
+
+    p_attr = FieldSpec("link", "a.detail::attr(href)").parse_expr()
+    assert p_attr["mode"] == "attr" and p_attr["attr"] == "href"
+
+
+# ---------------------------------------------------------------- 取值语义
+
+
+def test_json缺字段返回None而不是抛异常():
+    spec = make_api_spec()
+    crawler = SpecCrawler(spec)
+    records = crawler.parse_page(json.dumps({
+        "resultbody": {"job": {"items": [{"jobName": "只有标题"}]}}
+    }))
+    assert len(records) == 1
+    assert records[0]["title"] == "只有标题"
+    assert records[0]["company"] is None      # 缺字段 → None，不炸整批
+    assert records[0]["salary"] is None
+
+
+def test_json与regex组合能截出城市():
+    spec = make_api_spec()
+    records = SpecCrawler(spec).parse_page(json.dumps(API_PAYLOAD))
+    # "长沙-岳麓区" / "长沙·雨花区" 都截到 "长沙"
+    assert [r["city"] for r in records] == ["长沙", "长沙"]
+
+
+def test_json数组展开取值():
+    spec = make_api_spec(
+        list={"fields": {"tag": "json:tags[]"}},
+        mapping={"target": "generic", "field_map": {}},   # 本用例只验证取值，不涉及岗位映射
+    )
+    crawler = SpecCrawler(spec)
+    records = crawler.parse_page(json.dumps({
+        "resultbody": {"job": {"items": [
+            {"jobName": "x", "tags": ["Python", "RAG"]},
+        ]}}
+    }))
+    assert records[0]["tag"] == ["Python", "RAG"]
+
+
+def test_json嵌套数组展开并剔除空值():
+    """`a[].b` 的语义：对数组每一项继续走剩下的路径，空值不进列表。"""
+    spec = make_api_spec(
+        list={"fields": {"company": "json:companies[].name"}},
+        mapping={"target": "generic", "field_map": {}},
+    )
+    records = SpecCrawler(spec).parse_page(json.dumps({
+        "resultbody": {"job": {"items": [
+            {"jobName": "x", "companies": [{"name": "甲公司"}, {"name": ""}, {}]},
+        ]}}
+    }))
+    assert records[0]["company"] == ["甲公司"]
+
+
+# ---------------------------------------------------------------- 规格校验
+
+
+def test_api源必须写list_path():
+    with pytest.raises(SpecError, match="list.path"):
+        make_api_spec(list={"path": "", "fields": {"title": "json:jobName"}})
+
+
+def test_api源不接受css容器():
+    with pytest.raises(SpecError, match="container"):
+        make_api_spec(list={"container": "div.job",
+                            "path": "resultbody.job.items",
+                            "fields": {"title": "json:jobName"}})
+
+
+def test_api源与render冲突():
+    """api 走 httpx 取 JSON；渲染 JS 页面是 html + render 的事，两者不能同时成立。"""
+    with pytest.raises(SpecError, match="render"):
+        make_api_spec(request={"render": True})
+
+
+def test_api源不支持detail():
+    with pytest.raises(SpecError, match="detail"):
+        make_api_spec(detail={"enabled": True, "link_field": "href",
+                              "fields": {"description": "div.desc::text"}})
+
+
+def test_html源不接受list_path():
+    with pytest.raises(SpecError, match="list.path"):
+        make_api_spec(type="html", list={"path": "a.b", "container": "div.q",
+                                        "fields": {"title": "span::text"}})
+
+
+def test_未知数据源类型报错():
+    with pytest.raises(SpecError, match="type"):
+        make_api_spec(type="graphql")
+
+
+# ---------------------------------------------------------------- 解析与错误
+
+
+def test_api页解析出全部记录():
+    spec = make_api_spec()
+    records = SpecCrawler(spec).parse_page(json.dumps(API_PAYLOAD, ensure_ascii=False))
+    assert len(records) == 2
+    assert records[0]["title"] == "Python 后端工程师"
+    assert records[0]["company"] == "某某科技有限公司"
+    assert records[1]["salary"] == "8千-1.2万·13薪"
+
+
+def test_非JSON响应报明确错误而不是返回空列表():
+    """这是本项最关键的一条：WAF 页 / 登录页都是 HTTP 200 + HTML。
+
+    静默返回 0 条会让任务显示 COMPLETED / 0 条，看起来像「这个城市没岗位」。
+    """
+    from app.crawlers.spec_crawler import SpecPayloadError
+
+    spec = make_api_spec()
+    waf_page = ('<textarea id="renderData" style="display:none">'
+                '{"_waf_bd8ce2ce37":"brwFwrXgmQFwikOu1O9Hvm8N9YG2"}</textarea>'
+                '<!doctype html><html><head><title>验证</title></head></html>')
+    with pytest.raises(SpecPayloadError) as exc:
+        SpecCrawler(spec).parse_page(waf_page)
+    message = str(exc.value)
+    assert "不是合法 JSON" in message
+    assert "_waf_bd8ce2ce37" in message        # 带响应片段，便于判断是被拦还是参数错
+    assert "type: html" in message             # 给出正确方向
+
+
+def test_list_path指错时报明确错误():
+    from app.crawlers.spec_crawler import SpecPayloadError
+
+    spec = make_api_spec(list={"path": "resultbody.job.nonexistent"})
+    with pytest.raises(SpecPayloadError, match="list.path"):
+        SpecCrawler(spec).parse_page(json.dumps(API_PAYLOAD))
+
+
+def test_记录数组不是数组时报明确错误():
+    from app.crawlers.spec_crawler import SpecPayloadError
+
+    payload = {"resultbody": {"job": {"items": "不是数组"}}}
+    with pytest.raises(SpecPayloadError, match="不是数组"):
+        SpecCrawler(make_api_spec()).parse_page(json.dumps(payload))
+
+
+# ------------------------------------------------------- 输出形状与 job_key
+
+
+def test_api记录映射成岗位字典且job_key走统一指纹():
+    from app.crawlers.cleaner import generate_job_key
+
+    spec = make_api_spec()
+    crawler = SpecCrawler(spec)
+    rows = crawler.parse_page(json.dumps(API_PAYLOAD, ensure_ascii=False))
+    jobs = crawler._shape_records(rows, {"page": 1, "keyword": "python"}, "https://example.com/api")
+
+    assert len(jobs) == 2
+    first = jobs[0]
+    assert first["_target"] == "job"
+    assert first["source_site"] == "job51"
+    assert first["title"] == "Python 后端工程师"
+    # job_key 必须来自 generate_job_key（平台+标题+公司+城市），不能在这里另算
+    assert first["job_key"] == generate_job_key(
+        "job51", "Python 后端工程师", "某某科技有限公司", "长沙"
+    )
+
+
+def test_51job草稿规格与硬编码爬虫的字段口径一致():
+    """用真实接口 JSON 结构对比：YAML 产出的岗位与 Job51Crawler._map_item 逐字段一致。
+
+    这条是任务书 §三.3 的硬要求（job_key 不一致 = 同一岗位入库成两条）。
+    """
+    from app.crawlers.job51 import Job51Crawler
+    from app.crawlers.spec_schema import SPEC_DIR
+
+    spec = load_spec_file(SPEC_DIR / "_job51.yaml")
+    crawler = SpecCrawler(spec)
+    rows = crawler.parse_page(json.dumps(API_PAYLOAD, ensure_ascii=False))
+    assert len(rows) == 2, "草稿规格应能从真实响应结构里解析出两条记录"
+
+    spec_jobs = crawler._shape_records(
+        rows, {"page": 1, "keyword": "python", "area": "190200"},
+        "https://we.51job.com/api/job/search-pc",
+    )
+    reference = Job51Crawler()
+    items = API_PAYLOAD["resultbody"]["job"]["items"]
+    ref_jobs = [reference._map_item(item, spec_jobs[i]["city"]) for i, item in enumerate(items)]
+
+    for mine, ref in zip(spec_jobs, ref_jobs):
+        assert mine["job_key"] == ref["job_key"], "job_key 必须与硬编码爬虫完全一致"
+        assert mine["title"] == ref["title"]
+        assert mine["company_name"] == ref["company_name"]
+        assert mine["city"] == ref["city"]
+        assert mine["url"] == ref["url"]
+        assert mine["experience"] == ref["experience"]
+        assert mine["education"] == ref["education"]
+
+
+def test_51job草稿规格不会被自动加载():
+    """下划线开头 = 禁用。一旦被加载就会顶掉唯一能用的 Job51Crawler（SPECS 优先）。"""
+    from app.crawlers.spec_schema import load_all_specs
+
+    sites = load_all_specs()
+    assert "51job" not in sites, (
+        "草稿规格被自动加载了：registry 里 SPECS 优先于 CRAWLER_REGISTRY，"
+        "会立刻把可用的 Job51Crawler 换成走 httpx 的 SpecCrawler —— 而该接口对"
+        "非浏览器客户端返回 WAF 页，真实采集会整体失效"
+    )
+
+
+# ------------------------------------------------------------------- 分页
+
+
+class _FakeResponse:
+    def __init__(self, text, status=200, ctype="application/json"):
+        self.text = text
+        self.status_code = status
+        self.headers = {"content-type": ctype}
+
+    def raise_for_status(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_api源按page_param翻页(monkeypatch):
+    """翻页参数复用既有逻辑：URL 里的 {page} 逐页替换，不另造一套。"""
+    calls = []
+
+    async def fake_safe_get(url, headers=None, timeout=None):
+        calls.append(url)
+        page = "2" if "pageNum=2" in url else "1"
+        payload = {"resultbody": {"job": {"items": [
+            {"jobName": f"岗位-{page}", "companyName": "某公司"},
+        ]}}}
+        return _FakeResponse(json.dumps(payload, ensure_ascii=False))
+
+    monkeypatch.setattr("app.crawlers.spec_crawler.safe_get", fake_safe_get)
+
+    spec = make_api_spec(pagination={"type": "page_param", "start": 1, "max_pages": 2})
+    jobs = await SpecCrawler(spec).crawl(keyword="python")
+
+    assert len(calls) == 2, calls
+    assert "pageNum=1" in calls[0] and "pageNum=2" in calls[1]
+    assert [j["title"] for j in jobs] == ["岗位-1", "岗位-2"]
+
+
+@pytest.mark.asyncio
+async def test_api源遇到明显类型不符的响应在取数层就报错(monkeypatch):
+    """类型粗筛先拦一次，别等到 JSON 解析才炸（例如被代理换成图片/压缩包）。"""
+
+    async def fake_safe_get(url, headers=None, timeout=None):
+        return _FakeResponse("<html>WAF</html>", ctype="image/png")
+
+    monkeypatch.setattr("app.crawlers.spec_crawler.safe_get", fake_safe_get)
+    with pytest.raises(RuntimeError, match="content-type"):
+        await SpecCrawler(make_api_spec()).crawl(keyword="python")
