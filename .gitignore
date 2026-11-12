@@ -90,3 +90,6 @@ reports/*.html
 
 # 回填/迁移脚本自动备份的库副本（data/*.db 已忽略，但 .bak- 后缀不匹配 *.db）
 data/*.bak-*
+
+# 回填脚本的续跑状态（只有 job id 与失败原因，属本机运行产物）
+data/*.json

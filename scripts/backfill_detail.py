@@ -37,6 +37,19 @@
 
     # 在副本上试（不要拿 recsys.db 做实验）
     python scripts/backfill_detail.py --db data/test_copy.db --limit 5
+
+**失败分类与止损（2026-11-12 补）**
+
+只报「成功 / 失败」没法决策 —— 跑 555 条时真正要回答的是「该停、该重试、还是该放弃」。
+所以失败按 ``FAILURE_KINDS`` 分成 WAF/风控 · 登录墙 · 网络错误 · 解析失败 · 无该字段 · 其他，
+并加两条止损：
+
+1. **连续 ``--max-consecutive-blocked`` 条（默认 5）被拦截 → 立即停本批**（退出码 4）。
+   判定「被拦」= WAF/风控 **或** 登录墙 —— 2026-11-12 实测：51job 的软限流
+   表现为「302 到 login.51job.com」，只盯 WAF 的话这条止损永远不会触发。
+2. **每 ``--batch-size`` 条（默认 50）冷却 ``--cooldown`` 秒（默认 30）**。
+   域名闸门本身是 20 秒/请求，一批 50 条已经连打十几分钟；30 秒停顿让对方的
+   频率统计窗口滑过去，相对整批耗时可忽略。
 """
 from __future__ import annotations
 
@@ -47,25 +60,50 @@ import logging
 import shutil
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from app.crawlers.detail_fetcher import MIN_DESC_LEN, DetailFetcher  # noqa: E402
+# Windows 控制台默认 GBK：往 print 里塞一个 GBK 编不了的字符（emoji 之类）会抛
+# UnicodeEncodeError。这个脚本一跑就是几十分钟，崩在收尾处等于把整批汇总丢掉
+# （2026-11-12 实测踩到：止损分支里放了个 emoji，让成功/失败统计一行都没打印出来）。
+# 这里把编码错误降级为替换，并在源码里禁用非 GBK 字符（有测试锁着）。
+try:
+    sys.stdout.reconfigure(errors="replace")
+except Exception:  # noqa: BLE001 - 非标准流（被重定向）时忽略
+    pass
+
+from app.crawlers.detail_fetcher import (  # noqa: E402
+    BLOCKED_KINDS,
+    FAILURE_KINDS,
+    KIND_OTHER,
+    KIND_WAF,
+    MIN_DESC_LEN,
+    DetailFetcher,
+)
 
 logger = logging.getLogger("backfill_detail")
 
 DEFAULT_DB = ROOT / "data" / "recsys.db"
 DEFAULT_STATE = ROOT / "data" / "backfill_detail_state.json"
 
-# 需要回填的判定：没有正文，或者正文短得明显不是正文（列表页拼出来的标题+福利词）。
-# detail_html 为空也算 —— 有的岗位正文有了但整页 HTML 还没存。
+# 需要回填的判定：**只按正文长度**（没有正文，或正文短得明显不是正文）。
+#
+# 原先还要求 ``detail_html`` 非空，结果是「永远填不完」：
+# 2026-11-12 实测，唯一能拿到数据的路径是搜索接口（``source=search_api``），
+# 它返回的是一条 JSON 记录、**没有整页 HTML**，所以成功回填 52 条之后
+# ``detail_html`` 仍是 0/555 —— 每一行都还满足「待回填」，
+# 全量预估永远停在 555 条，脚本会把已经补好的行反复重抓。
+#
+# ``detail_html`` 的缺口是真实存在的（详情页未登录态打不开），但它属于
+# **另一条取数路径**的问题，不该混进「这条岗位还差正文」的判据里。
+# 每次运行结束时会把 detail_html 覆盖率单独打印出来，不藏。
 _NEED_BACKFILL = (
     "(url IS NOT NULL AND TRIM(url) <> '') AND ("
     " job_desc IS NULL OR LENGTH(TRIM(job_desc)) < ?"
-    " OR detail_html IS NULL OR TRIM(detail_html) = ''"
     ")"
 )
 
@@ -148,6 +186,24 @@ def _verify_status_unchanged(conn: sqlite3.Connection, before: dict) -> bool:
     return True
 
 
+def _fmt_duration(seconds: float) -> str:
+    """把秒数说成人话（预估耗时要能直接读给用户听）。"""
+    if seconds <= 0:
+        return "0 秒"
+    total = int(round(seconds))
+    minutes, sec = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} 小时 {minutes} 分"
+    if minutes:
+        return f"{minutes} 分 {sec} 秒"
+    return f"{sec} 秒"
+
+
+def _kind_label(kind: str) -> str:
+    return FAILURE_KINDS.get(kind, kind or "未分类")
+
+
 async def run(args) -> int:
     db_path = Path(args.db)
     if not db_path.is_absolute():
@@ -164,12 +220,27 @@ async def run(args) -> int:
 
     conn = _connect(db_path)
     try:
-        rows = _pending_rows(conn, args.limit, skip_ids)
+        # 先取全量待回填（用于预估），再按 --limit 截断本批
+        all_rows = _pending_rows(conn, 0, skip_ids)
+
+        # --resume 的语义是「继续往前走」，不是「把上次失败的原地重试一遍」。
+        # 失败过的（尤其被登录墙挡住的）在同一次运行里重试几乎必然再失败，
+        # 却会占满 --limit 名额、让新数据一条都推不动。所以把它们排到最后：
+        # 有余额才重试，没余额就先保证覆盖面。
+        failed_ids = set()
+        if args.resume:
+            failed_ids = {int(k) for k in state.get("failed", {}) if str(k).isdigit()}
+        if failed_ids:
+            all_rows.sort(key=lambda r: (r["id"] in failed_ids, r["id"]))
+        rows = all_rows[: args.limit] if args.limit > 0 else all_rows
         if not rows:
             print(f"没有待回填的岗位（库里已无缺失项，或 --limit 太小）。库：{db_path}")
             return 0
 
-        print(f"待回填 {len(rows)} 条（库：{db_path}，dry-run={args.dry_run}，resume={args.resume}）")
+        print(
+            f"待回填 {len(rows)} 条（全库剩余 {len(all_rows)} 条；库：{db_path}，"
+            f"dry-run={args.dry_run}，resume={args.resume}）"
+        )
 
         backup = None
         if not args.dry_run:
@@ -181,13 +252,21 @@ async def run(args) -> int:
 
         fetcher = DetailFetcher(min_interval=args.interval)
         ok = failed = skipped = 0
+        counts = {kind: 0 for kind in FAILURE_KINDS}
+        consecutive_waf = 0
+        stopped_by_waf = False
+        processed = 0
+        started = time.time()
+
         try:
             for idx, row in enumerate(rows, 1):
+                processed = idx
                 result = await fetcher.fetch(
                     row["url"], keyword=row["title"] or "", city=row["city"] or ""
                 )
                 if result.ok:
                     ok += 1
+                    consecutive_waf = 0
                     if not args.dry_run:
                         _write_one(conn, row["id"], result)
                         conn.commit()
@@ -202,27 +281,100 @@ async def run(args) -> int:
                     )
                 elif result.reason.startswith("缺少岗位 URL"):
                     skipped += 1
+                    consecutive_waf = 0
                     print(f"[{idx}/{len(rows)}] skip id={row['id']} 原因={result.reason}")
                 else:
                     failed += 1
+                    kind = result.failure or KIND_OTHER
+                    counts[kind] = counts.get(kind, 0) + 1
+                    consecutive_waf = consecutive_waf + 1 if kind in BLOCKED_KINDS else 0
                     if not args.dry_run:
-                        state.setdefault("failed", {})[str(row["id"])] = result.reason
+                        # 状态文件同时存类别与原文：类别用来聚合，原文用来排查
+                        state.setdefault("failed", {})[str(row["id"])] = {
+                            "kind": kind,
+                            "reason": result.reason,
+                        }
                         _save_state(state_path, state)
-                    print(f"[{idx}/{len(rows)}] fail id={row['id']} 原因={result.reason}")
+                    print(
+                        f"[{idx}/{len(rows)}] fail id={row['id']} "
+                        f"类别={_kind_label(kind)} 原因={result.reason}"
+                    )
+
+                # ---- 止损一：连续 N 条被「拦住」（WAF / 登录墙） ----
+                # 单条可能只是抽风；连续 N 条说明对方已经把我们这条 IP 标了。
+                # 此时继续硬顶只会把临时限流升级为封 IP，而且成功率会掉到 0。
+                # 实测依据见 FAILURE_KINDS 下方注释：51job 的软限流表现为「302 到登录页」，
+                # 只盯 WAF 的话这条止损永远不会触发。
+                if consecutive_waf >= args.max_consecutive_blocked:
+                    stopped_by_waf = True
+                    print(
+                        f"\n[STOP] 连续 {consecutive_waf} 条被站点拦截"
+                        f"（WAF 或登录墙）—— 立即停止本批。\n"
+                        f"       剩余 {len(rows) - idx} 条未处理；"
+                        f"换网络/等一段时间后再用 --resume 继续。"
+                    )
+                    break
 
                 if idx % 10 == 0:
-                    print(f"---- 进度 {idx}/{len(rows)}：成功 {ok} / 失败 {failed} / 跳过 {skipped}")
+                    elapsed = time.time() - started
+                    speed = elapsed / idx
+                    print(
+                        f"---- 进度 {idx}/{len(rows)}：成功 {ok} / 失败 {failed} / 跳过 {skipped}"
+                        f"（{speed:.1f} 秒/条，已用 {_fmt_duration(elapsed)}）"
+                    )
+
+                # ---- 止损二：批次之间冷却 ----
+                # 默认 50 条一批、批间 30 秒。依据：域名闸门本身是 20 秒/请求，
+                # 一批 50 条已经连续打了十几分钟；30 秒的停顿是为了让对方的
+                # 频率统计窗口滑过去，成本几乎为零（相对整批耗时）。
+                if (
+                    args.batch_size > 0
+                    and idx % args.batch_size == 0
+                    and idx < len(rows)
+                    and args.cooldown > 0
+                ):
+                    print(f"---- 批次结束（{idx}/{len(rows)}），冷却 {args.cooldown:g} 秒后再继续…")
+                    await asyncio.sleep(args.cooldown)
         finally:
             await fetcher.aclose()
 
+        elapsed = time.time() - started
+        avg = elapsed / processed if processed else 0.0
         print(
-            f"\n完成：成功 {ok} / 失败 {failed} / 跳过 {skipped}（共 {len(rows)} 条）"
+            f"\n完成：成功 {ok} / 失败 {failed} / 跳过 {skipped}"
+            f"（本批处理 {processed}/{len(rows)} 条，用时 {_fmt_duration(elapsed)}）"
             + ("（dry-run，未写库）" if args.dry_run else "")
         )
+        if failed:
+            print("失败分类：")
+            for kind, label in FAILURE_KINDS.items():
+                n = counts.get(kind, 0)
+                if n:
+                    print(f"  {label:<10} {n:>4} 条  ({n / failed * 100:.1f}%)")
+        if avg:
+            print(f"单条平均耗时 {avg:.1f} 秒（含节流等待）")
+            remaining = max(0, len(all_rows) - ok)
+            if remaining:
+                print(
+                    f"按本次速度估算：剩余 {remaining} 条约需 "
+                    f"{_fmt_duration(avg * remaining)}（不含冷却与失败重试）"
+                )
+
+        # detail_html 单独报一次：它只有 html 路径才会产生，而当前唯一可用的
+        # 取数路径是搜索接口（拿不到整页）。把缺口摆出来，别让它被"成功 52 条"盖住。
+        total_jobs = conn.execute("select count(*) from job").fetchone()[0]
+        html_rows = conn.execute(
+            "select count(*) from job where detail_html is not null and trim(detail_html) <> ''"
+        ).fetchone()[0]
+        print(
+            f"detail_html 覆盖：{html_rows}/{total_jobs}"
+            f"（唯一可用路径是搜索接口，不返回整页 HTML —— 已知缺口，见报告）"
+        )
+
         if not _verify_status_unchanged(conn, status_before):
             return 3
         print("job_status 校验：所有被回填岗位的状态与回填前一致。")
-        return 0
+        return 4 if stopped_by_waf else 0
     finally:
         conn.close()
 
@@ -237,6 +389,18 @@ def _parse_args(argv=None):
     parser.add_argument(
         "--interval", type=float, default=None,
         help="同域名最小间隔（秒）；默认沿用 settings.crawl_domain_min_interval",
+    )
+    parser.add_argument(
+        "--max-consecutive-blocked", type=int, default=5, metavar="N",
+        help="连续 N 条被站点拦截（WAF 或登录墙）就停止本批（默认 5）；退出码 4 表示因此停止",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=50, metavar="N",
+        help="每 N 条为一批，批间冷却（默认 50；0 = 不冷却）",
+    )
+    parser.add_argument(
+        "--cooldown", type=float, default=30.0, metavar="SEC",
+        help="批次之间的冷却秒数（默认 30）；依据见 --help 顶部说明",
     )
     return parser.parse_args(argv)
 

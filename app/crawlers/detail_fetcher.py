@@ -80,6 +80,95 @@ _MIN_HEADERS = {
 }
 
 
+# --------------------------------------------------------------------- 失败分类
+#
+# 只报「成功 / 失败」没法决策：539 条失败里，是站点在拦（该停）、
+# 是网络抖（该重试）、还是这条岗位本身没正文（根本不用重试）？
+# 三类混在一起，"失败 539" 这句话既不能指导重试也不能指导放弃。
+KIND_WAF = "waf"                 # WAF / 验证码 / 429
+KIND_LOGIN = "login_wall"        # 登录墙（跳登录页 / 密码表单）
+KIND_NETWORK = "network"         # 超时 / 连接失败 / 5xx
+KIND_PARSE = "parse"             # 拿到了页面但结构不认（SPA 空壳、改版）
+KIND_NO_FIELD = "no_field"       # 页面/接口正常，但这条岗位没有正文可取
+KIND_OTHER = "other"             # 地址不安全、4xx、缺 URL 等
+
+FAILURE_KINDS = {
+    KIND_WAF: "WAF/风控",
+    KIND_LOGIN: "登录墙",
+    KIND_NETWORK: "网络错误",
+    KIND_PARSE: "解析失败",
+    KIND_NO_FIELD: "无该字段",
+    KIND_OTHER: "其他",
+}
+
+# 哪些类别算「站点在拦我们」——用于批量止损。
+#
+# **登录墙必须算进去**：2026-11-12 实测，51job 在连续请求约 20 条之后开始把
+# 详情页 302 到 ``login.51job.com``（未登录态下这是它的软限流手段），
+# 而不是回 WAF 页。只盯 WAF 的话止损永远不触发，脚本会继续把 14 条、
+# 40 条…都打出去，这正是"硬顶把 IP 打黑"的形状。
+BLOCKED_KINDS = (KIND_WAF, KIND_LOGIN)
+
+# ------------------------------------------------------- 风控 / 登录墙的结构化判据
+#
+# 🔴 **为什么不能复用 ``BaseCrawler.detect_blocked``**：那个判据是给**列表页**写的 ——
+# 它扫正文前 4000 字符里有没有「风险」「校验」「验证码」等词。列表页的前 4000 字符
+# 是 head / nav / CSS，岗位正文根本进不了窗口；详情页正相反，**正文就是被判对象**，
+# 而「负责风控模型的数据校验」「风险控制体系」在岗位描述里极其常见。
+#
+# 2026-11-12 实测（同一段正文，只改它在 HTML 里的位置）：
+#   精简详情页，正文在 184 字符处   → 判成站点风控，desc_len=0，数据被丢
+#   同正文 + 12KB 内联样式，正文在 12799 字符处 → 不被判风控，正常抓到 59 字符
+# 同一句话，判不判取决于它落在第几个字节 —— 那不是判据，是抽签。
+#
+# 所以详情页只看**结构性证据**：HTTP 429、URL/标题指向 passport/security、
+# 页面骨架里有没有验证码容器或密码登录表单。不扫正文关键词。
+_LOGIN_URL_HINTS = ("/login", "login.", "passport", "/web/user/", "/signin", "from=passport")
+_WAF_URL_HINTS = ("security_check", "security.", "/verify", "captcha", "/waf", "aliyun_waf")
+_WAF_TITLE_HINTS = ("验证", "安全校验", "滑动", "人机", "访问受限", "请稍候", "安全检查", "拦截")
+_LOGIN_TITLE_HINTS = ("登录", "注册登录", "请登录", "sign in", "log in")
+
+# 结构性标记：验证码容器 / 密码登录表单（**不是**正文关键词）
+_WAF_SKELETON = (
+    "_waf_", "aliyun_waf", 'id="captcha"', "id='captcha'", 'class="captcha', "class='captcha",
+    "slide-verify", "geetest", "nc_1_wrapper", "nc-container", "verify-slider",
+)
+_LOGIN_SKELETON = (
+    'type="password"', "type='password'", 'name="password"', "name='password'",
+)
+
+
+def detect_blocked_structural(html: str, status_code: int = 200, url: str = "", title: str = ""):
+    """判定「这一页是站点在拦你」，返回 ``(kind, 证据)``；不是拦截则返回 ``("", "")``。
+
+    与 :meth:`BaseCrawler.detect_blocked` 的唯一区别，也是关键区别：
+    **不扫正文关键词**。详情页的正文是业务数据本身，不是页面特征。
+    """
+    if status_code == 429:
+        return KIND_WAF, "HTTP 429 限流"
+
+    url_low = str(url or "").lower()
+    if any(h in url_low for h in _LOGIN_URL_HINTS):
+        return KIND_LOGIN, f"跳转到登录页（{url}）"
+    if any(h in url_low for h in _WAF_URL_HINTS):
+        return KIND_WAF, f"跳转到安全校验页（{url}）"
+
+    title_text = str(title or "")
+    if title_text and any(h in title_text for h in _WAF_TITLE_HINTS):
+        return KIND_WAF, f"页面标题是验证页（{title_text}）"
+    if title_text and any(h in title_text for h in _LOGIN_TITLE_HINTS):
+        return KIND_LOGIN, f"页面标题是登录页（{title_text}）"
+
+    low = str(html or "").lower()
+    if not low:
+        return "", ""
+    if any(marker in low for marker in _WAF_SKELETON):
+        return KIND_WAF, "页面骨架里含验证码 / WAF 容器"
+    if any(marker in low for marker in _LOGIN_SKELETON):
+        return KIND_LOGIN, "页面骨架里含密码登录表单"
+    return "", ""
+
+
 @dataclass
 class DetailResult:
     """一条岗位详情的抓取结果。``ok`` 由正文是否够长决定，不由「有没有抛异常」决定。"""
@@ -90,6 +179,10 @@ class DetailResult:
     detail_html: str = ""
     source: str = ""
     reason: str = ""
+    # 失败类别（见 FAILURE_KINDS）。空串 = 成功，或还没判定。
+    # 为什么单独一个字段而不是从 reason 里猜：日志是给人看的，
+    # 统计要按类别聚合 —— 混在一起就只能得到「失败 539 条」，没法决策。
+    failure: str = ""
     attempts: List[str] = field(default_factory=list)
 
     @property
@@ -105,6 +198,7 @@ class DetailResult:
             "detail_html_len": len(self.detail_html),
             "source": self.source,
             "reason": self.reason,
+            "failure": self.failure,
         }
 
 
@@ -309,13 +403,34 @@ class DetailFetcher:
     """详情抓取器。浏览器**在多个岗位之间复用**：每次新建上下文要 3~5 秒，
     20 条就是一分多钟的纯启动开销。用 ``aclose()`` 显式释放。"""
 
-    def __init__(self, *, timeout: Optional[float] = None, min_interval: Optional[float] = None):
+    def __init__(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        min_interval: Optional[float] = None,
+        skip_login_walled_detail: bool = True,
+    ):
         self.timeout = float(timeout or settings.crawl_timeout)
+        self.skip_login_walled_detail = bool(skip_login_walled_detail)
         self.min_interval = (
             float(min_interval) if min_interval is not None else float(settings.crawl_domain_min_interval)
         )
         self._pw_ctx = None
         self._browser = None
+        # 子步骤（渲染 / 搜索兜底）的失败类别，由它们自己写入、fetch() 读取后清空。
+        # 为什么用实例属性而不是改返回值：这两个方法是既有测试的打桩目标
+        # （`_render_detail(self, url)` 返回 None 表示失败），改签名会连带改一堆用例，
+        # 而"这一条为什么失败"本来就属于这次抓取的状态。
+        self._last_failure: Tuple[str, str] = ("", "")
+
+        # 「详情页需要登录」这件事在一次运行里只需确认一次。
+        #
+        # 2026-11-12 实测：未登录态下 `we.51job.com/pc/jobdetail?jobId=…` 100% 302 到
+        # `login.51job.com`，而每条岗位都要先试静态 HTML、再试渲染 —— 两次都是白打。
+        # 一次全量回填因此变成 3 倍请求量：既慢（60 秒/条），又更容易把 IP 打成限流。
+        # 这里记一次结论，后续条目直接走搜索兜底那条唯一可用的路径。
+        # 想强制每条都试（例如以后带了登录态）就把 skip_login_walled_detail 设为 False。
+        self._detail_known_login_wall = False
 
     # ---------------------------------------------------------------- 浏览器
 
@@ -372,52 +487,104 @@ class DetailFetcher:
     async def fetch(
         self, url: str, *, keyword: str = "", city: str = "", allow_search: bool = True
     ) -> DetailResult:
-        """抓一条详情。**不抛异常**：失败信息放在 ``reason`` / ``attempts`` 里。"""
+        """抓一条详情。**不抛异常**：失败信息放在 ``reason`` / ``failure`` / ``attempts`` 里。
+
+        ``failure`` 只会是 :data:`FAILURE_KINDS` 里的键（成功时为空串）。
+        调用方据此决定「停整批（WAF）/ 重试（网络）/ 放弃（无该字段）」——
+        只报"失败"三个字的话，这三种处置没法区分。
+        """
         result = DetailResult(job_id=extract_job_id(url))
         if not url:
             result.reason = "缺少岗位 URL"
+            result.failure = KIND_OTHER
             return result
 
-        # 1) 静态 HTML
-        try:
-            await await_domain_slot(url, self.min_interval)
-            resp = await safe_get(url, headers=_MIN_HEADERS, timeout=self.timeout)
-            html = resp.text or ""
-            final_url = str(getattr(resp, "url", "") or url)
-            if BaseCrawler.detect_blocked(html, resp.status_code, final_url):
-                result.attempts.append("html: 命中风控信号")
-            else:
-                parsed = parse_detail_html(html, final_url)
-                if parsed:
-                    desc, publish = parsed
+        # 批量复用一个 fetcher：先清掉上一条的子步骤状态，
+        # 否则「上一条被登录墙挡了」会被算到这一条头上。
+        self._last_failure = ("", "")
+
+        # 1) 静态 HTML 与 2) 渲染详情页 —— 两步都依赖「详情页本身能打开」。
+        #
+        # 未登录态下这条前提 100% 不成立（302 到 login.51job.com），于是每条岗位都要
+        # 白打两次请求：各占一个域名槽位，20 秒间隔下就是每条多花 40 秒。
+        # 2026-11-12 实测：3 请求/条 → 64 秒/条；而真正能出数据的只有第 3 步。
+        # 一次运行确认过就够了，之后直接走搜索兜底（想强制逐条都试，把
+        # skip_login_walled_detail 设为 False —— 例如以后带上了登录态）。
+        if self.skip_login_walled_detail and self._detail_known_login_wall:
+            result.attempts.append(
+                "html/render: 本次运行已确认详情页需登录，跳过（省掉两次必失败的请求）"
+            )
+        else:
+            # 1) 静态 HTML
+            try:
+                await await_domain_slot(url, self.min_interval)
+                resp = await safe_get(url, headers=_MIN_HEADERS, timeout=self.timeout)
+                html = resp.text or ""
+                final_url = str(getattr(resp, "url", "") or url)
+                status = int(getattr(resp, "status_code", 200) or 200)
+
+                # 🔴 结构化判据，不扫正文关键词（原因见 detect_blocked_structural 注释）
+                kind, evidence = detect_blocked_structural(html, status, final_url)
+                if kind:
+                    result.attempts.append(f"html: {FAILURE_KINDS[kind]}（{evidence}）")
+                    result.failure = kind
+                    if kind == KIND_WAF:
+                        # 只有真的被拦才降速；正文里出现「风控」不再触发
+                        BaseCrawler.mark_blocked()
+                elif status >= 400:
+                    result.attempts.append(f"html: HTTP {status}")
+                    result.failure = KIND_NETWORK if status >= 500 else KIND_OTHER
+                else:
+                    parsed = parse_detail_html(html, final_url)
+                    if parsed:
+                        desc, publish = parsed
+                        result.job_desc = desc
+                        result.publish_time = publish
+                        result.detail_html = html[:MAX_HTML_LEN]
+                        result.source = "html"
+                        return result
+                    result.attempts.append(f"html: 结构不匹配（{len(html)} 字节）")
+                    result.failure = KIND_PARSE
+            except UnsafeURLError as exc:
+                result.attempts.append(f"html: 目标地址不安全（{exc}）")
+                result.failure = KIND_OTHER
+            except Exception as exc:  # noqa: BLE001 - 网络问题不该中断整批
+                result.attempts.append(f"html: {type(exc).__name__}: {exc}")
+                result.failure = KIND_NETWORK
+
+            if result.failure == KIND_LOGIN:
+                # 详情页要登录 —— 记住这一次结论，后面不再白打
+                self._detail_known_login_wall = True
+
+            # 2) 渲染详情页
+            try:
+                rendered = await self._render_detail(url)
+                if rendered:
+                    desc, publish = rendered
                     result.job_desc = desc
                     result.publish_time = publish
-                    result.detail_html = html[:MAX_HTML_LEN]
-                    result.source = "html"
+                    result.detail_html = ""  # 见 _render_detail：只在能拿到正文时返回正文
+                    result.source = "render"
                     return result
-                result.attempts.append(f"html: 结构不匹配（{len(html)} 字节）")
-        except UnsafeURLError as exc:
-            result.attempts.append(f"html: 目标地址不安全（{exc}）")
-        except Exception as exc:  # noqa: BLE001 - 网络问题不该中断整批
-            result.attempts.append(f"html: {type(exc).__name__}: {exc}")
-
-        # 2) 渲染详情页
-        try:
-            rendered = await self._render_detail(url)
-            if rendered:
-                desc, publish = rendered
-                result.job_desc = desc
-                result.publish_time = publish
-                result.detail_html = ""  # 见 _render_detail：只在能拿到正文时返回正文
-                result.source = "render"
-                return result
-            result.attempts.append("render: 未拿到正文")
-        except Exception as exc:  # noqa: BLE001
-            result.attempts.append(f"render: {type(exc).__name__}: {exc}")
+                kind, evidence = self._last_failure
+                label = FAILURE_KINDS.get(kind, "未拿到正文")
+                result.attempts.append(f"render: {label}" + (f"（{evidence}）" if evidence else ""))
+                # 不覆盖「更具体」的结论：静态路径已经判明是 WAF / 登录墙时，
+                # 渲染路径"没拿到正文"不代表它没被拦（浏览器同样会被挡）。
+                if kind and result.failure not in (KIND_WAF, KIND_LOGIN):
+                    result.failure = kind
+                elif not kind:
+                    result.failure = result.failure or KIND_PARSE
+                if kind == KIND_LOGIN or result.failure == KIND_LOGIN:
+                    self._detail_known_login_wall = True
+            except Exception as exc:  # noqa: BLE001
+                result.attempts.append(f"render: {type(exc).__name__}: {exc}")
+                result.failure = KIND_NETWORK
 
         # 3) 搜索接口兜底（需要标题做关键词）
         if allow_search and keyword:
             try:
+                self._last_failure = ("", "")
                 found = await self._search_by_keyword(keyword, city, result.job_id)
                 if found:
                     desc, publish, html = found
@@ -426,13 +593,22 @@ class DetailFetcher:
                     result.detail_html = html
                     result.source = "search_api"
                     return result
-                result.attempts.append("search: 结果里没有该 jobId")
+                kind, evidence = self._last_failure
+                label = FAILURE_KINDS.get(kind, "结果里没有该 jobId")
+                result.attempts.append(f"search: {label}" + (f"（{evidence}）" if evidence else ""))
+                # 前面已经确定是「被站点拦住」时，保留更严重的类别：
+                # 搜索兜底没命中不代表没被拦，只代表这条路也没成
+                if result.failure not in (KIND_WAF, KIND_LOGIN):
+                    result.failure = kind or KIND_NO_FIELD
             except Exception as exc:  # noqa: BLE001
                 result.attempts.append(f"search: {type(exc).__name__}: {exc}")
+                if result.failure not in (KIND_WAF, KIND_LOGIN):
+                    result.failure = KIND_NETWORK
         elif not keyword:
             result.attempts.append("search: 未提供标题，跳过")
 
         result.reason = "；".join(result.attempts[-3:]) or "未知原因"
+        result.failure = result.failure or KIND_OTHER
         return result
 
     # ---------------------------------------------------------------- 内部
@@ -450,16 +626,35 @@ class DetailFetcher:
                 title = await page.title()
             except Exception:  # noqa: BLE001
                 pass
-            # 登录墙与滑块验证：URL / 标题里带得到证据（detect_blocked 的同一判据）
-            if any(k in final.lower() for k in ("login.", "/login", "passport")) or \
-                    any(k in title for k in ("登录", "验证")):
-                logger.info("详情页需要登录或验证，跳过渲染取数：%s", url)
+            # 先用「URL + 标题」判一次（不用等整页 HTML）：登录墙与验证页在这两处
+            # 留的证据比正文关键词可靠得多，也便宜得多。
+            kind, evidence = detect_blocked_structural("", 200, final, title)
+            if kind:
+                self._last_failure = (kind, evidence)
+                if kind == KIND_WAF:
+                    BaseCrawler.mark_blocked()
+                logger.info(
+                    "详情页被拦（%s：%s），跳过渲染取数：%s", FAILURE_KINDS[kind], evidence, url
+                )
                 return None
+
             html = await page.content()
-            if BaseCrawler.detect_blocked(html, 200, final, title):
-                BaseCrawler.mark_blocked()
+            kind, evidence = detect_blocked_structural(html, 200, final, title)
+            if kind:
+                self._last_failure = (kind, evidence)
+                if kind == KIND_WAF:
+                    BaseCrawler.mark_blocked()
+                logger.info(
+                    "详情页被拦（%s：%s），跳过渲染取数：%s", FAILURE_KINDS[kind], evidence, url
+                )
                 return None
-            return parse_detail_html(html, final)
+
+            parsed = parse_detail_html(html, final)
+            if parsed is None:
+                # 渲染成功但这个容器结构仍不认识：SPA 空壳 / 改版，
+                # 与「被拦」是两回事，不能混进 WAF 计数里。
+                self._last_failure = (KIND_PARSE, f"渲染后仍无正文（{len(html)} 字节）")
+            return parsed
         finally:
             try:
                 await context.close()
@@ -473,6 +668,7 @@ class DetailFetcher:
         把别人的岗位职责写进这条记录 —— 数据看着完整、内容是错的，比空着更糟。
         """
         if not job_id:
+            self._last_failure = (KIND_NO_FIELD, "URL 里取不到 jobId，无法按 ID 精确命中")
             return None
         from urllib.parse import quote
 
@@ -509,6 +705,7 @@ class DetailFetcher:
             except Exception:  # noqa: BLE001
                 pass
 
+        scanned = 0
         for text in reversed(payloads):
             try:
                 items = extract_items(text)
@@ -516,14 +713,25 @@ class DetailFetcher:
                 continue
             if not items:
                 continue
+            scanned += len(items)
             for item in items:
                 if str(item.get("jobId") or "") != str(job_id):
                     continue
                 parsed = parse_search_item(item)
                 if not parsed:
+                    # 命中这一条了，但它的 jobDescribe 太短/为空 —— 是「这岗位没正文」，
+                    # 不是「被拦」，重试也没有用。
+                    self._last_failure = (KIND_NO_FIELD, "命中该 jobId 但接口里没有正文")
                     return None
                 desc, publish = parsed
                 return desc, publish, ""
+
+        if not payloads:
+            self._last_failure = (KIND_PARSE, "搜索页没有拿到接口响应（可能被拦或未渲染完）")
+        elif scanned:
+            self._last_failure = (KIND_NO_FIELD, f"接口返回 {scanned} 条里没有该 jobId")
+        else:
+            self._last_failure = (KIND_PARSE, "接口响应结构不可识别")
         return None
 
 

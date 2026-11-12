@@ -11,6 +11,98 @@ GitHub Release 的 tag 必须与之一致（`v1.0.0`）—— 更新检查就是
 
 ---
 
+## [1.2.0] - 2026-11-12
+
+本轮主线是「真实采集链路补全 + 第二轮安全收口」：规格引擎接上 JSON 接口源，详情回填落地，
+审计发现的 SSRF / XSS 路径逐条封死。下列每条均对应具体提交（括号内为短 SHA）。
+
+### 新增
+
+- **声明式规格引擎支持 JSON 接口源**（`type: api` + `json:` 路径表达式）：
+  `app/crawlers/spec_schema.py` / `app/crawlers/spec_crawler.py`，样例规格 `app/crawlers/specs/_job51.yaml`，
+  说明文档 `docs/data-source-plugin.md`；用例 `tests/test_spec_crawler.py`。（0c78d3d）
+- **详情回填链路落地**：`app/crawlers/detail_fetcher.py` 依次走 safe_get 静态 HTML →
+  受控 Playwright 渲染 → 51job 搜索接口；`scripts/backfill_detail.py` 只回填
+  `job_desc` / `detail_html` / `publish_time`，回填前备份 SQLite，回填后校验 `job_status` 不变；
+  用例 `tests/test_detail_fetcher.py`。（a50eda0）
+- **51job 接口被拒时改读渲染后 DOM**，新增批量采集器 `scripts/crawl_51job_batch.py`。（ba44e9b）
+- **入库时建 / 复用 Company 实体并回填 `company_id`**：`save_job` 作为全部入库路径的汇合点
+  统一维护公司实体；`scripts/backfill_company_ids.py` 幂等回填存量空值。（170cd4d）
+- **采集治理与审计脚本**：`scripts/check_boss_login.py` 登录态自检、`scripts/source_stats.py`
+  来源分布统计、`scripts/audit_api.py` 走真实路由表的只读 API 审计、
+  `scripts/audit_empty_db.py` 空库边界对账、`scripts/purge_seed_data.py` 清理合成 seed 岗位
+  （默认 dry-run，`--apply` 才删）。（de874ce / f757861 / 9abe969 / 00b6499 / 1b27fe2）
+- **空库边界与夹具分布回归**：`tests/test_api_empty_db.py`（空库下统计 / 分页 / 推荐 / 画像 /
+  导出 / 日报必须返回合法空值，不得 500）、`tests/test_api_job_distribution.py`（20 条固定夹具
+  的城市 / 技能 / 薪资 / 学历 / 经验手算对账）。（00b6499）
+- **仓库健康自检** `scripts/repo_health.py`：工位脏 / 分支残留 / 只读区被改 / 库行数与
+  journal_mode 等检查；只读不写，`--strict` 时有 🔴 退出码可用于提交前拦截。（f1950f6）
+- 补充 `python -m app.main` 启动入口（`app/main.py` 的 `__main__` 分支）。（2f0c5ef）
+
+### 修复（安全）
+
+- **声明式爬虫 SSRF 收口**：规格爬虫目标 URL 来自第三方页面 href，原先
+  `httpx.AsyncClient(follow_redirects=True)` 重定向后才校验。改走 `url_safety.safe_get()`
+  （`follow_redirects=False`、每跳先判后发）；Playwright 路径加预检 + document 级 route 守卫；
+  `UnsafeURLError` 记为不可重试；内网详情链接停止整批，而非记单条失败继续探测。（53f4b92）
+- **回退页存储型 XSS**：`app/static/index.html` 九处插值改用 `esc()` / `escText()`，
+  AI 流按纯文本渲染（保留换行，代价是回退页不做 Markdown 排版）。（53f4b92）
+- **`route.abort()` 吞掉异常类型**：守卫记录被拒 URL，goto 抛出的 `net::ERR_ABORTED`
+  改写回 `UnsafeURLError`；旧测试用替身整段替换抓取路径属假阳性，新测试驱动会 abort 的
+  假页面复现真实 abort-then-raise 序列。（056a87a）
+- **SSE 换行丢正文**：`data:` 字段按行编码，`split("\n")` 保留尾部空行；回退页按事件解析、
+  合并同一事件的多行 data。（056a87a）
+- **启动脚本回灌回环绑定**：`start.bat` / `start-generic.bat` 此前仍绑 `0.0.0.0`，
+  与 `run_entry.py` 的回环默认值不一致，改为 `127.0.0.1`；非回环地址 + 弱 `JWT_SECRET`
+  拒绝启动。（f3cb702 / b06f27a）
+
+### 修复
+
+- **推荐候选池状态口径**：`analyzer.py` 原只取 `ACTIVE`，而爬虫入库写 `NEW`，
+  555 条只进 42 条候选；改为 `NEW + ACTIVE`，与 `crawler_service.py` 口径一致，
+  `OFFLINE` / `CLOSED` 仍排除。（6762a93）
+- **API 源三处缺陷**：
+  - D4 风控关键词检测误喂 JSON 正文（合法 JD 含「风控 / 校验 / 审核」会被整页判阻）
+    → API 源跳过关键词检测，只认 HTTP 429 与结构失败；
+  - D3 `SpecPayloadError` 未进不可重试集合 → 引入 `DeterministicCrawlerError` 标记基类；
+  - D5 空数组与全量映射失败两条静默零路径：空数组记 info，全量映射失败抛结构错误并带首条记录的键。（6762a93）
+- **导入不复活已下架岗位**：两条契约测试钉住「状态只能由观察驱动」：CLOSED 岗位重导仍
+  CLOSED，旧导出不能覆盖库内已更新字段。（3ca56e2）
+- **知识库提交后序列化触发 `MissingGreenlet` 500**：序列化前显式 refresh，补 3 条回归。（260b7bd）
+- **视觉导入 `validate` 改 query 参数**：multipart 请求无 JSON body，原 `Body(None)` 恒为
+  None、入库分支走不到；vision-import 与 vision-batch-import 同源修复，用例
+  `tests/test_vision_import_route.py` 钉住契约。（f3cb702）
+- **视觉回复 JSON 尾逗号容错**：GLM-4V-Flash 实拍返回带尾逗号与 Markdown 围栏，标准
+  `json.loads` 必报错；先标准解析、失败再清洗重试，提示词补约束，含一条实拍原文用例。（74211f7）
+- **资深判定按经验区间下界**：旧实现判断字符「5」是否出现，双向误杀 / 漏放；
+  `_experience_lower_bound` 按应届 / 上界封顶 / 区间 / 下界敞开 / 单值解析下界，
+  年限判据改为下界 ≥ 5。（d95965e）
+- **采集任务回滚场景状态不落库**：except 分支在 needs-rollback 会话上 commit 抛
+  `PendingRollbackError`，任务永远停在 RUNNING；改为先回滚再写状态，连接不可用时用独立会话兜底。（b06f27a）
+- **SQLite 并发写锁冲突**：`busy_timeout` 30s；撤销 WAL 回到 DELETE 日志模式
+  （WAL 在并发写下触发 `SQLITE_READONLY`，`busy_timeout` 救不了）；启动时一次性把已有
+  WAL 老库切回 DELETE。（1cffb30 / 2b2035f）
+- **入库前校验 `source_site` 白名单**；风控重定向识别为被阻，不再当成 0 条。（f757861 / de874ce）
+- **审计 / 自检脚本假判据与硬编码路径**：审计脚本默认库路径从 `__file__` 推导；
+  `repo_health` 无 upstream、merge commit 两类误报修正。（4de4701 / d31a959 / 11d612a）
+
+### 变更
+
+- **本地模型名收敛**：`qwen2.5:14b` / `qwen2.5-coder:7b` → `qwen3.5:4b`（客户端注释 /
+  示例值 / 脚本 pull 提示）；README 历史实测表与配置文档里的旧型号作为历史留痕刻意保留。（f1950f6）
+- **清除 196 条 seed 演示岗位**：`scripts/purge_seed_data.py` 默认 dry-run、只动
+  `source_site='seed'`；`seed_demo_data.py` 补「真实采集阶段勿再跑」警示。（1b27fe2）
+- **测试基线**：用例由 1069 项推进到 **1126**，测试文件由 72 个推进到 **75**
+  （基线提交 91be3f0 / d1366a6 → 93c4753；用例数以演示机当场 pytest 汇总为准，本次发版工位未复跑全量）。
+
+### 文档
+
+- 演示与答辩现场手册按仓库现状重写（`docs/demo-playbook.md`）；README 测试数统一、
+  端点分模块表重算；补数据来源口径与故障排查两篇文档；排查文档去掉本机绝对路径，
+  showcase 路由模块数与失效爬虫路径订正。（8e7f44c / 2f0c5ef / 3dc6a8f / 96632e1 / 67c6662 / df83fcf）
+
+---
+
 ## [1.1.0] - 2026-10-29
 
 本轮主线是「把『验证通过』从自报变成可复现」，顺带补齐声明式数据源的最后一环。
