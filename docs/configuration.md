@@ -113,7 +113,7 @@ EMBEDDING_DIMENSIONS=1024
 #   zhipu   云端智谱 embedding-3（需 ZHIPUAI_API_KEY）
 #   ollama  本地 Ollama（离线、零成本、数据不出内网）
 #           使用前需执行：ollama pull qwen3-embedding:0.6b
-#           （旧版本用 nomic-embed-text；实测语义型命中率 43.8% → 93.8%，见 docs/reports/rag-evaluation.md）
+#           （旧版本用 nomic-embed-text；实测语义型命中率 43.8% → 93.8%，见 docs/reports/rag-evaluation-history.md）
 EMBEDDING_BACKEND=zhipu
 OLLAMA_EMBEDDING_MODEL=nomic-embed-text
 

@@ -24,9 +24,9 @@
 | 后端框架 | FastAPI 0.115 + SQLAlchemy 2.0（asyncio） |
 | 接口规模 | 12 个路由模块 / **104 个 REST 端点**（其中 **103 个在 `/api` 下**） |
 | 业务服务 | 22 个（AI 编排、RAG、爬虫、推荐、日报、用量统计…） |
-| 数据库 | MySQL / PostgreSQL / SQLite 三库可切 |
-| **测试** | **1151 项，全部通过**（75 个测试文件，覆盖认证 / 爬虫 / AI 降级 / RAG 评估 / 限流 / 日报 / 空库边界 / 分布对账 / 视觉导入契约 / 安全默认值 / 打包完整性 / 文档契约） |
-| 代码量 | 约 **1.6 万行 Python**（`app/`）+ 约 **1.3 万行 Vue/TS**（`frontend/src/`） |
+| 数据库 | 连接串构造支持 SQLite / MySQL / PostgreSQL；**实测仅 SQLite**，MySQL 未验证，PostgreSQL 有一处 `func.date` 已知不兼容 |
+| **测试** | **1163 项，全部通过**（75 个测试文件，覆盖认证 / 爬虫 / AI 降级 / RAG 评估 / 限流 / 日报 / 空库边界 / 分布对账 / 视觉导入契约 / 安全默认值 / 打包完整性 / 文档契约） |
+| 代码量 | 约 **1.8 万行 Python**（`app/`，实测 18,124 行）+ 约 **1.3 万行 Vue/TS**（`frontend/src/`，实测 13,104 行） |
 
 > 数字口径（2026-11-04 实测，可复现）：测试数取 `pytest` 汇总行；测试文件数按 `tests/test_*.py` 计
 > （不含 `conftest.py` / `helpers.py`）；端点数取**服务启动后**的
@@ -60,7 +60,7 @@ pip install -r requirements.txt
 cp .env.example .env           # 仅需填 DEEPSEEK_API_KEY（留空自动降级本地/规则引擎）
 python scripts/init_db.py      # 建表 + 播种 admin / admin123
 python run_entry.py            # 默认 http://127.0.0.1:8080，接口文档在 /docs
-python -m pytest -o addopts= -q   # 1151 项全绿，无需密钥即可跑通
+python -m pytest -o addopts= -q   # 1163 项全绿，无需密钥即可跑通
 ```
 
 > Windows 上也可以直接双击 `start.bat`（源码模式：自动建 venv、装依赖、建库、起服务并开浏览器）；
@@ -82,7 +82,7 @@ python -m pytest -o addopts= -q   # 1151 项全绿，无需密钥即可跑通
 > （**12.2 tok/s**，比小模型更慢），于是统一收敛到 `qwen3.5:4b` —— 为"看起来更强的模型"牺牲可用性不值。
 >
 > **主动暴露取舍（显得可信）**：四类运行态（限流 / 熔断 / 爬虫配额 / AI 会话）**默认走进程内存** ——
-> 单机够用、零依赖；多副本需显式切 Redis（该能力已实现，并按「双进程对照」验证过跨副本生效）。
+> 单机够用、零依赖；多副本需显式切 Redis（该能力已实现；已用同进程双实例验证内存→Redis 降级路径，真实 Redis 上的 Lua 原子性未验证）。
 > 向量与知识库缓存复用同一个 `app.cache` 层：未接 Redis 时重启需重算；
 > 初始管理员口令按「环境变量 > 生产随机生成并落盘 > 开发默认」取值，日志不输出明文。
 
