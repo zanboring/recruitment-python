@@ -6,7 +6,7 @@
 手算基准（20 条，全部 ACTIVE）：
 - 城市：长沙 8 / 北京 5 / 上海 4 / 深圳 2 / 广州 1
 - 学历：本科 15 / 硕士 4 / 大专 1
-- 经验：3-5年 8 / 1-3年 7 / 5-10年 5
+- 经验：3-5年 8 / 1-3年 7 / 5年以上 5（原文 "5-10年"，上界 10 > 5 → 归「5年以上」）
 - 技能（出现次数，合计 40 次）：
     Python 6 / MySQL 5 / Java 5 / FastAPI 3 / 前端 3 / Vue 3 /
     Spring 2 / Go 2 / 数据分析 2 / PyTorch 2 /
@@ -50,7 +50,7 @@ FIXTURES = [
 
 EXPECTED_CITY = {"长沙": 8, "北京": 5, "上海": 4, "深圳": 2, "广州": 1}
 EXPECTED_EDUCATION = {"本科": 15, "硕士": 4, "大专": 1}
-EXPECTED_EXPERIENCE = {"3-5年": 8, "1-3年": 7, "5-10年": 5}
+EXPECTED_EXPERIENCE = {"3-5年": 8, "1-3年": 7, "5年以上": 5}
 EXPECTED_SKILL = {
     "Python": 6, "MySQL": 5, "Java": 5, "FastAPI": 3, "前端": 3, "Vue": 3,
     "Spring": 2, "Go": 2, "数据分析": 2, "PyTorch": 2,
@@ -163,3 +163,156 @@ async def test_分页边界(client, db_session, twenty_jobs):
     # 一页装下全部
     page_all = await _post(client, token, "/api/jobs/page", {"page_num": 1, "page_size": 20})
     assert page_all["total"] == 20 and len(page_all["list"]) == 20
+
+
+# ==========================================================================
+# 统计口径：可见 = NEW + ACTIVE（2026-11-16）
+#
+# 事故：九张统计图合计只有 42 条，而库里有 555 条。
+# 根因是统计口径写成单个 ``"ACTIVE"``，而爬虫新建岗位写的是 ``"NEW"``；
+# ``NEW → ACTIVE`` 的唯一路径是「再次爬到同一岗位并命中」，555 条一次性抓取的
+# 数据永远停在 NEW。推荐与存活核查两处早已是 ``in_(["NEW","ACTIVE"])``，
+# 只剩统计这一片没对齐。
+#
+# 这组用例要能**在旧实现上变红**：旧实现只用 == "ACTIVE"，下面的合计会变成 2。
+# ==========================================================================
+
+
+@pytest_asyncio.fixture
+async def jobs_by_status(db_session):
+    """四种状态各铺几条：NEW×3 / ACTIVE×2 / OFFLINE×2 / CLOSED×1。
+
+    不可见那三行故意用**不重叠**的城市/技能/学历（下架城、下架技能、博士…），
+    这样一旦口径写错，分组名本身就会暴露，而不是只差几个数字。
+    """
+    rows = [
+        # (状态, 城市, 技能, 学历, 经验, key)
+        ("NEW", "长沙", "Python", "本科", "1-3年", "s1"),
+        ("NEW", "长沙", "Python", "本科", "3-5年", "s2"),
+        ("NEW", "北京", "Go", "硕士", "5-10年", "s3"),
+        ("ACTIVE", "长沙", "Java", "本科", "1-3年", "s4"),
+        ("ACTIVE", "上海", "Java", "大专", "3年及以上", "s5"),
+        ("OFFLINE", "下架城", "下架技能", "博士", "10年以上", "s6"),
+        ("OFFLINE", "下架城", "下架技能", "博士", "10年以上", "s7"),
+        ("CLOSED", "关闭城", "关闭技能", "博士", "10年以上", "s8"),
+    ]
+    for i, (status, city, skills, edu, exp, key) in enumerate(rows):
+        db_session.add(Job(
+            job_key=f"status-fixture-{key}",
+            source_site="51job",
+            job_status=status,
+            title=f"状态夹具{i}",
+            company_name=f"公司{status}",
+            city=city,
+            skills=skills,
+            education=edu,
+            experience=exp,
+            min_salary=10000 + i * 1000,
+            max_salary=20000 + i * 1000,
+        ))
+    await db_session.commit()
+
+
+async def test_统计口径只含NEW与ACTIVE且合计等于两者之和(jobs_by_status, db_session):
+    from app.services.job_service import JobService
+
+    visible = 5                     # NEW 3 + ACTIVE 2
+    city = {r["name"]: r["count"] for r in await JobService.stat_by_city(db_session)}
+    assert city == {"长沙": 3, "北京": 1, "上海": 1}
+    assert sum(city.values()) == visible, "合计必须等于 NEW + ACTIVE 的行数（旧实现这里会是 2）"
+
+    edu = {r["name"]: r["count"] for r in await JobService.stat_by_education(db_session)}
+    assert edu == {"本科": 3, "硕士": 1, "大专": 1}, f"下架/关闭岗位的学历漏进来了：{edu}"
+
+    skill = {r["name"]: r["count"] for r in await JobService.stat_by_skill(db_session)}
+    assert skill == {"Python": 2, "Java": 2, "Go": 1}, f"技能口径不对：{skill}"
+
+    company = {r["name"]: r["count"] for r in await JobService.stat_by_company(db_session)}
+    assert "公司OFFLINE" not in company and "公司CLOSED" not in company
+
+    salary = await JobService.stat_by_salary_range(db_session)
+    assert sum(r["count"] for r in salary) == visible
+
+    exp = await JobService.stat_by_experience(db_session)
+    assert sum(r["count"] for r in exp) == visible, "经验统计丢样本（合计对不上可见岗位数）"
+
+    summary = await JobService.stat_summary(db_session)
+    assert summary["active"] == visible, "键名保留 active，但含义已是「可见量」"
+    assert summary["total"] == 8, "累计采集量仍要含下架/关闭"
+
+
+async def test_状态分布仍然展示全部四种状态(jobs_by_status, db_session):
+    """stat_by_status 是唯一例外：它的职责就是展示各状态分布。"""
+    from app.services.job_service import JobService
+
+    data = {r["name"]: r["count"] for r in await JobService.stat_by_status(db_session)}
+    assert data == {"NEW": 3, "ACTIVE": 2, "OFFLINE": 2, "CLOSED": 1}
+
+
+# 真实库（2026-11-16 快照）里 experience 的 22 种写法 → 桶
+EXPERIENCE_BUCKET_TABLE = {
+    "无需经验": "无需经验",
+    "1年": "1年以内",
+    "1年及以上": "1-3年",
+    "2年": "1-3年",
+    "2年及以上": "1-3年",
+    "1-3年": "1-3年",
+    "2-3年": "1-3年",
+    "1-2年": "1-3年",
+    "3年": "3-5年",
+    "3年及以上": "3-5年",
+    "3-5年": "3-5年",
+    "3-4年": "3-5年",
+    "2-5年": "3-5年",
+    "2-4年": "3-5年",
+    "1-5年": "3-5年",
+    "4-5年": "3-5年",        # 下界 4 > 3，表里两条规则都不命中 → 按上界归 3-5年
+    "4年及以上": "5年以上",
+    "1-8年": "5年以上",
+    "1-7年": "5年以上",
+    "3-10年": "5年以上",
+    "2-10年": "5年以上",
+    "1-10年": "5年以上",
+}
+
+
+async def test_经验归并覆盖真实库里的全部22种写法():
+    from app.services.job_service import bucket_experience
+
+    assert len(EXPERIENCE_BUCKET_TABLE) == 22, "这张表必须覆盖全部 22 种真实写法"
+    wrong = {
+        raw: (bucket_experience(raw), expect)
+        for raw, expect in EXPERIENCE_BUCKET_TABLE.items()
+        if bucket_experience(raw) != expect
+    }
+    assert not wrong, f"这些写法归错桶（实际, 期望）：{wrong}"
+
+
+async def test_经验归并的边界与脏值():
+    from app.services.job_service import bucket_experience
+
+    # 解析不出来 → 其他。**不许静默丢弃**：丢掉会让各桶合计对不上岗位总数，
+    # 那又是一个"看起来对"的假数字。
+    for raw in ("", None, "昨天", "经验丰富", "abc", "面议"):
+        assert bucket_experience(raw) == "其他", raw
+
+    # 「不限 / 应届 / 在校 / 实习」都归无需经验
+    for raw in ("经验不限", "应届生", "在校", "实习", "在校/实习"):
+        assert bucket_experience(raw) == "无需经验", raw
+
+    # 写反的区间也认（5-3年 就是 3-5年），而不是当成解析失败
+    assert bucket_experience("5-3年") == "3-5年"
+    # 带空格 / 全角的写法
+    assert bucket_experience(" 1 - 3 年 ") == "1-3年"
+
+
+async def test_经验接口返回的是桶而不是原始写法(client, db_session, twenty_jobs):
+    token = await admin_token(client, db_session)
+    data = await _get(client, token, "/api/jobs/stat/experience")
+
+    names = {item["name"] for item in data}
+    assert names == {"3-5年", "1-3年", "5年以上"}, f"接口还在按原文分组：{names}"
+    assert {item["name"]: item["count"] for item in data} == EXPECTED_EXPERIENCE
+    # 归并不许丢样本：合计必须等于可见岗位数
+    assert sum(item["count"] for item in data) == len(FIXTURES)
+

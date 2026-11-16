@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.models.job import Job
+from app.services.job_service import VISIBLE_STATUSES
 
 FAQ = {
     "项目介绍": "这是一个智能招聘数据分析平台，包含数据爬取、存储、分析、AI问答全流程。后端基于FastAPI + SQLAlchemy，前端使用Vue3 + Tailwind CSS，AI模块对接智谱GLM-4和Ollama本地模型。",
@@ -42,7 +43,9 @@ class LocalModelService:
         if not db:
             return "暂无数据，请连接数据库后重试。"
         result = await db.execute(
-            select(func.avg(Job.min_salary), func.avg(Job.max_salary), func.count()).where(Job.job_status == "ACTIVE")
+            select(func.avg(Job.min_salary), func.avg(Job.max_salary), func.count()).where(
+                Job.job_status.in_(VISIBLE_STATUSES)
+            )
         )
         row = result.first()
         if not row or row[2] == 0:

@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.job import Job
+from app.services.job_service import VISIBLE_STATUSES
 
 # 常见技能别名归一化：JD 里的写法五花八门，统一后覆盖率统计才不会漏
 SKILL_ALIASES = {
@@ -87,7 +88,7 @@ async def build_skill_profile(
     if not my_set:
         raise ValueError("请至少输入一个技能")
 
-    stmt = select(Job).where(Job.job_status == "ACTIVE")
+    stmt = select(Job).where(Job.job_status.in_(VISIBLE_STATUSES))
     if city:
         stmt = stmt.where(Job.city == city)
     rows = (await db.execute(stmt)).scalars().all()

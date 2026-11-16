@@ -201,3 +201,68 @@ def test_robots_gate_is_actually_wired():
         f"{service}: 没找到 `robots.gate(` 调用点 —— CHANGELOG 声称「robots 已实际接入」，"
         f"若调用被删掉，文档表述也必须改回去"
     )
+
+
+# ------------------------------------------- 发布前敏感扫描：本机绝对路径门禁
+#
+# 这道判据原本只存在于 `sync-public.sh`（仓库外，不进版本控制），要到**发布时**
+# 才跑。于是"文档里粘了一条本机命令"这件事，一路绿灯到最后一步才炸：
+# 2026-11-16 的 rag-evaluation-history.md 就是把复现命令连项目解释器路径一起粘了
+# 进去，导出 301 个文件、扫描到第 6 步才中止，白跑一遍发布。
+#
+# 把同一组模式下沉到测试层：判据与被判对象同层，发布前就能红。
+# 模式刻意与脚本保持一致，否则会在这里通过、在发布时仍被拦。
+_MACHINE_PATH_PATTERNS = (
+    (re.compile(r"[A-Za-z]:[\\/]Users[\\/]Administrator"), "Windows 用户目录"),
+    (re.compile(r"[A-Za-z]:[\\/]Dev[\\/]recruitment"), "项目本机路径"),
+    (re.compile(r"/[a-z]/Users/Administrator"), "Git Bash 形式的用户目录"),
+    (re.compile(r"/[a-z]/Dev/recruitment"), "Git Bash 形式的项目路径"),
+)
+
+# 这些文档在 `sync-public.sh` 的 EXCLUDES 里，本来就不进公开版，
+# 扫它们只会制造假红（内部协作说明写本机路径是有意的）。
+_INTERNAL_DOCS = frozenset(
+    {
+        "AGENTS.md",
+        "HANDOFF.md",
+        "docs/AGENT-ROSTER.md",
+        "docs/AGENT-WORKFLOW.md",
+        "docs/onboarding.md",
+        "docs/interview-prep.md",
+        "docs/demo-playbook.md",
+    }
+)
+_SCAN_DIRS = ("docs", "app", "scripts", "tests", "frontend/src")
+_SCAN_SUFFIXES = frozenset({".md", ".py", ".ts", ".vue", ".yml", ".yaml"})
+
+
+def _public_surface_files():
+    """会进公开版的文本文件（近似集合：根目录 md + 主要源码/文档目录）。"""
+    candidates = list(REPO_ROOT.glob("*.md"))
+    for rel in _SCAN_DIRS:
+        candidates.extend((REPO_ROOT / rel).rglob("*"))
+    return [
+        p
+        for p in candidates
+        if p.is_file()
+        and p.suffix in _SCAN_SUFFIXES
+        and "node_modules" not in p.parts
+        and p.relative_to(REPO_ROOT).as_posix() not in _INTERNAL_DOCS
+    ]
+
+
+def test_no_machine_absolute_paths_in_public_surface():
+    """仓库里不得出现本机绝对路径 —— 公开版快照的敏感扫描会因此中止发布。"""
+    hits = []
+    for path in _public_surface_files():
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for pattern, label in _MACHINE_PATH_PATTERNS:
+            for match in pattern.finditer(text):
+                line_no = text.count("\n", 0, match.start()) + 1
+                hits.append(f"{rel}:{line_no}  {label}  {match.group(0)}")
+    assert not hits, (
+        "以下位置出现了本机绝对路径，公开版敏感扫描会中止发布。\n"
+        "改成相对路径，或在命令前后注明「在项目根目录下执行」：\n  "
+        + "\n  ".join(hits)
+    )

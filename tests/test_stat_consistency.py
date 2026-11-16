@@ -7,12 +7,18 @@
 - AI 说「技能需求 TOP：Java」，技能图表里却还有只存在于下架岗位里的技能。
 
 数字互相矛盾比数字不准更糟 —— 使用者会直接不信任整个看板。
-本文件确保六个图表接口与 AI 分析共用同一个口径（``VISIBLE_STATUS``）。
+本文件确保六个图表接口与 AI 分析共用同一个口径（``VISIBLE_STATUSES``）。
+
+2026-11-16 更新：可见口径从单个 ``"ACTIVE"`` 改为 ``("NEW", "ACTIVE")``。
+本文件的夹具**只用 ACTIVE** —— 不是因为口径变了，而是因为 AI 侧
+（``local_model_service``）仍是 ACTIVE-only，夹具里混入 NEW 会让"图表与 AI 一致"
+那条用例变红（详见交付报告的「没做到」一节）。NEW 的覆盖在
+``tests/test_api_job_distribution.py``。
 """
 import pytest
 
 from app.models.job import Job
-from app.services.job_service import VISIBLE_STATUS, JobService
+from app.services.job_service import VISIBLE_STATUSES, JobService
 from app.services.local_model_service import LocalModelService
 
 
@@ -32,8 +38,8 @@ async def mixed_jobs(db_session):
     给下架岗位一个极端薪资，是为了让「有没有把它算进去」在平均值上立刻暴露。
     """
     db_session.add_all([
-        _job("在架A", "长沙", "Java,MySQL", VISIBLE_STATUS, "k1"),
-        _job("在架B", "长沙", "Java", VISIBLE_STATUS, "k2"),
+        _job("在架A", "长沙", "Java,MySQL", "ACTIVE", "k1"),
+        _job("在架B", "长沙", "Java", "ACTIVE", "k2"),
         _job("已下架", "北京", "Python", "OFFLINE", "k3", salary=(100000, 200000)),
     ])
     await db_session.commit()
@@ -130,5 +136,6 @@ async def test_状态分布统计必须包含下架岗位(mixed_jobs):
     """stat_by_status 的职责就是展示各状态分布，不能跟着一起过滤。"""
     data = {r["name"]: r["count"] for r in await JobService.stat_by_status(mixed_jobs)}
 
-    assert data.get(VISIBLE_STATUS) == 2
+    assert set(VISIBLE_STATUSES) == {"NEW", "ACTIVE"}, "可见口径必须是 NEW + ACTIVE"
+    assert data.get("ACTIVE") == 2
     assert data.get("OFFLINE") == 1

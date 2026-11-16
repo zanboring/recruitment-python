@@ -1,3 +1,5 @@
+import re
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, case, delete
 from collections import Counter
@@ -11,17 +13,135 @@ HOT_CITIES = ["北京", "上海", "深圳", "杭州", "广州"]
 
 # ---- 可视化统计的岗位口径 ----
 #
-# **只统计在架岗位（ACTIVE）**，且所有统计函数必须共用这一个口径。
+# **可见 = NEW 或 ACTIVE**（两者都代表"现在挂着"），所有统计函数必须共用这一个口径。
 #
-# 原先只有 local_model_service 的技能分析过滤了 ACTIVE，而 city / company /
-# skill / salary / education / experience 六个图表接口完全没过滤，把已下架岗位
-# 也算了进去。后果是同一个仪表盘上两个数字互相矛盾：
-#   - 「岗位城市分布」里会出现用户在工作列表里根本看不到的城市；
-#   - AI 说「技能需求 TOP：Java」，技能图表里却还有只存在于下架岗位里的技能。
-# 数字互相矛盾比数字不准更糟 —— 使用者会直接不信任整个看板。
+# 为什么不再是单个 "ACTIVE"（2026-11-16 实测）：
+# 爬虫新建岗位写的是 ``NEW``（crawler_service.save_job），而 ``NEW → ACTIVE`` 的
+# 唯一路径是**再次爬到同一岗位并命中**。555 条是一次性抓的，所以它们**永远停在 NEW**，
+# 库里 ACTIVE 只有 42 条 → 九张图表合计只有 42 条，城市分布是「长沙 25 / 杭州 10 /
+# 深圳 3」这种明显不成立的结果（真实分布是上海 118 / 长沙 117 / 深圳 112 / 杭州 107 /
+# 北京 101）。数字本身自洽、只是口径错了 —— 这类错误最难被发现。
+#
+# 同源问题两轮前修过一半：``app/recommender/analyzer.py`` 与
+# ``crawler_service`` 的存活核查早已是 ``in_(["NEW","ACTIVE"])``，只剩统计这一片没对齐。
+# 现在把常量改成**集合**而不是单值：以后新增统计函数拿到的是一个元组，
+# 想再写成 ``== VISIBLE_STATUS`` 都写不出来。
 #
 # 唯一的例外是 stat_by_status：它的职责就是展示各状态分布，必须不带过滤。
-VISIBLE_STATUS = "ACTIVE"
+VISIBLE_STATUSES = ("NEW", "ACTIVE")
+
+
+# ---- 经验字段的分桶（统计层归并，不改库） ----
+#
+# 库里的 experience 有 22 种写法（3年及以上 220 / 2年及以上 123 / 无需经验 48 /
+# 1年及以上 39 / 1-3年 27 / …），stat_by_experience 直接 GROUP BY 会让图表长出
+# 十几根柱子，趋势完全读不出来。
+#
+# 这里只改**统计口径**：库里仍按原文存（要按原文查询照样查得到），不加列、不动爬虫。
+EXPERIENCE_NO_NEED = "无需经验"
+EXPERIENCE_WITHIN_1 = "1年以内"
+EXPERIENCE_1_3 = "1-3年"
+EXPERIENCE_3_5 = "3-5年"
+EXPERIENCE_5_PLUS = "5年以上"
+EXPERIENCE_OTHER = "其他"
+
+EXPERIENCE_BUCKETS = (
+    EXPERIENCE_NO_NEED,
+    EXPERIENCE_WITHIN_1,
+    EXPERIENCE_1_3,
+    EXPERIENCE_3_5,
+    EXPERIENCE_5_PLUS,
+    EXPERIENCE_OTHER,
+)
+
+# 「不需要经验」的几种说法。「在校 / 实习」不在任务书列的三词里，但语义相同
+# （面向学生 = 不要求年限）；漏掉它们会让这类行掉进「其他」，见报告的口径说明。
+_NO_EXPERIENCE_HINTS = ("无需", "不限", "应届", "在校", "实习")
+
+# 匹配顺序很重要：开区间先于单值 —— 「1年及以上」若先被单值规则吃掉，
+# 会变成 (1, 1) 落进「1年以内」，把"至少一年"读成"一年以内"，正好差一档。
+_OPEN_RANGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*年\s*(?:及以上|以上|\+)")
+_CLOSED_RANGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[-~至到]\s*(\d+(?:\.\d+)?)\s*年")
+_SINGLE_YEAR_RE = re.compile(r"(\d+(?:\.\d+)?)\s*年")
+
+
+def parse_experience_range(raw) -> tuple[float, float | None] | None:
+    """把经验文案解析成 ``(下界, 上界)``；无上界（「N年及以上」）时上界为 ``None``。
+
+    解析不出来返回 ``None``（调用方把它归入「其他」，**不静默丢弃** —— 丢弃会让
+    各桶合计对不上岗位总数，又是一个假数字）。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+
+    found = _OPEN_RANGE_RE.search(text)
+    if found:                              # 「N年及以上」= 下界 N、无上界
+        return float(found.group(1)), None
+
+    found = _CLOSED_RANGE_RE.search(text)
+    if found:                              # 「N-M年」= 下界 N、上界 M
+        low, high = float(found.group(1)), float(found.group(2))
+        if low > high:                     # 「5-3年」这种写反的脏数据：换回来而不是丢掉
+            low, high = high, low
+        return low, high
+
+    found = _SINGLE_YEAR_RE.search(text)
+    if found:                              # 「N年」= 下界 N、上界 N
+        value = float(found.group(1))
+        return value, value
+    return None
+
+
+def bucket_experience(raw) -> str:
+    """把一条经验文案归并到一个桶（统计层用）。
+
+    判定表（任务书 §二）+ 两处**任务书没覆盖**、由我定的边界，见下面「两处补充口径」。
+
+    ============  ==========================================
+    无需经验       含「无需 / 不限 / 应届」（另含在校、实习）
+    1年以内        上界 ≤ 1
+    1-3年         下界 ≤ 2 且上界 ≤ 3
+    3-5年         下界 ≤ 3 且上界 ≤ 5
+    5年以上        上界 > 5；或「N年及以上」且 N > 3
+    其他           解析不出来（含空值）
+    ============  ==========================================
+
+    两处补充口径（任务书的表没有写，但真实数据里存在这类值）：
+
+    1. **无上界且 N ≤ 3**（「1年及以上」39 条、「2年及以上」123 条、「3年及以上」220 条）：
+       按**下界**落桶 —— N ≤ 2 → 1-3年，N = 3 → 3-5年。理由：开区间意味着
+       "至少 N 年"，N 就是用人单位的要求下限；按上限判会全部挤进「5年以上」，
+       按原表又会全部掉进「其他」（162+220 条），两种都不可用。
+    2. **闭区间两条规则都不命中**（如「4-5年」：下界 4 > 3）：按上界归入「3-5年」。
+       它显然不是"解析失败"，不该进「其他」。
+    """
+    text = str(raw or "")
+    if any(hint in text for hint in _NO_EXPERIENCE_HINTS):
+        return EXPERIENCE_NO_NEED
+
+    parsed = parse_experience_range(text)
+    if parsed is None:
+        return EXPERIENCE_OTHER
+
+    low, high = parsed
+    if high is None:                       # 「N年及以上」：按要求下限落桶
+        if low > 3:
+            return EXPERIENCE_5_PLUS
+        if low >= 3:
+            return EXPERIENCE_3_5
+        return EXPERIENCE_1_3
+
+    if high <= 1:
+        return EXPERIENCE_WITHIN_1
+    if low <= 2 and high <= 3:
+        return EXPERIENCE_1_3
+    if low <= 3 and high <= 5:
+        return EXPERIENCE_3_5
+    if high > 5:
+        return EXPERIENCE_5_PLUS
+    # 兜底：上界 ≤ 5 但下界越过 3（如「4-5年」）→ 3-5年，而不是「其他」
+    return EXPERIENCE_3_5
 
 
 def _escape_like(s: str) -> str:
@@ -204,7 +324,7 @@ class JobService:
     @staticmethod
     async def stat_by_city(db: AsyncSession) -> list[dict]:
         stmt = select(Job.city, func.count(Job.id).label("count")).where(
-            Job.job_status == VISIBLE_STATUS,
+            Job.job_status.in_(VISIBLE_STATUSES),
             Job.city.isnot(None)
         ).group_by(Job.city).order_by(func.count(Job.id).desc())
         result = await db.execute(stmt)
@@ -214,7 +334,7 @@ class JobService:
     @staticmethod
     async def stat_by_company(db: AsyncSession) -> list[dict]:
         stmt = select(Job.company_name, func.count(Job.id).label("count")).where(
-            Job.job_status == VISIBLE_STATUS,
+            Job.job_status.in_(VISIBLE_STATUSES),
             Job.company_name.isnot(None)
         ).group_by(Job.company_name).order_by(func.count(Job.id).desc()).limit(20)
         result = await db.execute(stmt)
@@ -225,7 +345,7 @@ class JobService:
     async def stat_by_skill(db: AsyncSession) -> list[dict]:
         result = await db.execute(
             select(Job.skills).where(
-                Job.job_status == VISIBLE_STATUS, Job.skills.isnot(None)
+                Job.job_status.in_(VISIBLE_STATUSES), Job.skills.isnot(None)
             )
         )
         rows = result.scalars().all()
@@ -255,7 +375,7 @@ class JobService:
 
         result = await db.execute(
             select(Job.min_salary, Job.max_salary).where(
-                Job.job_status == VISIBLE_STATUS, Job.min_salary.isnot(None)
+                Job.job_status.in_(VISIBLE_STATUSES), Job.min_salary.isnot(None)
             )
         )
         rows = result.all()
@@ -273,7 +393,7 @@ class JobService:
     @staticmethod
     async def stat_by_education(db: AsyncSession) -> list[dict]:
         stmt = select(Job.education, func.count(Job.id).label("count")).where(
-            Job.job_status == VISIBLE_STATUS,
+            Job.job_status.in_(VISIBLE_STATUSES),
             Job.education.isnot(None)
         ).group_by(Job.education).order_by(func.count(Job.id).desc())
         result = await db.execute(stmt)
@@ -282,13 +402,24 @@ class JobService:
 
     @staticmethod
     async def stat_by_experience(db: AsyncSession) -> list[dict]:
+        """经验分布：把 22 种写法归并成 5+1 个桶（见 :func:`bucket_experience`）。
+
+        分两步而不是在 SQL 里 GROUP BY 原文：归并规则是**业务口径**（要能单独测、
+        以后改档位只改一处），塞进 SQL 就只能靠真库验。聚合仍在 SQL 做，
+        只把「原文 → 桶」这一层搬到 Python，行数最多 22 行的量级。
+        """
         stmt = select(Job.experience, func.count(Job.id).label("count")).where(
-            Job.job_status == VISIBLE_STATUS,
+            Job.job_status.in_(VISIBLE_STATUSES),
             Job.experience.isnot(None)
-        ).group_by(Job.experience).order_by(func.count(Job.id).desc())
+        ).group_by(Job.experience)
         result = await db.execute(stmt)
-        rows = result.all()
-        return [{"name": row[0], "count": row[1]} for row in rows]
+
+        counts = Counter()
+        for raw, count in result.all():
+            counts[bucket_experience(raw)] += count
+
+        # 只返回非空桶：图上不该出现一排 0 高度的柱子；按数量降序（前端口径）
+        return [{"name": name, "count": n} for name, n in counts.most_common()]
 
     @staticmethod
     async def stat_by_status(db: AsyncSession) -> list[dict]:
@@ -306,18 +437,20 @@ class JobService:
         三个字段的口径必须说清楚，否则「总数 / 在架数 / 平均薪资」会各自成立
         却互相对不上：
         - ``total``      累计采集量（含已下架，代表"爬了多少"）
-        - ``active``     当前在架量（与图表口径一致）
-        - ``avg_salary`` **只统计在架岗位**：原先不带状态过滤，把已下架岗位的
+        - ``active``     当前**可见**量（NEW + ACTIVE，与图表口径一致）。
+          键名保留 ``active`` 是为了不动前端；它现在的含义是「可见岗位数」，
+          不是"状态为 ACTIVE 的行数"（那个数请用 stat_by_status）。
+        - ``avg_salary`` **只统计可见岗位**：原先不带状态过滤，把已下架岗位的
           薪资也平均了进去，导致「在架 2 个岗位」与「平均薪资取自 3 个岗位」
           同时出现在一个响应里。
         """
         total = await db.execute(select(func.count(Job.id)))
         active = await db.execute(
-            select(func.count(Job.id)).where(Job.job_status == VISIBLE_STATUS)
+            select(func.count(Job.id)).where(Job.job_status.in_(VISIBLE_STATUSES))
         )
         avg_sal = await db.execute(
             select(func.avg((Job.min_salary + Job.max_salary) / 2)).where(
-                Job.job_status == VISIBLE_STATUS, Job.min_salary.isnot(None)
+                Job.job_status.in_(VISIBLE_STATUSES), Job.min_salary.isnot(None)
             )
         )
 

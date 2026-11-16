@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import async_session, Base
 from app.models.job import Job
-from app.services.job_service import JobService, VISIBLE_STATUS
+from app.services.job_service import JobService, VISIBLE_STATUSES
 from app.services import webhook_service
 
 logger = logging.getLogger(__name__)
@@ -60,14 +60,14 @@ async def count_new_jobs_today(db: AsyncSession, since: datetime) -> int:
 
 
 async def build_platform_stats(db: AsyncSession) -> list:
-    """按**来源平台**聚合在架岗位数。
+    """按**来源平台**聚合可见岗位数。
 
-    口径与图表一致：只算在架岗位（``VISIBLE_STATUS``），否则日报里的
-    「平台分布」会把已下架岗位也算进去，与同页的总览数字对不上。
+    口径与图表一致：只算可见岗位（``VISIBLE_STATUSES`` = NEW + ACTIVE），否则日报里的
+    「平台分布」会与同页的总览数字对不上（下架岗位算多了 / NEW 岗位算少了）。
     """
     stmt = (
         select(Job.source_site, func.count(Job.id))
-        .where(Job.job_status == VISIBLE_STATUS)
+        .where(Job.job_status.in_(VISIBLE_STATUSES))
         .group_by(Job.source_site)
         .order_by(func.count(Job.id).desc())
     )
@@ -86,7 +86,7 @@ async def build_city_platform_pivot(db: AsyncSession, top_n: int = 10) -> dict:
     """
     stmt = (
         select(Job.city, Job.source_site, func.count(Job.id))
-        .where(Job.job_status == VISIBLE_STATUS)
+        .where(Job.job_status.in_(VISIBLE_STATUSES))
         .group_by(Job.city, Job.source_site)
     )
     rows = (await db.execute(stmt)).all()
