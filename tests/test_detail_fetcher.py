@@ -25,6 +25,7 @@
 这不是「用假数据冒充真实结果」：真实数据用在真实能拿到的地方，
 抓不到的地方就用合成片段只验解析规则，并在报告中如实说明。
 """
+import asyncio
 import inspect
 from datetime import datetime
 
@@ -714,6 +715,282 @@ async def test_端到端只写三列(tmp_path, monkeypatch):
 
 
 # ==========================================================================
+# 2026-11-17：F4 备份原子化 + F5 异常边界 + 状态文件对账
+#
+# 背景（都是实测，不是设想）：
+#   · shutil.copy2 边写边拷，0.28%~0.54% 的副本 integrity_check 不通过；
+#     旧脚本对副本不校验、永不清理 —— 失败时拿到的"备份"可能是坏的。
+#   · 脚本自己的 sqlite3 连接默认 timeout=5 秒，main() 不接异常：
+#     撞上写锁直接抛栈，备份已生成、状态文件半截，汇总/覆盖率/红线全不执行。
+#   · _load_state 把半截 JSON 当空文件返回，紧接着的保存会把已有记录永久覆盖。
+# ==========================================================================
+
+
+def test_连接等锁预算与ORM的30秒对齐(tmp_path):
+    """脚本是另一条连接路径，不会继承 SQLAlchemy 的 busy_timeout。"""
+    script = _load_backfill_script()
+    db_path = tmp_path / "t.db"
+    _make_backfill_db(db_path, 1)
+
+    conn = script._connect(db_path)
+    try:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+    finally:
+        conn.close()
+
+
+def test_备份走在线接口_副本可读且完整性通过(tmp_path):
+    """备份是"能拿去回滚的库"，不是"长得像库的文件"。"""
+    import sqlite3
+
+    script = _load_backfill_script()
+    db_path = tmp_path / "t.db"
+    _make_backfill_db(db_path, 50)
+
+    backup = script._backup(db_path)
+
+    assert backup.exists()
+    assert backup.parent == db_path.parent, "备份路径必须从库路径推导"
+    assert backup.name.startswith(db_path.name + ".bak-")
+    conn = sqlite3.connect(str(backup))
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("select count(*) from job").fetchone()[0] == 50
+    finally:
+        conn.close()
+
+
+def test_备份期间有并发写入时副本完整性仍通过(tmp_path):
+    """D 项硬要求：边写边备份，副本 ``integrity_check`` 必须仍然 ok。
+
+    这就是 shutil.copy2 与在线备份接口的区别 —— 前者按字节拷、不管写入方
+    改到哪一页；后者在一条读事务里按页复制，源库被改过就重来，提交时
+    得到的是某个时刻的一致快照。
+    """
+    import sqlite3
+    import threading
+    import time
+
+    script = _load_backfill_script()
+    db_path = tmp_path / "t.db"
+    _make_backfill_db(db_path, 400)
+    # 给每行塞 2KB，让副本有体量、并发窗口足够长
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("update job set detail_html=?", ("y" * 2000,))
+    conn.commit()
+    conn.close()
+
+    stop = threading.Event()
+    written = {"n": 0}
+
+    def _writer():
+        w = sqlite3.connect(str(db_path), timeout=30)
+        try:
+            while not stop.is_set():
+                w.execute(
+                    "insert into job (id, title, city, url, job_status)"
+                    " values (?, '并发写入', '长沙', 'https://example.com/x', 'NEW')",
+                    (100000 + written["n"],),
+                )
+                w.commit()
+                written["n"] += 1
+                time.sleep(0.001)  # 给备份读事务留出让位窗口
+        finally:
+            w.close()
+
+    thread = threading.Thread(target=_writer, daemon=True)
+    thread.start()
+    try:
+        backup = script._backup(db_path)
+    finally:
+        stop.set()
+        thread.join(timeout=30)
+
+    assert written["n"] >= 1, "并发写入一次都没成功，这条用例没测到并发"
+    assert not thread.is_alive()
+
+    copy = sqlite3.connect(str(backup))
+    try:
+        assert copy.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        rows = copy.execute("select count(*) from job").fetchone()[0]
+    finally:
+        copy.close()
+    # 快照可能落在并发写入之前或之中，但一定包含原有 400 行
+    assert 400 <= rows <= 400 + written["n"]
+
+
+async def test_备份不可用时中止且一条都不写(tmp_path, monkeypatch, capsys):
+    """没有回滚锚点就不许写库：备份失败必须是"什么都没发生"。"""
+    import sqlite3
+
+    script = _load_backfill_script()
+    db_path = tmp_path / "t.db"
+    _make_backfill_db(db_path, 2)
+    calls = _install_fake_fetch(monkeypatch, ["ok", "ok"])
+
+    def _bad_backup(_path):
+        raise script.BackupError("stub：integrity_check 不通过")
+
+    monkeypatch.setattr(script, "_backup", _bad_backup)
+    args = script._parse_args([
+        "--db", str(db_path), "--state", str(tmp_path / "s.json"),
+        "--limit", "2", "--batch-size", "0",
+    ])
+    assert await script.run(args) == 5
+
+    out = capsys.readouterr().out
+    assert "未做任何写入" in out
+    assert calls["n"] == 0, "备份没建好就不该发任何请求"
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute(
+            "select count(*) from job where length(coalesce(job_desc,''))>=30"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+async def test_写锁等满预算后明确失败_汇总与覆盖率仍打印(tmp_path, monkeypatch, capsys):
+    """F5 的核心场景：写锁 → 明确失败（退出码 6），但汇总一行不少。"""
+    import sqlite3
+
+    script = _load_backfill_script()
+    monkeypatch.setattr(script, "BUSY_TIMEOUT_SECONDS", 0.2)  # 真等 30 秒没必要
+    db_path = tmp_path / "t.db"
+    _make_backfill_db(db_path, 3)
+    _install_fake_fetch(monkeypatch, ["ok", "ok", "ok"])
+
+    holder = sqlite3.connect(str(db_path))
+    holder.isolation_level = None
+    holder.execute("BEGIN IMMEDIATE")          # 占住写锁，模拟应用侧写事务
+    holder.execute("update job set title=title where id=1")
+    try:
+        args = script._parse_args([
+            "--db", str(db_path), "--state", str(tmp_path / "s.json"),
+            "--limit", "3", "--batch-size", "0",
+        ])
+        code = await script.run(args)
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    assert code == 6, "写锁等满预算应返回 6（可 --resume），而不是抛栈"
+    out = capsys.readouterr().out
+    assert "完成：成功 0" in out, "异常路径也必须打印汇总"
+    assert "写锁" in out and "可直接带 --resume 重跑" in out
+    assert "detail_html 覆盖" in out, "覆盖率也要照常报"
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute(
+            "select count(*) from job where length(coalesce(job_desc,''))>=30"
+        ).fetchone()[0] == 0, "写锁失败时不该有半截写入"
+    finally:
+        conn.close()
+
+
+async def test_job_status在写入期间被改时本条回滚并返回3(tmp_path, monkeypatch, capsys):
+    """红线校验挪到 commit 之前：本条写入能回滚，且如实报告。"""
+    import sqlite3
+
+    script = _load_backfill_script()
+    db_path = tmp_path / "t.db"
+    _make_backfill_db(db_path, 2)
+    _install_fake_fetch(monkeypatch, ["ok", "ok"])
+
+    real_write = script._write_one
+
+    def _write_and_smuggle(conn, job_id, result):
+        sets = real_write(conn, job_id, result)
+        # 模拟「别的东西在同一事务窗口里改了 job_status」
+        conn.execute("update job set job_status='EXPIRED' where id=?", (job_id,))
+        return sets
+
+    monkeypatch.setattr(script, "_write_one", _write_and_smuggle)
+    args = script._parse_args([
+        "--db", str(db_path), "--state", str(tmp_path / "s.json"),
+        "--limit", "2", "--batch-size", "0",
+    ])
+    assert await script.run(args) == 3
+
+    out = capsys.readouterr().out
+    assert "RED LINE" in out and "本条写入已回滚" in out
+    assert "不要直接 --resume" in out
+    assert "完成：成功 0" in out
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        status, desc_len = conn.execute(
+            "select job_status, length(coalesce(job_desc,'')) from job where id=1"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert status == "NEW", "绿灯：被改的状态与正文一起回滚"
+    assert desc_len < 30
+
+
+def test_半截状态文件不会被当成空文件(tmp_path):
+    """解析失败 = 人工介入，**不是**空状态（否则下次保存会覆盖历史记录）。"""
+    script = _load_backfill_script()
+    path = tmp_path / "s.json"
+    broken = '{"ok": [1, 2, 3'
+    path.write_text(broken, encoding="utf-8")
+
+    with pytest.raises(script.StateFileError):
+        script._load_state(path)
+    assert path.read_text(encoding="utf-8") == broken, "读都不能读，更不能改它"
+
+
+async def test_半截状态文件时拒绝启动且一字不动(tmp_path, capsys):
+    script = _load_backfill_script()
+    db_path = tmp_path / "t.db"
+    _make_backfill_db(db_path, 1)
+    state_path = tmp_path / "s.json"
+    state_path.write_text('{"ok": [1,', encoding="utf-8")
+
+    code = await script.run(script._parse_args([
+        "--db", str(db_path), "--state", str(state_path),
+        "--limit", "1", "--resume",
+    ]))
+    assert code == 7
+    assert "状态文件不可用" in capsys.readouterr().out
+    assert state_path.read_text(encoding="utf-8") == '{"ok": [1,'
+
+
+async def test_状态文件属于别的库时拒绝resume(tmp_path, capsys):
+    """A 库的 ok 列表不能拿来跳过 B 库的岗位。"""
+    import json
+
+    script = _load_backfill_script()
+    db_path = tmp_path / "t.db"
+    _make_backfill_db(db_path, 2)
+    state_path = tmp_path / "s.json"
+    state_path.write_text(
+        json.dumps({"db": str(tmp_path / "other.db"), "ok": [1], "failed": {}}),
+        encoding="utf-8",
+    )
+
+    code = await script.run(script._parse_args([
+        "--db", str(db_path), "--state", str(state_path),
+        "--limit", "2", "--resume",
+    ]))
+    assert code == 7
+    assert "另一个库" in capsys.readouterr().out
+
+
+def test_状态文件保存原子且不留临时文件(tmp_path):
+    import json
+
+    script = _load_backfill_script()
+    path = tmp_path / "s.json"
+    script._save_state(path, {"ok": [1, 2], "failed": {}})
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"ok": [1, 2], "failed": {}}
+    assert not path.with_name(path.name + ".tmp").exists()
+
+
+# ==========================================================================
 # 2026-11-12：详情页的风控判据改成**结构性**的
 #
 # 旧写法直接复用 `BaseCrawler.detect_blocked`（扫正文前 4000 字符里的
@@ -900,3 +1177,256 @@ async def test_failure_登录墙(monkeypatch):
 
     result = await DetailFetcher().fetch("https://we.51job.com/pc/jobdetail?jobId=1")
     assert result.failure == df.KIND_LOGIN
+
+
+# ==========================================================================
+# F1（P0）：latch 置位后止损参数结构性不可达
+#
+# 现象：第 1 条命中登录墙 → `_detail_known_login_wall` 置位 → 后续条目跳过
+# 静态 HTML 与渲染两步，只剩搜索兜底；而那条路径**一次都不调风控判据**，
+# 失败全被记成 parse / no_field → `consecutive_blocked` 永远停在 1，
+# `--max-consecutive-blocked=5` 形同虚设。
+#
+# 这组用例用**真 fetch() + 真 run()**，只把网络出口打桩：
+# 上一轮的桩直接返回 login_wall，恰好掩盖了 F1（任务书 §C 明确禁止）。
+# ==========================================================================
+
+
+class _WafApiResponse:
+    """搜索接口返回的不是 JSON，而是 aliyun WAF 页（实测形态）。"""
+
+    def __init__(self, status: int = 200):
+        self.url = "https://we.51job.com/api/job/search-pc?keyword=python"
+        self.status = status
+
+    async def text(self):
+        return (
+            '<!doctypehtml><meta charset="UTF-8"><meta name="aliyun_waf_a">'
+            '<textarea id="renderData">{"_waf_bd8ce2ce37":"x"}</textarea>'
+            + "x" * 6000
+        )
+
+
+class _SearchPage:
+    """搜索页替身：页面本身正常，只有 XHR 命中的是 WAF 页。
+
+    这正是 2026-11-16 实测到的软限流形态：标题正常、0 张卡片、
+    接口响应是 `<!doctypehtml>…aliyun_waf…`。
+    """
+
+    def __init__(self, api_response=None, normal_payload: str = ""):
+        self._handlers = []
+        self._api_response = api_response or _WafApiResponse()
+        self._normal_payload = normal_payload
+
+    def on(self, event, callback):
+        if event == "response":
+            self._handlers.append(callback)
+
+    async def goto(self, url, **kwargs):
+        for callback in self._handlers:
+            callback(self._api_response)      # 回调内部用 ensure_future 排 _collect
+        return _FakeResponse("<html></html>", status_code=200, url=url)
+
+    async def wait_for_selector(self, selector, **kwargs):
+        return None
+
+    async def wait_for_timeout(self, milliseconds):
+        # 让 _collect 的协程真的跑完（goto 里只是被 schedule 了）
+        await asyncio.sleep(0)
+
+    @property
+    def url(self):
+        return "https://we.51job.com/pc/search?jobArea=190200&keyword=python"
+
+    async def title(self):
+        return "【python,长沙招聘,求职】-前程无忧"
+
+    async def content(self):
+        return (
+            "<html><head><title>【python,长沙招聘,求职】-前程无忧</title></head>"
+            "<body><div class='joblist-item'></div></body></html>"
+        )
+
+
+class _SearchContext:
+    def __init__(self, api_response=None, normal_payload: str = ""):
+        self.page = _SearchPage(api_response, normal_payload)
+
+    async def new_page(self):
+        return self.page
+
+    async def close(self):
+        pass
+
+
+async def test_latch置位后连续被拦仍能触发整批停止(tmp_path, monkeypatch, capsys):
+    """**F1 核心判据**：第 1 条登录墙置 latch，第 2、3 条走搜索兜底也被判 waf，
+    连续计数到阈值 3 → 脚本在第 3 条停，退出码 4。
+
+    `DetailFetcher.fetch` 用的是**生产实现原函数**（只在外面套一层计数）；
+    `backfill_detail.run` 也是**生产实现原函数**。被打桩的只有网络出口。
+    """
+    script = _load_backfill_script()
+    db_path = tmp_path / "f1.db"
+    _make_backfill_db(db_path, 8)                # 8 条待回填，足够越过阈值
+
+    # 静态路径：第 1 条返回登录页 → 置 latch；之后不应再打（latch 生效的证据）
+    static_calls = []
+
+    async def fake_safe_get(url, **kwargs):
+        static_calls.append(url)
+        return _FakeResponse(
+            '<html><head><title>登录</title></head>'
+            '<body><input type="password" name="pwd"></body></html>',
+            url="https://login.51job.com/login.php?url=x",
+        )
+
+    async def fake_new_page(self):
+        ctx = _SearchContext()
+        return ctx, ctx.page
+
+    # 渲染路径（只有第 1 条会走）：正常页 → 解析不到正文 → parse
+    async def fake_render(self, url):
+        return None
+
+    # 计数包装：证明每次都调用了**真 fetch**
+    calls = []
+    real_fetch = df.DetailFetcher.fetch
+
+    async def counted_fetch(self, url, **kwargs):
+        calls.append(url)
+        return await real_fetch(self, url, **kwargs)
+
+    monkeypatch.setattr(df, "safe_get", fake_safe_get)
+    monkeypatch.setattr(df.DetailFetcher, "_new_page", fake_new_page)
+    monkeypatch.setattr(df.DetailFetcher, "_render_detail", fake_render)
+    monkeypatch.setattr(df.DetailFetcher, "fetch", counted_fetch)
+
+    args = script._parse_args([
+        "--db", str(db_path), "--state", str(tmp_path / "state.json"),
+        "--limit", "8", "--interval", "0", "--batch-size", "0",
+        "--max-consecutive-blocked", "3",
+    ])
+    code = await script.run(args)
+
+    out = capsys.readouterr().out
+    assert code == 4, f"应在连续 3 条被拦后停批并返回 4，实际 {code}；输出：{out[-500:]}"
+    assert len(calls) == 3, f"第 3 条就应停，实际调了 {len(calls)} 条：{out[-500:]}"
+    assert "[STOP]" in out and "连续 3 条" in out
+    assert len(static_calls) == 1, (
+        f"latch 置位后不该再打静态详情，实际打了 {len(static_calls)} 次"
+    )
+    # 3 条的最终分类都必须是「被站点拦」才算进连续计数
+    assert out.count("类别=登录墙") + out.count("类别=WAF/风控") == 3, out[-800:]
+
+
+async def test_网络与无字段类失败不会误触发止损(tmp_path, monkeypatch, capsys):
+    """只有 waf / login_wall 计数；网络、解析、无该字段不许让 stop 误触发。
+
+    这条用正常 JSON（含 1 条别的 jobId）走搜索兜底 → `no_field`，
+    跑满 8 条且退出码 0。
+    """
+    import json as _json
+
+    script = _load_backfill_script()
+    db_path = tmp_path / "f1_negative.db"
+    _make_backfill_db(db_path, 8)
+
+    item = _real_search_item()
+    item["jobId"] = "999999999"        # 有数据，但没有我们要的那个岗位
+    payload = _json.dumps(
+        {"resultbody": {"job": {"items": [item]}}}, ensure_ascii=False
+    )
+
+    class _JsonResponse:
+        url = "https://we.51job.com/api/job/search-pc?keyword=x"
+        status = 200
+
+        async def text(self):
+            return payload
+
+    async def fake_safe_get(url, **kwargs):
+        return _FakeResponse(_read_fixture(), url=url)   # SPA 空壳 → parse
+
+    async def fake_new_page(self):
+        ctx = _SearchContext(_JsonResponse())
+        return ctx, ctx.page
+
+    async def fake_render(self, url):
+        return None
+
+    monkeypatch.setattr(df, "safe_get", fake_safe_get)
+    monkeypatch.setattr(df.DetailFetcher, "_new_page", fake_new_page)
+    monkeypatch.setattr(df.DetailFetcher, "_render_detail", fake_render)
+
+    args = script._parse_args([
+        "--db", str(db_path), "--state", str(tmp_path / "state.json"),
+        "--limit", "8", "--interval", "0", "--batch-size", "0",
+        "--max-consecutive-blocked", "3",
+    ])
+    code = await script.run(args)
+    out = capsys.readouterr().out
+
+    assert code == 0, f"no_field 不该触发止损，实际退出码 {code}：{out[-500:]}"
+    assert "[STOP]" not in out
+    assert out.count("类别=无该字段") == 8, out[-800:]
+
+
+# ---------------------------------------------------------------- F7 / F2
+
+async def test_静态路径也用标题判登录墙(monkeypatch):
+    """F7：URL 正常、正文没有密码表单，只有 <title> 里有「登录」。
+
+    修之前静态路径不传 title → 判「结构不匹配」；渲染路径传 → 判登录墙。
+    同一页两条路径结论翻转。
+    """
+    html = "<html><head><title>BOSS直聘注册登录</title></head><body></body></html>"
+
+    async def fake_safe_get(url, **kwargs):
+        return _FakeResponse(html, url="https://we.51job.com/pc/jobdetail?jobId=1")
+
+    async def none_render(self, url):
+        return None
+
+    monkeypatch.setattr(df, "safe_get", fake_safe_get)
+    monkeypatch.setattr(DetailFetcher, "_render_detail", none_render)
+
+    result = await DetailFetcher().fetch(
+        "https://we.51job.com/pc/jobdetail?jobId=1", allow_search=False
+    )
+    assert result.failure == df.KIND_LOGIN, result.attempts
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [(403, df.KIND_WAF), (503, df.KIND_NETWORK), (404, df.KIND_OTHER)],
+)
+async def test_静态HTTP状态分类不会被搜索兜底降级(monkeypatch, status, expected):
+    """F2：403 是站点拒绝（计 waf）；5xx 是服务端故障（network）；4xx 其它归 other。
+
+    关掉搜索兜底单独验静态分类 —— 若开着，other 会被 no_field 覆盖，
+    那是"兜底覆盖已判明事实"的另一条路，由上一组用例的 protected 集合处理。
+    """
+    async def fake_safe_get(url, **kwargs):
+        return _FakeResponse(
+            "<html><body>error</body></html>", status_code=status, url=url
+        )
+
+    async def none_render(self, url):
+        return None
+
+    monkeypatch.setattr(df, "safe_get", fake_safe_get)
+    # 不打桩 render 会真的起 Playwright → 它撞登录墙后把分类改成 login_wall，
+    # 就测不到静态路径自己的 HTTP 状态分类了
+    monkeypatch.setattr(DetailFetcher, "_render_detail", none_render)
+    result = await DetailFetcher().fetch(
+        "https://we.51job.com/pc/jobdetail?jobId=1", allow_search=False
+    )
+    assert result.failure == expected, (status, result.failure, result.attempts)
+
+
+def test_403被视为站点拦截而不是普通4xx():
+    assert df.detect_blocked_structural("", 403)[0] == df.KIND_WAF
+    assert df.detect_blocked_structural("", 429)[0] == df.KIND_WAF
+    assert df.detect_blocked_structural("", 404)[0] == ""

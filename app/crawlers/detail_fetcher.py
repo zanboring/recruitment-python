@@ -107,6 +107,13 @@ FAILURE_KINDS = {
 # 详情页 302 到 ``login.51job.com``（未登录态下这是它的软限流手段），
 # 而不是回 WAF 页。只盯 WAF 的话止损永远不触发，脚本会继续把 14 条、
 # 40 条…都打出去，这正是"硬顶把 IP 打黑"的形状。
+#
+# **阈值语义（``--max-consecutive-blocked=5``）**：
+# 指「连续 **5 条岗位** 的最终分类是 WAF 或登录墙」，不是「5 次 HTTP 异常」。
+# 一条岗位内部可能打 1~3 次请求，但只产出**一个** ``DetailResult.failure``；
+# 网络错误 / 解析失败 / 无该字段会打断连续计数（脚本见非 blocked 类别就清零），
+# 成功入库同样清零。被拦的证据必须在这条坑的**实际执行路径**上被识别出来 ——
+# latch 置位后只剩搜索兜底，那里不判风控的话计数永远停在 1（F1）。
 BLOCKED_KINDS = (KIND_WAF, KIND_LOGIN)
 
 # ------------------------------------------------------- 风控 / 登录墙的结构化判据
@@ -137,6 +144,17 @@ _LOGIN_SKELETON = (
     'type="password"', "type='password'", 'name="password"', "name='password'",
 )
 
+# F7：静态路径原先不传 <title>，渲染路径传 —— 同一个登录页在两条路径上
+# 会得出不同结论（URL 正常、正文里也没有密码表单时只有标题有「登录」）。
+# 从 HTML 里取出标题即可，不需要另发一次请求。
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+
+
+def _html_title(html: str) -> str:
+    """从 HTML 片段里取 ``<title>``；没有就返回空串。"""
+    found = _TITLE_RE.search(html or "")
+    return _clean_text(found.group(1)) if found else ""
+
 
 def detect_blocked_structural(html: str, status_code: int = 200, url: str = "", title: str = ""):
     """判定「这一页是站点在拦你」，返回 ``(kind, 证据)``；不是拦截则返回 ``("", "")``。
@@ -144,8 +162,10 @@ def detect_blocked_structural(html: str, status_code: int = 200, url: str = "", 
     与 :meth:`BaseCrawler.detect_blocked` 的唯一区别，也是关键区别：
     **不扫正文关键词**。详情页的正文是业务数据本身，不是页面特征。
     """
-    if status_code == 429:
-        return KIND_WAF, "HTTP 429 限流"
+    # 429 = 限流；403 = 站点主动拒绝。两者都是"被站点拦"，不是网络抖 ——
+    # 归 waf 才能让批量止损的连续计数真的涨上去（F2）。
+    if status_code in (403, 429):
+        return KIND_WAF, f"HTTP {status_code} 拒绝访问"
 
     url_low = str(url or "").lower()
     if any(h in url_low for h in _LOGIN_URL_HINTS):
@@ -524,7 +544,10 @@ class DetailFetcher:
                 status = int(getattr(resp, "status_code", 200) or 200)
 
                 # 🔴 结构化判据，不扫正文关键词（原因见 detect_blocked_structural 注释）
-                kind, evidence = detect_blocked_structural(html, status, final_url)
+                # F7：与渲染路径一样把 <title> 传进去，避免同一页两条路径结论翻转
+                kind, evidence = detect_blocked_structural(
+                    html, status, final_url, _html_title(html)
+                )
                 if kind:
                     result.attempts.append(f"html: {FAILURE_KINDS[kind]}（{evidence}）")
                     result.failure = kind
@@ -533,6 +556,7 @@ class DetailFetcher:
                         BaseCrawler.mark_blocked()
                 elif status >= 400:
                     result.attempts.append(f"html: HTTP {status}")
+                    # 5xx 是服务端故障，归 network（不计数）；其它 4xx 归 other
                     result.failure = KIND_NETWORK if status >= 500 else KIND_OTHER
                 else:
                     parsed = parse_detail_html(html, final_url)
@@ -596,13 +620,15 @@ class DetailFetcher:
                 kind, evidence = self._last_failure
                 label = FAILURE_KINDS.get(kind, "结果里没有该 jobId")
                 result.attempts.append(f"search: {label}" + (f"（{evidence}）" if evidence else ""))
-                # 前面已经确定是「被站点拦住」时，保留更严重的类别：
-                # 搜索兜底没命中不代表没被拦，只代表这条路也没成
-                if result.failure not in (KIND_WAF, KIND_LOGIN):
+                # 前面已经判明的类别不许被搜索兜底降级（F2）：
+                #   WAF / 登录墙 = 真被拦；network = 5xx 等服务端故障 ——
+                # 搜索没命中只说明"这条路没成"，不是"刚才那次判据错了"。
+                # 否则「静态 403/5xx → 搜索 parse/no_field」会让止损漏计。
+                if result.failure not in (KIND_WAF, KIND_LOGIN, KIND_NETWORK):
                     result.failure = kind or KIND_NO_FIELD
             except Exception as exc:  # noqa: BLE001
                 result.attempts.append(f"search: {type(exc).__name__}: {exc}")
-                if result.failure not in (KIND_WAF, KIND_LOGIN):
+                if result.failure not in (KIND_WAF, KIND_LOGIN, KIND_NETWORK):
                     result.failure = KIND_NETWORK
         elif not keyword:
             result.attempts.append("search: 未提供标题，跳过")
@@ -678,35 +704,82 @@ class DetailFetcher:
         url = f"{SEARCH_PAGE}?jobArea={area}&keyword={quote(keyword)}&searchType=2&sortType=0"
 
         context, page = await self._new_page()
-        payloads: List[str] = []
+        payloads: List[Tuple[int, str]] = []   # (HTTP status, 正文)
 
         async def _collect(resp):
             if "/api/job/search-pc" not in resp.url:
                 return
             try:
                 text = await resp.text()
+                status = int(getattr(resp, "status", 200) or 200)
             except Exception:  # noqa: BLE001
                 return
-            if text.lstrip().startswith("{") and len(text) > 5000:
-                payloads.append(text)
+            # 🔴 F1：**全部收下**，包括 WAF / 登录页。
+            # 原来只收「以 { 开头且 >5000 字节」的正文，而实测 aliyun WAF 页是
+            # `<!doctypehtml><meta name="aliyun_waf_a…` —— 正好被这层过滤掉，
+            # 后面只能得到「没有接口响应」的 parse，止损的连续计数永远停在 1。
+            payloads.append((status, text))
 
         page.on("response", lambda r: asyncio.ensure_future(_collect(r)))
+
+        final_url = ""
+        page_title = ""
+        page_html = ""
+        nav_status = 200
         try:
             await await_domain_slot(url, self.min_interval)
-            await page.goto(url, timeout=int(self.timeout * 1000), wait_until="domcontentloaded")
+            response = await page.goto(
+                url, timeout=int(self.timeout * 1000), wait_until="domcontentloaded"
+            )
+            # Playwright 的 goto 返回 Response；测试替身可能返回 None，按 200 处理
+            nav_status = int(getattr(response, "status", 200) or 200)
             try:
                 await page.wait_for_selector(".joblist-item", timeout=20000)
             except Exception:  # noqa: BLE001 - 没有卡片也可能是接口已返回，继续看 payload
                 pass
             await page.wait_for_timeout(3000)
+            final_url = str(getattr(page, "url", "") or "")
+            try:
+                page_title = await page.title()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                page_html = await page.content()
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             try:
                 await context.close()
             except Exception:  # noqa: BLE001
                 pass
 
+        # ------------------------------------------------------------------
+        # 🔴 F1 核心：在 latch 置位后**唯一还会执行的路径**上补风控判据。
+        #
+        # 登录墙 latch 一旦置位，fetch() 会跳过静态 HTML 与渲染两步，只剩这里。
+        # 如果这里不判，「本次运行」里所有后续岗位都会得到 parse / no_field，
+        # 脚本的 consecutive_blocked 永远到不了阈值 5 —— 参数存在但结构性不可达。
+        # 判据仍只看结构（URL / 标题 / 骨架 / 403·429），不扫正文关键词。
+        # ------------------------------------------------------------------
+        kind, evidence = detect_blocked_structural(
+            page_html, nav_status, final_url, page_title
+        )
+        if kind:
+            self._last_failure = (kind, f"搜索页：{evidence}")
+            if kind == KIND_WAF:
+                BaseCrawler.mark_blocked()
+            return None
+
         scanned = 0
-        for text in reversed(payloads):
+        for status, text in reversed(payloads):
+            kind, evidence = detect_blocked_structural(text, status)
+            if kind:
+                self._last_failure = (kind, f"搜索接口响应：{evidence}")
+                if kind == KIND_WAF:
+                    BaseCrawler.mark_blocked()
+                return None
+            if not text.lstrip().startswith("{"):
+                continue
             try:
                 items = extract_items(text)
             except (ValueError, TypeError):
