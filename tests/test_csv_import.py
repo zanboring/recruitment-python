@@ -237,43 +237,45 @@ async def test_csv空标题行单独计数且总数可对账(db_session):
     assert stored.scalar_one() == result["success"], "success 与库里实际行数不一致"
 
 
-class _FlushFailingSession:
-    """真实 Session 的薄代理：在第 N 次 flush 时注入一个 IntegrityError。
+class _InsertFailingSession:
+    """真实 Session 的薄代理：遇到指定 ``job_key`` 的 INSERT 时注入 IntegrityError。
 
-    为什么用代理而不是 monkeypatch 类方法：本用例要的是「**这一次**写库失败」，
-    patch 类方法会把同进程其它会话一起打坏（pytest 单进程跑全量）。
+    为什么要按 key 而不是按「第 N 次 flush」：2026-11-18 起写库改成 Core
+    executemany（一次 INSERT 写完整批），flush 计数不再与数据行对应。
+    按 key 注入无论走批量路径还是重放路径都能准确命中同一行。
 
     注入的是真实的 ``sqlalchemy.exc.IntegrityError`` 类型 —— 与唯一约束冲突
-    抛出的类型完全相同，因此 ``begin_nested()`` 的收尾路径与生产一致。
+    抛出的类型完全相同。
     """
 
-    def __init__(self, real, fail_on_flush: int):
+    def __init__(self, real, fail_key: str):
         self._real = real
-        self._flush_calls = 0
-        self._fail_on = fail_on_flush
+        self._fail_key = fail_key
 
     def __getattr__(self, name):
         return getattr(self._real, name)
 
-    async def flush(self, *args, **kwargs):
-        self._flush_calls += 1
-        if self._flush_calls == self._fail_on:
-            from sqlalchemy.exc import IntegrityError
+    async def execute(self, statement, params=None, *args, **kwargs):
+        if str(statement).strip().upper().startswith("INSERT"):
+            items = params if isinstance(params, (list, tuple)) else [params]
+            if any(
+                isinstance(p, dict) and p.get("job_key") == self._fail_key for p in items
+            ):
+                from sqlalchemy.exc import IntegrityError
 
-            raise IntegrityError(
-                "INSERT INTO job", {}, Exception("UNIQUE constraint failed: job.job_key")
-            )
-        return await self._real.flush(*args, **kwargs)
+                raise IntegrityError(
+                    "INSERT INTO job", params or {},
+                    Exception("UNIQUE constraint failed: job.job_key"),
+                )
+        return await self._real.execute(statement, params, *args, **kwargs)
 
 
 @pytest.mark.asyncio
 async def test_csv单行写库失败不影响其余行且计数完整(db_session):
-    """A2-2 + A2-3：写库失败只回滚那一行，三个数字仍然完整。
+    """单行写库失败不影响其余行，四个计数仍然完整。
 
-    修复前：``db.add`` 后立刻 success+1（失败记到下一行头上），
-    而一次 flush 异常会让会话进入「必须 rollback」状态 —— 之后每行都抛
-    ``PendingRollbackError`` 并被计入 fail，最后的 ``commit()`` 再抛一次，
-    接口直接 500，**所有计数丢失**。
+    2026-11-18 后的实现：批量 executemany 失败 → 回滚整个事务 → 逐行重放并
+    剔除那一行 → 其余行照常写入；返回体是真实计数，不是 500 + 半提交。
     """
     from sqlalchemy import func, select
 
@@ -286,7 +288,10 @@ async def test_csv单行写库失败不影响其余行且计数完整(db_session
         "Go工程师,测试公司3,北京,20000,35000,3-5年,本科,Go,offline,,负责网关\n"
     )
 
-    proxy = _FlushFailingSession(db_session, fail_on_flush=2)   # 第 2 行写库失败
+    from app.utils.job_key import generate_job_key
+
+    bad_key = generate_job_key("offline", "Python工程师", "测试公司2", "深圳")
+    proxy = _InsertFailingSession(db_session, fail_key=bad_key)   # 第 2 行写库失败
     result = await export_service.import_jobs_from_csv(proxy, three_rows.encode("utf-8"))
 
     assert result == {
@@ -304,7 +309,7 @@ async def test_csv单行写库失败不影响其余行且计数完整(db_session
     assert "Python工程师" not in titles, "失败的那一行不该留下半截数据"
     assert set(titles) == {"Java开发工程师", "Go工程师"}
 
-    # 会话必须仍然可用（SAVEPOINT 回滚后不该进入 PendingRollback 状态）
+    # 会话必须仍然可用（回滚后不该进入 PendingRollback 状态）
     await db_session.execute(select(func.count(Job.id)))
 
 
@@ -428,3 +433,111 @@ def test_nginx请求体上限要略大于应用上限而不是恰好相等():
         f"nginx 上限 {limit} 字节留了过多余量：应用上限之外再放行一倍以上，"
         f"等于让 nginx 不再起兜底作用"
     )
+
+
+# ==========================================================================
+# F1/F2 回归（2026-11-18）：半提交 + 92.5 倍吞吐退化
+#
+# 上一轮用 `begin_nested()` 逐行 SAVEPOINT 做到"单行失败不拖垮整批"，
+# 代价是在 SQLite 的 legacy 事务模式下每条 RELEASE 都等于 COMMIT：
+#   * 外层异常时出错点之前的行已经落盘，接口却只吐 500、计数全丢；
+#   * 1 万行实测 32.37s（qoder 复审），nginx 12m 入口能装几十万行 → 300s 504。
+# 现在改成 Core executemany 一次写入，失败才逐行重放剔除坏行。
+# ==========================================================================
+
+def _make_large_csv(n: int) -> bytes:
+    header = "标题,公司,城市,薪资(min),薪资(max),经验,学历,技能,来源平台,发布时间,描述\n"
+    lines = [
+        f"岗位{i},公司{i},长沙,10000,20000,1-3年,本科,Python,import,,描述{i}"
+        for i in range(n)
+    ]
+    return (header + "\n".join(lines) + "\n").encode("utf-8")
+
+
+async def test_一万行导入耗时不得退化到逐行提交(tmp_path):
+    """**吞吐回归**：10 万字节级文件要能在 5 秒内导完。
+
+    阈值放宽到 5s 是为了不把 CI 抖动做成红测；实测正常在 0.2s 量级，
+    旧的逐行 SAVEPOINT 实现是 32s —— 这个阈值仍能抓住任何数量级退化。
+    """
+    import time
+
+    from sqlalchemy import func, select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.database import Base as ModelBase
+    from app.models.job import Job
+
+    engine = await _make_file_engine(tmp_path / "throughput.db", ModelBase)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with maker() as db:
+            started = time.perf_counter()
+            result = await export_service.import_jobs_from_csv(db, _make_large_csv(10000))
+            elapsed = time.perf_counter() - started
+
+        assert result["success"] == 10000, result
+        assert elapsed < 5.0, (
+            f"1 万行耗时 {elapsed:.2f}s —— 逐行提交退化回来了（旧实现 32.37s）"
+        )
+
+        async with maker() as fresh:
+            stored = (await fresh.execute(select(func.count(Job.id)))).scalar_one()
+        assert stored == 10000, f"返回说写进 10000 条，库里只有 {stored} 条"
+    finally:
+        await engine.dispose()
+
+
+async def test_外层解析异常时不留半批已提交行(tmp_path):
+    """生成器在第 4 行抛错（CSV 字段超长等价物）：库里必须是 0 行。
+
+    旧实现下前 3 行已经被逐行 RELEASE 提交，重开连接仍看得到 —— 接口 500
+    加半批数据，用户重试时这 3 行又变成 skip，谁都不知道发生过什么。
+    """
+    import sqlite3
+
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.database import Base as ModelBase
+    from app.models.job import Job
+
+    path = tmp_path / "half_commit.db"
+    engine = await _make_file_engine(path, ModelBase)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    def broken_rows():
+        for i in range(3):
+            yield {"标题": f"半提交{i}", "公司": "某公司", "城市": "长沙"}
+        raise ValueError("field larger than field limit (131072)")
+
+    try:
+        async with maker() as db:
+            with pytest.raises(ValueError, match="field larger"):
+                await export_service._import_rows(db, broken_rows(), label="CSV")
+            await db.rollback()          # 调用方（import_jobs_from_csv）的异常分支会做这一步
+
+        # 用**新连接**读：排除"当前 session 还没 flush"造成的假阴性
+        conn = sqlite3.connect(str(path))
+        stored = conn.execute("select count(*) from job").fetchone()[0]
+        conn.close()
+        assert stored == 0, f"外层异常留下了 {stored} 行半提交数据"
+
+        async with maker() as fresh:
+            assert (await fresh.execute(select(Job.id))).all() == []
+    finally:
+        await engine.dispose()
+
+
+async def _make_file_engine(path, model_base):
+    """给上面两条用例建一个独立的 SQLite **文件**库（用真表结构）。
+
+    不用测试夹具的内存库：内存库是 StaticPool 单连接，"半提交"这种跨连接
+    可见性验证在那里测不出来。
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{path.as_posix()}")
+    async with engine.begin() as conn:
+        await conn.run_sync(model_base.metadata.create_all)
+    return engine

@@ -1430,3 +1430,246 @@ def test_403被视为站点拦截而不是普通4xx():
     assert df.detect_blocked_structural("", 403)[0] == df.KIND_WAF
     assert df.detect_blocked_structural("", 429)[0] == df.KIND_WAF
     assert df.detect_blocked_structural("", 404)[0] == ""
+
+
+# ==========================================================================
+# failure 契约：ok=True ⇒ failure == ""（fetch 文档串自己声明的口径）
+#
+# 缺陷形状：静态路径判出登录墙 → failure=login_wall → 渲染 / 搜索兜底把正文
+# 救回来 → 成功早返回不清 failure，于是 ok=True 却带着 login_wall。
+# 脚本按 ok 分支走，数据是对的；但 as_dict() 与任何按 failure 聚合的下游
+# 会把成功条算进「被拦」。
+#
+# 这组用例只打桩网络 / 浏览器出口：fetch()、_render_detail()、
+# _search_by_keyword()、backfill_detail.run() 全部是生产实现原函数。
+# ==========================================================================
+
+
+class _ContractApiResponse:
+    """搜索接口替身：正常 JSON（与 _WafApiResponse 相反的那一侧）。"""
+
+    def __init__(self, payload: str):
+        self.url = "https://we.51job.com/api/job/search-pc?keyword=python"
+        self.status = 200
+        self._payload = payload
+
+    async def text(self):
+        return self._payload
+
+
+class _ContractPage:
+    """按 goto 的 URL 分流，让渲染与搜索两条浏览器路径都跑生产实现。
+
+    详情页 → 落在 login.51job.com（结构性判据命中，_render_detail 返回 None）；
+    搜索页 → 正常标题 + 正常接口 JSON（_search_by_keyword 按 jobId 精确命中）。
+    """
+
+    def __init__(self, payload: str):
+        self._payload = payload
+        self._handlers = []
+        self.url = ""
+        self._title = ""
+        self._html = ""
+
+    def on(self, event, callback):
+        if event == "response":
+            self._handlers.append(callback)
+
+    async def goto(self, url, **kwargs):
+        if "/pc/search" in url:
+            self.url = url
+            self._title = "【python,长沙招聘,求职】-前程无忧"
+            self._html = (
+                "<html><head><title>【python,长沙招聘,求职】-前程无忧</title></head>"
+                "<body><div class='joblist-item'></div></body></html>"
+            )
+            for callback in self._handlers:
+                callback(_ContractApiResponse(self._payload))
+            return _FakeResponse(self._html, url=url)
+        self.url = "https://login.51job.com/login?from=passport&url=x"
+        self._title = "登录-51job"
+        self._html = '<html><body><input type="password" name="pwd"></body></html>'
+        return _FakeResponse(self._html, url=self.url)
+
+    async def wait_for_selector(self, selector, **kwargs):
+        return None
+
+    async def wait_for_timeout(self, milliseconds):
+        await asyncio.sleep(0)      # 让 _collect 的协程真的跑完
+
+    async def title(self):
+        return self._title
+
+    async def content(self):
+        return self._html
+
+
+class _ContractContext:
+    def __init__(self, payload: str):
+        self.page = _ContractPage(payload)
+
+    async def new_page(self):
+        return self.page
+
+    async def close(self):
+        pass
+
+
+def _search_payload(job_ids) -> str:
+    """真实 search-pc item，只把 jobId 换成待回填的那几条。"""
+    import json
+
+    items = []
+    for job_id in job_ids:
+        item = _real_search_item()
+        item["jobId"] = str(job_id)
+        items.append(item)
+    return json.dumps({"resultbody": {"job": {"items": items}}}, ensure_ascii=False)
+
+
+_CONTRACT_LOGIN_HTML = (
+    '<html><head><title>登录</title></head>'
+    '<body><input type="password" name="pwd"></body></html>'
+)
+
+
+def _install_login_wall_static(monkeypatch):
+    async def fake_safe_get(url, **kwargs):
+        return _FakeResponse(
+            _CONTRACT_LOGIN_HTML, url="https://login.51job.com/login.php?url=x"
+        )
+
+    monkeypatch.setattr(df, "safe_get", fake_safe_get)
+
+
+def _install_contract_browser(monkeypatch, payload: str):
+    async def fake_new_page(self):
+        ctx = _ContractContext(payload)
+        return ctx, ctx.page
+
+    monkeypatch.setattr(df.DetailFetcher, "_new_page", fake_new_page)
+
+
+async def test_latch置位后搜索兜底成功_failure为空串(monkeypatch):
+    """核心判据：第 1 条撞登录墙置 latch，搜索兜底救回正文 → failure 必须是空串。
+
+    第 2 条走 latch 稳态（跳过静态与渲染，只剩搜索），同样必须是空串。
+    """
+    _install_login_wall_static(monkeypatch)
+    _install_contract_browser(monkeypatch, _search_payload(["174174002"]))
+
+    fetcher = DetailFetcher(min_interval=0)
+    url = "https://we.51job.com/pc/jobdetail?jobId=174174002"
+    first = await fetcher.fetch(url, keyword="智能计算开发工程师", city="长沙")
+    second = await fetcher.fetch(url, keyword="智能计算开发工程师", city="长沙")
+
+    assert fetcher._detail_known_login_wall is True, "latch 没置位就测不到目标路径"
+    assert first.ok and first.source == "search_api", first.attempts
+    assert first.failure == "", f"成功却带着失败类别 {first.failure!r}：{first.attempts}"
+    assert first.as_dict()["failure"] == ""
+    assert second.ok and second.source == "search_api", second.attempts
+    assert second.failure == "", f"latch 稳态下成功却带着 {second.failure!r}"
+    # 证据不许被抹掉：登录墙仍留在 attempts 里，排查时看得到
+    assert any("登录墙" in a for a in first.attempts), first.attempts
+
+
+async def test_静态判登录墙后渲染成功_failure为空串(monkeypatch):
+    """第二条成功早返回路径：静态判登录墙，渲染却拿到了正文。"""
+    _install_login_wall_static(monkeypatch)
+
+    class _DetailPage:
+        url = "https://we.51job.com/pc/jobdetail?jobId=174174002"
+
+        async def goto(self, url, **kwargs):
+            return _FakeResponse(JSON_LD_PAGE, url=url)
+
+        async def wait_for_timeout(self, milliseconds):
+            await asyncio.sleep(0)
+
+        async def title(self):
+            return "某岗位"
+
+        async def content(self):
+            return JSON_LD_PAGE
+
+    class _Ctx:
+        page = _DetailPage()
+
+        async def close(self):
+            pass
+
+    async def fake_new_page(self):
+        ctx = _Ctx()
+        return ctx, ctx.page
+
+    monkeypatch.setattr(df.DetailFetcher, "_new_page", fake_new_page)
+    monkeypatch.setattr(df.DetailFetcher, "_search_by_keyword", _no_search)
+
+    result = await DetailFetcher(min_interval=0).fetch(
+        "https://we.51job.com/pc/jobdetail?jobId=174174002", keyword="后端开发工程师"
+    )
+
+    assert result.ok and result.source == "render", result.attempts
+    assert result.failure == "", f"渲染成功却带着 {result.failure!r}：{result.attempts}"
+    assert result.as_dict()["failure"] == ""
+
+
+def test_成功结果的failure恒为空串_失败结果保留类别():
+    """对象级不变量：契约由结果对象自己保证，不依赖调用方记得清。"""
+    succeeded = DetailResult(job_id="1", job_desc="x" * MIN_DESC_LEN, source="search_api")
+    succeeded.failure = df.KIND_LOGIN          # 成功之前判出的类别
+    assert succeeded.ok is True
+    assert succeeded.failure == ""
+    assert succeeded.as_dict()["failure"] == ""
+
+    failed = DetailResult(job_id="1")
+    failed.failure = df.KIND_LOGIN
+    assert failed.ok is False
+    assert failed.failure == df.KIND_LOGIN     # 失败侧不许被抹掉
+    assert failed.as_dict()["failure"] == df.KIND_LOGIN
+
+    failed.job_desc = "x" * MIN_DESC_LEN       # 同一对象后来成功了
+    assert failed.ok is True
+    assert failed.failure == ""
+
+
+async def test_搜索兜底救回的条目在脚本里算成功且不计被拦(tmp_path, monkeypatch, capsys):
+    """端到端：真 run() + 真 fetch()，三条全由搜索兜底救回。
+
+    阈值故意设成 2：若成功条仍带着 login_wall，脚本会把它们算进连续被拦
+    而在第 2 条停批（退出码 4）。这条用例同时锁住「契约」与「止损口径」。
+    """
+    import json
+    import sqlite3
+
+    script = _load_backfill_script()
+    db_path = tmp_path / "contract.db"
+    state_path = tmp_path / "state.json"
+    _make_backfill_db(db_path, 3)
+    _install_login_wall_static(monkeypatch)
+    _install_contract_browser(monkeypatch, _search_payload(["1", "2", "3"]))
+
+    args = script._parse_args([
+        "--db", str(db_path), "--state", str(state_path),
+        "--limit", "3", "--interval", "0", "--batch-size", "0",
+        "--max-consecutive-blocked", "2",
+    ])
+    code = await script.run(args)
+    out = capsys.readouterr().out
+
+    assert code == 0, f"三条都成功却返回 {code}：{out[-800:]}"
+    assert "[STOP]" not in out, out[-800:]
+    assert out.count("] ok") == 3, out[-800:]
+    assert "类别=" not in out, "成功条不该进失败分类统计"
+
+    conn = sqlite3.connect(str(db_path))
+    done = conn.execute(
+        "select count(*) from job where length(coalesce(job_desc,''))>=30"
+    ).fetchone()[0]
+    changed = conn.execute("select count(*) from job where job_status<>'NEW'").fetchone()[0]
+    conn.close()
+    assert done == 3 and changed == 0
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["ok"] == [1, 2, 3]
+    assert state["failed"] == {}

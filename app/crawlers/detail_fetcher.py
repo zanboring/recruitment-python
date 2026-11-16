@@ -202,12 +202,30 @@ class DetailResult:
     # 失败类别（见 FAILURE_KINDS）。空串 = 成功，或还没判定。
     # 为什么单独一个字段而不是从 reason 里猜：日志是给人看的，
     # 统计要按类别聚合 —— 混在一起就只能得到「失败 539 条」，没法决策。
-    failure: str = ""
+    # 这里存**原始判定**，对外读取一律走下面的 failure 属性。
+    _failure: str = ""
     attempts: List[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return len(self.job_desc) >= MIN_DESC_LEN
+
+    @property
+    def failure(self) -> str:
+        """成功时必为空串 —— 由 ``ok`` 派生，不靠各分支记得清。
+
+        三条成功早返回（html / render / search_api）之前都可能已经判出
+        login_wall / waf：静态路径撞了登录墙，渲染或搜索兜底仍可能把正文救回来。
+        在每个返回前手动清一次，将来新增第四条成功路径就会再漏一次；
+        把契约放在结果对象上，``ok`` 与 ``failure`` 共用同一个真相源（正文长度），
+        结构上不可能出现「ok=True 却带着失败类别」。
+        原始判定留在 ``_failure`` 与 ``attempts`` 里，排查不丢信息。
+        """
+        return "" if self.ok else self._failure
+
+    @failure.setter
+    def failure(self, kind: str) -> None:
+        self._failure = kind
 
     def as_dict(self) -> dict:
         return {
