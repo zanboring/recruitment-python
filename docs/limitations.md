@@ -69,7 +69,7 @@
 - **证据**：
   - `docs/reports/rag-evaluation.md:25-27`（脚本生成：语义 64.3%、混合 67.9%）、`:33-35`（分类别：keyword 语义型 0.0%、semantic 43.8%、hybrid 43.8%）；生成时间 2026-09-11，旧模型 `nomic-embed-text`。
   - `docs/reports/rag-evaluation-history.md:16-17`（43.8%→93.8%、67.9%→96.4%）、`:24-28`（只有人工背书，无明细 / 表格 / 原始产物）、`:37-38`（本轮未重跑，不能用「已复现」描述）。
-- **现在怎么讲**：93.8% / 96.4% 只能说是「2026-10-23 人工补记的复测数字」；主报告里可复现的数字对应旧模型。
+- **现在怎么讲**：93.8% / 96.4% 已于 2026-11-16 两次独立跑出，可说「脚本可复现」；**换模型前**的 43.8% / 67.9% 仍只有人背书。主报告 `rag-evaluation.md` 里可复现的那组数字对应旧模型，新模型的复现记录在 `rag-evaluation-history.md:30-58`。
 
 ### 6. 详情回填：工具可用，HTML 快照路径拿不到
 
@@ -116,12 +116,14 @@
   - WAF 实测与示例口径：`deliveries/archive-20261112/qoder-REPORT-第4轮.md` §三.4、G8 / D6。
 - **现在怎么讲**：声明式接入降低了加源成本；真实招聘站的 JSON 接入尚未打通。
 
-### 11. 看板与图表：三处已知展示缺陷（代码静态核对，未起服务验证）
+### 11. 看板与图表：三处展示缺陷已于 2026-11-16 修复
 
-- **「平均薪资」卡片恒 0**：薪资区间接口只返回 `name` / `count`（`app/services/job_service.py:271`），后端从不产出 `avgSalary`；前端 `Dashboard.vue:234,:237` 的加权求和与 `DataCompare.vue:91,:93` 的列读的是这个不存在的键。
-- **「企业数量」卡片恒 ≤20**：公司排行 SQL `limit(20)`（`app/services/job_service.py:219`），卡片取分组条数（`Dashboard.vue:230`）；`company` 表 432 条（`select count(*) from company;`），卡片不展示全量。
-- **分析摘要渲染成 `[object Object]`**：`Analysis.vue:188` 把 summary dict 当字符串赋给 `summary.value`；此条为读码判断，未起服务验证实际渲染。
-- **技能画像 / 本地模型页仍按 ACTIVE 42 口径**：`app/services/skill_profile.py:90`、`app/services/local_model_service.py:45,:59,:88,:110,:124` 写死 `"ACTIVE"`，与首页岗位总数 555 的口径不一致。
+三处都是「用户一打开首页/分析页就能看到的错误数字」，起真实服务 + 探针库实测确认后修复：
+
+- **「平均薪资」卡片恒 0 → 已修**：薪资区间接口只返回 `name` / `count`，从不产出 `avgSalary`，而 `Dashboard.vue` 按这个不存在的键加权，结果永远是 0。改为直接读 `/analysis/summary` 已算好的 `avg_salary`（真实库实测 16113.85），前端不再重复计算。
+- **「企业数量」卡片恒 ≤20 → 已修**：卡片取 `stat/company`（Top-20 榜单）的数组长度。后端 `stat_summary` 新增 `company_count`（`count(distinct company_name)`，限定可见岗位口径），前端改读该字段。
+- **分析摘要 `[object Object]` → 已修**：`/analysis/summary` 返回对象，`job.ts` 却声明 `Promise<string>`，`Analysis.vue` 直接把对象塞进 `:title`。收紧类型为 `AnalysisSummary`，并在前端拼成可读句子。
+- 同类第四处：`DataCompare.vue` 的「平均薪资 / 最高薪资」列与卡片也读不存在的 `avgSalary`（数据源 status/city/education/experience 只有 name/count），恒为 0。已移除这两列和两个薪资卡片，改为展示真实可得的「分组数」——不造假数据。
 
 ### 12. 回填脚本其余已知审计项（未修，详见 `deliveries/qoder-REPORT.md`）
 

@@ -174,7 +174,7 @@ const chartInstances: echarts.ECharts[] = [];
 
 const init = async () => {
   try {
-    const [summaryText, cityData, skillData, salaryRangeData, topTitles, educationData, experienceData, companyData] = await Promise.all([
+    const [summaryData, cityData, skillData, salaryRangeData, topTitles, educationData, experienceData, companyData] = await Promise.all([
       fetchAnalysisSummary(),
       fetchJobStatCity(),
       fetchJobStatSkill(),
@@ -185,7 +185,14 @@ const init = async () => {
       fetchJobStatCompany()
     ]);
     
-    summary.value = (summaryText as string) || '暂无数据';
+    // /analysis/summary 返回的是结构化对象（total / active / avg_salary /
+    // company_count / update_time），旧代码把它当字符串直接塞进 :title，
+    // 于是页面上显示「[object Object]」。这里显式拼成一句可读的话。
+    summary.value = summaryData
+      ? `累计采集 ${summaryData.total} 个岗位，当前在架 ${summaryData.active} 个，` +
+        `平均薪资 ${Math.round(summaryData.avg_salary || 0).toLocaleString()} 元/月，` +
+        `涉及 ${summaryData.company_count || 0} 家企业（更新于 ${summaryData.update_time}）。`
+      : '暂无数据';
 
     const cityColors = ['#5470c6', '#91cc75', '#fac858', '#ee6666', '#73c0de', '#3ba272', '#fc8452', '#9a60b4', '#ea7ccc'];
 

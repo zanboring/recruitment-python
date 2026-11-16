@@ -113,6 +113,17 @@ async def test_摘要与图表口径一致(mixed_jobs):
     assert city_total == summary["active"]
 
 
+@pytest.mark.asyncio
+async def test_摘要公司数按可见岗位去重(mixed_jobs):
+    """回归：企业数量卡片原先取 stat/company（Top-20）长度，恒 ≤20。
+
+    stat_summary.company_count 必须数「有可见岗位的公司」，与 active 同口径：
+    两条在架岗位是两个不同公司 → 2；下架岗位的公司不计入。
+    """
+    summary = await JobService.stat_summary(mixed_jobs)
+    assert summary["company_count"] == 2
+
+
 # ---------- 与 AI 分析对齐 ----------
 
 @pytest.mark.asyncio

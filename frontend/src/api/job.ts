@@ -95,7 +95,18 @@ export function recommendJobs(params: { skills?: string; education?: string; exp
   return http.get('/jobs/recommend', { params });
 }
 
-export function fetchAnalysisSummary(): Promise<string> {
+// /api/jobs/analysis/summary 返回的是结构化对象，不是字符串。
+// 旧类型写成 Promise<string> 是「[object Object]」展示缺陷的根源：
+// Analysis.vue 把对象直接当字符串渲染。类型在这里收紧，调用方必须显式格式化。
+export interface AnalysisSummary {
+  total: number;
+  active: number;
+  avg_salary: number;
+  company_count: number;
+  update_time: string;
+}
+
+export function fetchAnalysisSummary(): Promise<AnalysisSummary> {
   return http.get('/jobs/analysis/summary');
 }
 

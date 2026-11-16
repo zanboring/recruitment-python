@@ -1,7 +1,7 @@
 import re
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_, func, case, delete
+from sqlalchemy import select, and_, or_, func, case, delete, distinct
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
@@ -453,6 +453,15 @@ class JobService:
                 Job.job_status.in_(VISIBLE_STATUSES), Job.min_salary.isnot(None)
             )
         )
+        # 企业数量卡片原来取 `stat/company`（Top-20）的数组长度，永远 ≤20，
+        # 而库里实际有数百家公司 —— 用户一进首页就看到明显偏小的数字。
+        # 这里给出「有可见岗位的公司数」，与岗位总数同口径；从 job 表去重而不查
+        # company 表，避免把「注册过但当前无岗位」的公司算进去。
+        company_count = await db.execute(
+            select(func.count(distinct(Job.company_name))).where(
+                Job.job_status.in_(VISIBLE_STATUSES)
+            )
+        )
 
         # 展示用的日期按北京时间输出。
         # 原来用 datetime.now(timezone.utc) 取日期，在东八区会导致每天 00:00–08:00
@@ -463,6 +472,8 @@ class JobService:
             "total": total.scalar() or 0,
             "active": active.scalar() or 0,
             "avg_salary": round(avg_sal.scalar() or 0, 2),
+            # 有可见岗位的公司数（≠ company 表总数，也 ≠ Top-20 榜单长度）
+            "company_count": company_count.scalar() or 0,
             "update_time": beijing.strftime("%Y-%m-%d")
         }
 

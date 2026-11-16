@@ -126,7 +126,8 @@ import {
   fetchJobStatExperience,
   fetchJobStatStatus,
   fetchJobStatCompany,
-  fetchTopTitles
+  fetchTopTitles,
+  fetchAnalysisSummary
 } from '@/api/job';
 
 const cityChartRef = ref<HTMLDivElement | null>(null);
@@ -210,7 +211,7 @@ const getRadialGradient = (index: number) => {
 };
 
 const init = async () => {
-  const [cityData, salaryRangeData, skillData, eduData, expData, statusData, companyData, titleData] = await Promise.all([
+  const [cityData, salaryRangeData, skillData, eduData, expData, statusData, companyData, titleData, summary] = await Promise.all([
     fetchJobStatCity(),
     fetchJobStatSalaryRange(),
     fetchJobStatSkill(),
@@ -218,7 +219,8 @@ const init = async () => {
     fetchJobStatExperience(),
     fetchJobStatStatus(),
     fetchJobStatCompany(),
-    fetchTopTitles()
+    fetchTopTitles(),
+    fetchAnalysisSummary()
   ]);
 
   // 更新统计卡片
@@ -227,14 +229,17 @@ const init = async () => {
   const newStatus = allStatus.find((s: any) => s.name === 'NEW');
   jobCount.value = (activeStatus?.count || 0) + (newStatus?.count || 0);
   activeCount.value = activeStatus?.count || 0;
-  companyCount.value = (companyData || []).length;
 
-  // 计算平均薪资
-  const salarySum = (salaryRangeData || []).reduce((sum: number, item: any) => {
-    return sum + ((item.avgSalary || 0) * (item.count || 0));
-  }, 0);
-  const totalCount = (salaryRangeData || []).reduce((sum: number, item: any) => sum + (item.count || 0), 0);
-  avgSalary.value = totalCount > 0 ? Math.round(salarySum / totalCount).toLocaleString() : '0';
+  // 企业数量与平均薪资都取自 /analysis/summary：
+  // - 旧写法 companyCount = companyData.length，而 companyData 是 Top-20 榜单，
+  //   于是卡片永远 ≤20（库里实际数百家）。
+  // - 旧写法从 salaryRange 按 item.avgSalary 加权，但该接口只返回 name/count，
+  //   没有 avgSalary 字段，结果永远是 0。
+  // 后端 stat_summary 已按可见岗位口径算好这两个数，直接用，避免前端重复计算。
+  companyCount.value = summary?.company_count ?? (companyData || []).length;
+  avgSalary.value = summary?.avg_salary
+    ? Math.round(summary.avg_salary).toLocaleString()
+    : '0';
 
   // 城市分布饼图 - 带动画效果
   if (cityChartRef.value) {

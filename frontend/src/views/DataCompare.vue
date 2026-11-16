@@ -88,11 +88,6 @@
           <el-table :data="tableData" stripe>
             <el-table-column prop="name" label="名称" width="200" />
             <el-table-column prop="count" label="数量" width="120" sortable />
-            <el-table-column prop="avgSalary" label="平均薪资" width="150" sortable>
-              <template #default="{ row }">
-                {{ formatSalary(row.avgSalary) }}
-              </template>
-            </el-table-column>
             <el-table-column prop="percentage" label="占比" width="120">
               <template #default="{ row }">
                 {{ row.percentage }}%
@@ -138,17 +133,16 @@ const tableData = ref<any[]>([]);
 
 const statItems = computed(() => {
   const total = tableData.value.reduce((sum, item) => sum + (item.count || 0), 0);
-  const avgSalary = tableData.value.length > 0 
-    ? tableData.value.reduce((sum, item) => sum + (item.avgSalary || 0), 0) / tableData.value.length 
-    : 0;
   const maxCount = Math.max(...tableData.value.map(item => item.count || 0), 0);
-  const maxSalary = Math.max(...tableData.value.map(item => item.avgSalary || 0), 0);
+  const groupCount = tableData.value.length;
 
+  // 本页数据源是状态 / 城市 / 学历 / 经验分组，后端只返回 name 与 count，
+  // 从不提供 avgSalary。原先这里的「平均薪资 / 最高薪资」卡片恒为 0，
+  // 与其造假数据，不如只展示这些维度真实可得的指标。
   return [
     { label: '总数量', value: total, desc: '个岗位', color: '#5470c6' },
-    { label: '平均薪资', value: formatSalary(avgSalary), desc: '月薪', color: '#91cc75' },
-    { label: '最高数量', value: maxCount, desc: '个岗位', color: '#fac858' },
-    { label: '最高薪资', value: formatSalary(maxSalary), desc: '月薪', color: '#ee6666' }
+    { label: '分组数', value: groupCount, desc: '个维度项', color: '#91cc75' },
+    { label: '最高数量', value: maxCount, desc: '个岗位', color: '#fac858' }
   ];
 });
 
@@ -166,11 +160,6 @@ const getChartTitle = () => {
     experience: '经验薪资对比'
   };
   return titles[compareType.value] || '数据对比';
-};
-
-const formatSalary = (salary?: number) => {
-  if (!salary) return '0K';
-  return `${Math.round(salary)}K`;
 };
 
 const getProgressColor = (percentage: number) => {
