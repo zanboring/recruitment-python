@@ -21,20 +21,22 @@ for category, skills in SKILL_KEYWORDS_FULL.items():
 def _build_skill_matcher(skill: str):
     """为一个技能词编译匹配器。
 
-    **为什么不能一律用子串**：短英文词会命中别的单词内部 —— 最典型的是 ``Go``
-    命中 ``Django``（这个项目里 Django 岗位极常见），于是每一条 Django 岗位都
-    被额外打上 Go 标签，技能分布、技能图谱与「按技能搜索」全部被污染，而且
-    没有任何报错，看起来只是"数据有点怪"。
+    **为什么不能一律用子串**：英文词会命中别的单词内部 —— ``Go`` 命中 ``Django``
+    （这个项目里 Django 岗位极常见），``Java`` 命中 ``JavaScript``（量化、前端岗位
+    常见），于是岗位被额外打上并不要求它的标签，技能分布、技能图谱与
+    「按技能搜索」全部被污染，而且没有任何报错，看起来只是"数据有点怪"。
 
-    规则：
-    - 纯字母/数字且长度 ≤3（Go / PHP / Vue / AWS / LLM / Git）→ 加词边界，避免
-      ``\\bgo\\b`` 命中 ``django`` / ``logo`` / ``cargo``。
+    规则（2026-11-20 调整：原先按「长度 ≤3」判定，而长度根本不是判据 ——
+    ``Java`` 有 4 个字母，照样是 ``JavaScript`` 的前缀）：
+    - 纯字母/数字的词（Go / Java / Python / MySQL / Spring）→ 两侧不得紧邻**字母**。
+      数字允许相邻：``Python3`` / ``MySQL8.0`` 是同一项技能的不同写法，
+      按字母边界处理既挡住了 ``JavaScript``，又不会漏掉 ``Python3``。
     - 含特殊字符的（C++ / C# / .NET / Node.js / CI/CD）→ 保持子串匹配，因为
       ``\\b`` 在这些符号边界上不成立，加边界反而永远命中不了。
     - 中文技能词（数据分析 / 机器学习）→ 子串匹配，中文没有词边界概念。
     """
-    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", skill) and len(skill) <= 3:
-        return re.compile(rf"(?<![A-Za-z0-9]){re.escape(skill)}(?![A-Za-z0-9])", re.IGNORECASE)
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", skill):
+        return re.compile(rf"(?<![A-Za-z]){re.escape(skill)}(?![A-Za-z])", re.IGNORECASE)
     return re.compile(re.escape(skill), re.IGNORECASE)
 
 

@@ -1673,3 +1673,124 @@ async def test_搜索兜底救回的条目在脚本里算成功且不计被拦(t
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["ok"] == [1, 2, 3]
     assert state["failed"] == {}
+# 2026-11-20：skills 重算（scripts/recompute_skills.py）
+#
+# 回填把正文从 16 推到了 270/555，但 skills 仍是「标题 + 当年那段短正文」
+# 算出来的旧值。下面锁住三条契约：结果与 extract_skills 一致、dry-run 不写库、
+# 重复跑零变更（幂等），以及「只动 skills 一列」。
+# ==========================================================================
+
+
+def _load_recompute_script():
+    """按路径加载 scripts/recompute_skills.py（scripts/ 不是包，不能直接 import）。"""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    path = root / "scripts" / "recompute_skills.py"
+    spec = importlib.util.spec_from_file_location("recompute_skills_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _make_skills_db(path, rows) -> None:
+    """最小库：列覆盖重算脚本会读的全部非 skills 列（红线指纹要用）。"""
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE job ("
+        " id INTEGER PRIMARY KEY, title TEXT, job_desc TEXT, skills TEXT,"
+        " job_status TEXT, min_salary INTEGER, max_salary INTEGER, job_key TEXT,"
+        " url TEXT, detail_html TEXT, publish_time TEXT, updated_at TEXT)"
+    )
+    for job_id, title, desc, skills in rows:
+        conn.execute(
+            "INSERT INTO job (id, title, job_desc, skills, job_status, min_salary,"
+            " max_salary, job_key, url, updated_at)"
+            " VALUES (?, ?, ?, ?, 'NEW', 0, 0, ?, ?, '2026-11-01 00:00:00')",
+            (job_id, title, desc, skills, f"key-{job_id}", f"https://example.com/j/{job_id}"),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_skills重算结果等于extract_skills且不动其它列(tmp_path):
+    """重算后 skills 必须逐字节等于 extract_skills(title, job_desc)。"""
+    import sqlite3
+
+    from app.crawlers.cleaner import extract_skills
+
+    script = _load_recompute_script()
+    title = "后端开发工程师"
+    desc = "岗位职责：负责推荐系统后端服务开发。任职要求：熟悉 Python、MySQL、Redis，有 Docker 经验。"
+    db_path = tmp_path / "t.db"
+    _make_skills_db(db_path, [(1, title, desc, "Java")])
+
+    assert script.main(["--db", str(db_path)]) == 0
+
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute(
+        "select skills, job_status, title, job_desc, job_key, min_salary, updated_at from job"
+    ).fetchone()
+    conn.close()
+    assert row[0] == extract_skills(title, desc)
+    assert "Python" in row[0]
+    # 只改 skills 一列
+    assert row[1] == "NEW"
+    assert row[2] == title
+    assert row[3] == desc
+    assert row[4] == "key-1"
+    assert row[5] == 0
+    assert row[6] == "2026-11-01 00:00:00"
+
+
+def test_skills重算dry_run不改库(tmp_path):
+    """--dry-run 只统计：库里的旧值一个字都不能变，也不该产生备份。"""
+    import sqlite3
+
+    script = _load_recompute_script()
+    db_path = tmp_path / "t.db"
+    _make_skills_db(db_path, [(1, "数据分析师", "岗位职责：使用 Python 做数据挖掘与机器学习建模。", "旧值")])
+
+    assert script.main(["--db", str(db_path), "--dry-run"]) == 0
+
+    conn = sqlite3.connect(str(db_path))
+    got = conn.execute("select skills from job where id=1").fetchone()[0]
+    conn.close()
+    assert got == "旧值"
+    assert not list(tmp_path.glob("*.bak-*")), "dry-run 不写库，不该生成备份"
+
+
+def test_skills重算幂等_第二次零变更(tmp_path, capsys):
+    """连跑两次：第二次应报「变更 0 条」，且不再生成备份。"""
+    import sqlite3
+
+    script = _load_recompute_script()
+    db_path = tmp_path / "t.db"
+    _make_skills_db(db_path, [
+        (1, "后端开发工程师", "任职要求：熟悉 Python、MySQL、Redis。", "Java"),
+        (2, "前端工程师", "任职要求：熟悉 Vue、TypeScript、Webpack。", ""),
+    ])
+
+    assert script.main(["--db", str(db_path)]) == 0
+    first = capsys.readouterr().out
+    assert "变更：2 条" in first, first[-800:]
+
+    backup_count = len(list(tmp_path.glob("*.bak-*")))
+    assert backup_count == 1, "第一次有变更，应生成一份备份"
+
+    assert script.main(["--db", str(db_path)]) == 0
+    second = capsys.readouterr().out
+    assert "变更：0 条" in second, second[-800:]
+    assert len(list(tmp_path.glob("*.bak-*"))) == backup_count, "没有变更就不该再备份"
+
+    conn = sqlite3.connect(str(db_path))
+    rows = conn.execute("select id, skills from job order by id").fetchall()
+    conn.close()
+    assert rows[0][1] and "Python" in rows[0][1]
+    assert rows[1][1] and "Vue" in rows[1][1]

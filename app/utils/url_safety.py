@@ -183,12 +183,34 @@ async def safe_get(url: str, *, headers=None, timeout: float = 30.0):
 
     返回的响应体已完整读入（`client.get` 非 stream 模式），
     因此在客户端关闭后继续读 `resp.text` / `resp.status_code` 是安全的。
+
+    **代理取舍（2026-11-17，抗非法代理环境）**：构造客户端时 ``trust_env=False``，
+    不再读环境里的 ``HTTP_PROXY`` / ``HTTPS_PROXY`` / ``NO_PROXY``。原因：httpx
+    0.27.0 解析 ``NO_PROXY`` 时，带括号的 IPv6（如 ``[::1]``，Windows 常见默认值）
+    不被识别为 IPv6，落进通配域名分支拼出 ``all://*[::1]``，``URLPattern`` 把
+    ``:1]`` 当端口 → **构造客户端即抛 ``InvalidURL``** —— 请求还没发、SSRF 闸门
+    还没跑，整条出站就崩了，且错误形状像 URL 问题，排查会往 URL 上找。环境代理
+    是全局、可被任意进程污染、格式不受我们控制的变量，不该让一条安全出站路径的
+    可用性押在它上面。
+
+    需要代理时改用项目已有的**显式**配置 ``settings.crawl_proxy``（与浏览器采集
+    同一旋钮，见 ``app/crawlers/browser.py``）：由管理员配置、格式可控，设了就走它，
+    没设就直连。代价：依赖环境 ``HTTP_PROXY`` 的部署不再被本路径自动读取 —— 这是
+    刻意的，把「隐式、会崩」换成「显式、可控」。``crawl_proxy`` 必须是合法代理 URL
+    （``http://host:port`` 或 ``http://user:pass@host:port``）。
+
+    安全性不变：每一跳仍在**发出请求之前**做 scheme 白名单 + DNS 解析后判内网，
+    ``follow_redirects=False`` 不变。走代理时由代理端建连，DNS rebinding 残余风险
+    与直连路径同类（见模块 docstring），不新增绕过闸门的通道。
     """
     import httpx  # 延迟导入：本模块其余部分只依赖标准库
+    from app.config import settings  # 延迟导入：取显式代理旋钮，避免模块级依赖 config
 
+    proxy = settings.crawl_proxy or None
     current = url
     async with httpx.AsyncClient(
-        timeout=timeout, follow_redirects=False, headers=headers or {}
+        timeout=timeout, follow_redirects=False, headers=headers or {},
+        trust_env=False, proxy=proxy,
     ) as client:
         for _ in range(MAX_REDIRECTS + 1):
             current = await assert_safe_url_async(current)

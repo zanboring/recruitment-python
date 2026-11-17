@@ -291,3 +291,103 @@ async def test_接口层返回400且带明确原因(client, db_session, dns):
     )
     assert resp.status_code == 400
     assert "内网" in resp.json()["message"]
+
+
+# --------------------------------------------------------------------------
+# 8. 抗非法代理环境（回归 20261120）：NO_PROXY 含 [::1] 不再让出站全崩
+# --------------------------------------------------------------------------
+#
+# 背景：httpx 0.27.0 解析 NO_PROXY 时，带括号的 IPv6（[::1]，Windows 常见默认值）
+# 不被识别为 IPv6，落进通配域名分支拼出 all://*[::1]，URLPattern 把 :1] 当端口 →
+# **构造客户端即抛 InvalidURL**，请求没发、SSRF 闸门没跑就全崩。修复：safe_get
+# 构造客户端 trust_env=False 隔离环境代理，代理改用显式 settings.crawl_proxy。
+# 这一组锁三件事：①非法 NO_PROXY 下走到闸门、明确失败而非意外崩溃；②隔离是刻意的
+# （trust_env=False）；③企业代理不因隔离而失效（crawl_proxy 仍被采用）。
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "no_proxy",
+    [
+        "[::1]",
+        "localhost,.localhost,127.0.0.1,127.0.0.0/8,[::1],::1",  # 本机机器级原值
+        "[::1],::1",
+    ],
+)
+async def test_非法NO_PROXY下safe_get不崩溃_内网目标仍被闸门拒绝(dns, monkeypatch, no_proxy):
+    """任务书要求的核心形状：非法 NO_PROXY 下，safe_get 的行为是「明确失败」
+    （UnsafeURLError，SSRF 拒绝）而不是「意外崩溃」（InvalidURL，构造期炸）。
+
+    刻意**不桩** httpx.AsyncClient —— 让真实构造发生，那正是崩溃点。
+    127.0.0.1 是 IP 字面量，闸门在发出任何请求之前就拒，全程离线。
+    """
+    dns()
+    monkeypatch.setenv("NO_PROXY", no_proxy)
+    monkeypatch.setenv("no_proxy", no_proxy)
+    with pytest.raises(UnsafeURLError, match="内网/本机"):
+        await safe_get("http://127.0.0.1:9/")
+
+
+@pytest.mark.asyncio
+async def test_safe_get构造客户端时隔离环境代理(dns, monkeypatch):
+    """锁住修复机制：无论环境 NO_PROXY 多非法，safe_get 都必须 trust_env=False，
+    且保持 follow_redirects=False（不跟随重定向的安全约束不被顺手改掉）。
+    用 spy 记录真实传给 httpx.AsyncClient 的 kwargs。"""
+    dns()
+    monkeypatch.setenv("NO_PROXY", "[::1]")
+    import httpx
+
+    captured = {}
+
+    def spy(*a, **k):
+        captured.update(k)
+        return _FakeClient([_FakeResp(200, text="ok")])
+
+    monkeypatch.setattr(httpx, "AsyncClient", spy)
+    await safe_get("http://jobs.example.com/job/1")
+    assert captured.get("trust_env") is False, "必须隔离环境代理，否则非法 NO_PROXY 会崩"
+    assert captured.get("follow_redirects") is False, "不跟随重定向的约束不能被改掉"
+
+
+@pytest.mark.asyncio
+async def test_显式crawl_proxy被采用_环境代理仍被隔离(dns, monkeypatch):
+    """企业代理不因隔离环境而失效：设了 settings.crawl_proxy 就走它（显式、可控），
+    同时 trust_env 仍为 False（不读会崩的环境代理）。这是「代理取舍」的另一半：
+    丢掉隐式环境代理，保留显式配置代理。"""
+    from app.config import settings
+
+    dns()
+    monkeypatch.setenv("NO_PROXY", "[::1]")
+    monkeypatch.setattr(settings, "crawl_proxy", "http://127.0.0.1:8888")
+    import httpx
+
+    captured = {}
+
+    def spy(*a, **k):
+        captured.update(k)
+        return _FakeClient([_FakeResp(200, text="ok")])
+
+    monkeypatch.setattr(httpx, "AsyncClient", spy)
+    await safe_get("http://jobs.example.com/job/1")
+    assert captured.get("proxy") == "http://127.0.0.1:8888", "显式代理必须被传给客户端"
+    assert captured.get("trust_env") is False, "即便有显式代理，也不读会崩的环境代理"
+
+
+@pytest.mark.asyncio
+async def test_非法NO_PROXY下公网目标真实构造不崩溃(dns, monkeypatch):
+    """公网目标 + 非法 NO_PROXY：真实构造 httpx 客户端（子类继承真 __init__，
+    只把 get 换成离线替身）不得在构造期崩。修复前 trust_env 默认 True 会读
+    NO_PROXY=[::1] 直接 InvalidURL；修复后 trust_env=False 构造成功、正常取回。"""
+    dns()
+    monkeypatch.setenv("NO_PROXY", "[::1]")
+    import httpx
+
+    RealClient = httpx.AsyncClient
+
+    class _RealBuildFakeGet(RealClient):
+        async def get(self, url):
+            return _FakeResp(200, text="ok")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _RealBuildFakeGet)
+    resp = await safe_get("http://jobs.example.com/job/1")
+    assert resp.status_code == 200

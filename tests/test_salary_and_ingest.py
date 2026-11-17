@@ -151,6 +151,10 @@ def test_clean_job_data_截断超长描述():
         ("Go开发工程师", "golang 微服务", "Go", None),
         ("C++工程师", "C++ QT 开发", "C++", None),
         ("Node.js后端", "node.js express", "Node.js", None),
+        # 「JavaScript」里含 "Java"：按长度 ≤3 判边界时 Java（4 字母）走子串，
+        # 于是每条提到 JavaScript 的量化/前端岗位都多一个 Java 标签。
+        ("python量化开发工程师", "掌握基础前端开发能力（HTML / CSS / JavaScript）", "Python", "Java"),
+        ("Java开发工程师", "熟悉 Java、SpringBoot，三年以上经验", "Java", None),
     ],
 )
 def test_技能抽取按词边界匹配(title, desc, expected_in, expected_not_in):
@@ -160,3 +164,14 @@ def test_技能抽取按词边界匹配(title, desc, expected_in, expected_not_i
         assert expected_not_in not in skills.split(","), (
             f"{skills} 不应包含 {expected_not_in}（短词命中了别的单词内部）"
         )
+
+
+def test_技能抽取允许数字紧邻_Python3仍是Python():
+    """数字不是"另一个词"：``Python3`` / ``MySQL8.0`` 是同一项技能的不同写法。
+
+    修 Java/JavaScript 时如果直接把边界写成「不许紧邻字母或数字」，
+    ``Python3``、``MySQL8.0`` 这类常见写法会整批漏掉 —— 这里把它锁住。
+    """
+    skills = extract_skills("后端开发", "熟悉 Python3 与 MySQL8.0，有两年经验").split(",")
+    assert "Python" in skills
+    assert "MySQL" in skills
