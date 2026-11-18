@@ -1,7 +1,7 @@
 # 已知边界与验证状态
 
 > 这份文件区分「实现到什么程度」和「验证到什么程度」。每条都能指到代码位置、原始命令或审计报告；没有证据的不写。
-> 数据口径来自 2026-11-11 只读快照 `recsys.db`（`mode=ro`）；代码对照只读副本 HEAD `880e2d7`。
+> 数据口径来自 2026-11-11 只读快照 `recsys.db`（`mode=ro`）；代码对照只读副本 HEAD `e18b7ae`。
 > 本文件只记录现状，不含待办计划。
 > 相关运行手册：[`backfill-playbook.md`](backfill-playbook.md)（回填脚本准入条件、参数、红线与 resume 边界）。
 
@@ -23,7 +23,7 @@
 | 看板 / 图表展示 | 完整（前端调用链已逐行核对） | 代码静态核对 + 只读 SQL；未起服务 | 平均薪资、企业数量、分析摘要、DataCompare 四处展示缺陷已修；残留口径不一致见 §11 |
 | 声明式规格引擎 | 部分（HTML / CSS / JSON 路径） | 抽取层在公开示例上验证过；真实招聘站未打通 | `type: api` 禁止 `detail.*`；已登记 boss / 51job / quotes_demo，51job 搜索接口被 WAF 拦在 HTML |
 | RAG 问答 | 完整 | 代码静态核对 | 知识库 21 条，与岗位库独立；不能回答「这条岗位具体要求什么」 |
-| 测试基线 | 完整 | 文档声明 1187 项 / 75 个测试文件；本工位未复跑 collect-only | 75 个测试文件为静态实测；1187 项含 parametrize 展开，读源码数不出，数字以 `docs/showcase.md` 声明为准 |
+| 测试基线 | 完整 | 文档声明 1207 项 / 75 个测试文件；本工位未复跑 collect-only | 75 个测试文件为静态实测；1207 项含 parametrize 展开，读源码数不出，数字以 `docs/showcase.md` 声明为准 |
 
 ## 二、逐条说明
 
@@ -60,7 +60,7 @@
 
 - **实际到哪一步**：compose 默认 2 worker 共享一个 SQLite 文件（`docker-compose.yml:27` `--workers ${BACKEND_WORKERS:-2}`、`:30` sqlite）。仓库内并发写用例全部是单进程 asyncio；跨进程写锁路径零用例。
 - **证据**：
-  - `tests/` 目录 grep `workers|multiprocessing|Process(|Popen|fork` 0 命中；唯一并发写用例 `tests/test_crawler_validation.py:1030` 8 个协程共用同一 engine；`scripts/stress_sqlite_writes.py:159` 同样 `asyncio.gather`。
+  - `tests/` 目录 grep `workers|multiprocessing|Process(|Popen|fork` 0 命中；唯一并发写用例 `tests/test_crawler_validation.py:1030` 8 个协程共用同一 engine；`scripts/stress_sqlite_writes.py:304` 同样 `asyncio.gather`。
   - 缓解只有 `busy_timeout=30s`（`app/database.py:152`）；`app/database.py:106-108` 记录仍会失败的情形，根治需 `BEGIN IMMEDIATE`，未做。
   - 同源默认配置代价：2 worker 下进程内 APScheduler 每个 worker 各起一份，定时爬取 / 日报重复触发（`docker-compose.yml:62-68` 注释）。
 - **现在怎么讲**：2 worker × SQLite 的跨进程写表现未验证；不要讲「已压测」「已验证」。
@@ -69,7 +69,7 @@
 
 - **实际到哪一步**：关键词 / 语义 / 混合三策略与黄金集（20 知识 / 28 查询）完整。2026-11-16 用本机 `qwen3-embedding:0.6b` 跑 `scripts/eval_rag.py`，两个数字均复现（语义型子集 93.8%、整体 96.4%），与补记一致。**换模型前**的 43.8% / 67.9% 因旧模型未安装，仍只有人背书。
 - **证据**：
-  - `docs/reports/rag-evaluation.md:26-27`（脚本生成：语义 64.3%、混合 67.9%）、`:34-35`（分类别：keyword 语义型 0.0%、semantic 43.8%、hybrid 43.8%）；生成时间 2026-09-11，旧模型 `nomic-embed-text`。
+  - `docs/reports/rag-evaluation.md:26-27`（脚本生成：语义 64.3%、混合 67.9%）、`:33-35`（分类别：keyword 语义型 0.0%、semantic 43.8%、hybrid 43.8%）；生成时间 2026-09-11，旧模型 `nomic-embed-text`。
   - `docs/reports/rag-evaluation-history.md:16-17`（43.8%→93.8%、67.9%→96.4%）、`:25-26`（只有人工背书，无明细 / 表格 / 原始产物）、`:30-58`（本轮复现记录与命令）。
 - **现在怎么讲**：93.8% / 96.4% 已于 2026-11-16 复现，可说「脚本可复现」；**换模型前**的 43.8% / 67.9% 仍只有人背书。主报告 `rag-evaluation.md` 里可复现的那组数字对应旧模型，新模型的复现记录在 `rag-evaluation-history.md:30-58`。
 
@@ -89,9 +89,9 @@
 
 - **实际到哪一步**：`--max-consecutive-blocked` 止损参数在登录墙稳态下原本结构性不可达；现已在 latch 置位后唯一还会走的搜索兜底路径上补了两层结构化风控判据，连续被拦计数能涨到阈值并真的停批。修复只在打桩传输层 + 单测上验证过，没有对真实站点跑全库。
 - **修复点**（`app/crawlers/detail_fetcher.py`）：
-  - `_collect` 全量收下接口响应（含 WAF / 登录页 HTML），不再只收 JSON 形态（`:709-721`）。
-  - 搜索页页面层判一次（URL / title / 骨架 / 403·429，`:764-771`；判为 WAF 时 `mark_blocked()`，`:769-770`）。
-  - 接口响应再判一次（`:774-780`；WAF 时 `mark_blocked()`，`:778-779`）。
+  - `_collect` 全量收下接口响应（含 WAF / 登录页 HTML），不再只收 JSON 形态（`:727-739`）。
+  - 搜索页页面层判一次（URL / title / 骨架 / 403·429，`:782-789`；判为 WAF 时 `mark_blocked()`，`:788`）。
+  - 接口响应再判一次（`:792-798`；WAF 时 `mark_blocked()`，`:797`）。
   - 阈值语义：`BLOCKED_KINDS = (waf, login_wall)`（`:104-117`）；脚本只在最终分类属于 blocked 类别时累加连续计数，成功 / network / parse / no_field 都清零（`scripts/backfill_detail.py:491`，停批 `:509-517`）。
 - **实测证据**：`deliveries/archive-20261116c/codebuddy-REPORT-第8轮.md` §2.1 —— 阈值设 3，第 3 条停批、退出码 4、静态详情请求仅 1 次、分类 1 条 login_wall + 2 条 waf；§2.3 负向用例：`no_field` 连打 8 条不停、退出码 0。全量 1177 passed / 0 failed（该报告 §2.4）。
 - **未覆盖**：同报告 §三.1 自陈网络出口是替身（登录页 + WAF 页形状取自 2026-11-12 实测样本），未对 51job 真站跑全库；真站 WAF 形态若改版，判据需跟着加新标记。
@@ -108,7 +108,7 @@
     但库内 `skills` 列**未同步**：270 条里只有 15 条与 `extract_skills(title, job_desc)` 结果完全一致。
     即：正文已具备，技能收益尚未落库——这是当前最值得做的一次性补算。
 - **证据**：
-  - `app/crawlers/cleaner.py:7-18` 词表；`:144` `extract_skills`；`:150` 匹配文本 = 标题 + 描述；`:163` 上限 8 个。
+  - `app/crawlers/cleaner.py:7-18` 词表；`:146` `extract_skills`；`:152` 匹配文本 = 标题 + 描述；`:165` 上限 8 个。
   - `app/services/job_service.py:31` `VISIBLE_STATUSES = ("NEW", "ACTIVE")`；`app/recommender/analyzer.py:129`（候选池 `in_(["NEW","ACTIVE"])`）、`:134-142`（按 `skills`/`title` LIKE 过滤）、`:156`（技能相似度权重 0.7 / 学历 0.2 / 经验 0.1）。
   - `app/services/skill_profile.py:20,:91`（画像取 `VISIBLE_STATUSES`）、`:101-103`（无 `skills` 直接跳过）。
   - 快照命令：在架 42、有标签 13（`select count(*) from job where job_status='ACTIVE' and skills is not null and skills<>'';`）；在架技能去重仅 Python 8 / Java 4 / 数据分析 2。
@@ -148,15 +148,15 @@
 | F3 | 部分修：状态文件损坏 / 顶层非对象 → `StateFileError`，退出码 7，原文件一字不动（`scripts/backfill_detail.py:267-273,:390-395`）；状态文件记录所属库，跨库 resume 拒绝（`:274-279`，写 `db` 字段 `:397`）；状态文件 `.tmp` + `os.replace` 原子写（`:285-295`），旧格式（无 `db`）仍可读。未做：人工备份回滚后的 `ok` 行不补齐——脚本无 restore 入口（`deliveries/archive-20261116c/trae-REPORT-第8轮.md` §六.2） |
 | F4 | 已修：备份改 `sqlite3.Connection.backup()` 在线接口（`backfill_detail.py:205`）；副本上跑 `PRAGMA integrity_check`，非 `ok` 抛 `BackupError`（`:206-208`）；生命周期：校验通过保留，校验不过 / 复制异常立刻删半截文件并中止，退出码 5（`:186-190,:218-220,:427-432`）；路径 `<库名>.bak-<时间戳>`，同秒碰撞加序号（`:194-198`） |
 | F5 | 已修：脚本连接 `timeout=30` + 显式 `PRAGMA busy_timeout=30000`，与 ORM 30 秒对齐（`backfill_detail.py:120-123,:152-158`）；等满 30 秒拿不到写锁 = 明确失败不重试，退出码 6（`:539-547`）；批量层接 `OperationalError` / 其他 Exception，先 rollback 本条未提交写入（`:539-552`）；汇总在 `finally` 必出（`:553-563`）；覆盖率查询单独 try/except（`:568-578`）；`main()` 三层兜底：`KeyboardInterrupt`→130、`sqlite3.Error`→6/1、其他→1（`:646-663`） |
-| F7 | 已修：静态路径调风控判据时传 `<title>`（`_html_title` `app/crawlers/detail_fetcher.py:153`；调用点 `:548-549`），与渲染路径一致 |
+| F7 | 已修：静态路径调风控判据时传 `<title>`（`_html_title` `app/crawlers/detail_fetcher.py:153`；调用点 `:567`），与渲染路径一致 |
 | F8 | 部分前移：红线校验挪到每条 commit 之前，本条可随事务回滚（`_verify_one_status` `backfill_detail.py:298-313`，调用 `:466-471`）；批次结束后保留一次全量复核（`:600-607`）。退出码 3 时之前已提交的行仍无法自动撤销（`:601-604`，`deliveries/archive-20261116c/trae-REPORT-第8轮.md` §六.4） |
-| F9 | 部分缓解：F1 核心路径用真 `fetch()` + 真 `run()`、仅打桩网络出口（`tests/test_detail_fetcher.py:1183-1360`）；其余批量用例仍建 8 列小表（`:388-404`）并回放替身结果（`:407-425`） |
+| F9 | 部分缓解：F1 核心路径用真 `fetch()` + 真 `run()`、仅打桩网络出口（`tests/test_detail_fetcher.py:1183-1373`）；其余批量用例仍建 8 列小表（`:388-404`）并回放替身结果（`:407-425`） |
 
 ### 13. 测试基线与文档契约
 
-- **文档声明**：`docs/showcase.md:28` 写 **1187 项，全部通过**（75 个测试文件）；`:63` 写「1187 项全绿」；`:31` 标注口径为测试数取 `pytest` 汇总行、文件数按 `tests/test_*.py` 计。
-- **本工位可静态核对**：`tests/test_*.py` 共 75 个文件；源码内 `def test_` 1033 个、`@pytest.mark.parametrize` 37 处（参数化会展开，读源码数不出总条数）。
-- **未本地复跑**：本工位全局 Python 缺 `pytest` / `pydantic` / `fastapi`，`scripts/check_docs.py` 与 `pytest --collect-only` 起不来；1187 项未在本工位重跑，数字以 `showcase.md` 声明与各轮报告口径为准（archive-c codebuddy F1 轮 1177、trae 轮 1180、showcase 最终声明 1187）。
+- **文档声明**：`docs/showcase.md:28` 写 **1207 项，全部通过**（75 个测试文件）；`:63` 写「1207 项全绿」；`:31` 标注口径为测试数取 `pytest` 汇总行、文件数按 `tests/test_*.py` 计。
+- **本工位可静态核对**：`tests/test_*.py` 共 75 个文件；源码内 `def test_` 1048 个、`@pytest.mark.parametrize` 38 处（参数化会展开，读源码数不出总条数）。
+- **未本地复跑**：本工位全局 Python 缺 `pytest` / `pydantic` / `fastapi`，`scripts/check_docs.py` 与 `pytest --collect-only` 起不来；1207 项未在本工位重跑，数字以 `showcase.md` 声明与各轮报告口径为准（archive-c codebuddy F1 轮 1177、trae 轮 1180、showcase 最终声明 1207）。
 
 ### 14. 回填已可执行，并在真实站点跑过一批
 
@@ -203,7 +203,7 @@
 ## 四、明确未做的事（取舍，不是缺陷）
 
 - **薪资预测未做数据训练模型**：系数表硬编码在 `app/recommender/salary_predictor.py:1-30`，定位是规则估算。
-- **技能抽取未做语义理解**：封闭词表字面命中（`app/crawlers/cleaner.py:7-18,:163`）；「抽不到」不等于「岗位不需要」。
+- **技能抽取未做语义理解**：封闭词表字面命中（`app/crawlers/cleaner.py:7-18,:165`）；「抽不到」不等于「岗位不需要」。
 - **RAG 未接入岗位库**：`app/services/knowledge_service.py` 无 `Job` 导入或查询；问答范围限于知识库 21 条。
 - **多 worker 进程内调度重复触发**：compose 默认开启进程内调度，2 worker 下每个 worker 各起一份；compose 注释给出的规避方式是生产环境关闭进程内调度（`docker-compose.yml:62-68`）。
 - **端到端接口未在审计中起服务验证**：能力矩阵结论来自代码阅读 + 只读 SQL 统计，未启动服务做 `/api/jobs/recommend`、`/skill-profile`、`/stat/*` 前后对照（`deliveries/archive-20261113/trae-REPORT-第4轮内容-第5轮未交付.md` §5.5）。
@@ -223,7 +223,7 @@
   但不再逐行提交，1 万行实测 **32.37s → 0.17s**；计数恒等式
   `success + skip + fail + skipped_empty == total` 在异常路径下仍成立。
 
-测试基线同步 **1187 → 1206**（qoder 4 条契约用例 + codebuddy 2 条导入用例）。
+测试基线同步 **1187 → 1207**（qoder 4 条契约用例 + codebuddy 2 条导入用例）。
 
 ## 六、2026-11-17 补记：skills 列已重算
 

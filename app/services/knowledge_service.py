@@ -408,4 +408,19 @@ class KnowledgeService:
                 (KnowledgeBase.source != "manual") | (KnowledgeBase.source.is_(None))
             )
         )
-        return {"total": total, "enabled": enabled, "manual": manual, "auto": auto}
+        # 「总使用次数」：知识条目被 RAG 命中的累计次数。
+        # 2026-11-21 补：前端 admin/KnowledgeBase.vue 一直在读 stats.totalUsage，
+        # 但这里从不返回，卡片恒空。usage_count 是**真在被维护**的字段
+        # （真库 21 条：13 条 0 次、6 条 1 次、2 条 2 次，合计 10），
+        # 所以补一个真指标，而不是把卡片删掉。
+        # COALESCE：空知识库时 SUM 返回 NULL，不能让接口吐 null 给前端。
+        total_usage = await db.scalar(
+            select(func.coalesce(func.sum(KnowledgeBase.usage_count), 0))
+        )
+        return {
+            "total": total,
+            "enabled": enabled,
+            "manual": manual,
+            "auto": auto,
+            "total_usage": int(total_usage or 0),
+        }

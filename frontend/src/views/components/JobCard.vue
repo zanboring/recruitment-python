@@ -51,11 +51,15 @@
           @click.stop="openOriginalUrl" class="view-original-btn">
           <el-icon><Link /></el-icon>{{ originalUrlLabel }}
         </el-button>
-        <!-- 【方案A增量】有本地详情时显示"查看本地详情"按钮 -->
-        <el-button v-if="hasDetailHtml" type="success" link size="small"
-          @click.stop="showLocalDetail" class="view-local-btn">
-          <el-icon><Document /></el-icon>本地详情
-        </el-button>
+        <!-- 本地详情快照：库内 detail_html 非空为 0/555，且列表接口按设计不带该字段。
+             旧实现用 props.job.detailHtml 决定是否显示按钮 → 恒 false → 入口永远不出现；
+             直接改成按需请求又会给 555 张卡片制造 555 次无效请求。
+             这里保留一个禁用按钮说明"暂不可用"，不放点了没反应的入口。 -->
+        <el-tooltip content="原平台详情页快照需登录采集，当前暂不可用" placement="top">
+          <el-button disabled type="success" link size="small" class="view-local-btn">
+            <el-icon><Document /></el-icon>本地详情（暂无）
+          </el-button>
+        </el-tooltip>
         <!-- 【方案A增量】下架岗位显示"查找类似岗位"按钮，引导用户搜索同类岗位 -->
         <el-button v-if="isOffline" type="warning" link size="small"
           @click.stop="$emit('click', job)" class="view-similar-btn">
@@ -66,56 +70,23 @@
     </div>
   </el-card>
 
-  <!-- 【方案A增量】本地详情弹窗 -->
-  <el-dialog
-    v-model="localDetailVisible"
-    title="本地岗位详情（原平台页面快照）"
-    width="80%"
-    :destroy-on-close="true"
-  >
-    <div v-if="localDetailHtml" v-html="sanitizedDetailHtml" class="local-detail-content"></div>
-    <div v-else>加载中...</div>
-  </el-dialog>
 </div>
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed } from 'vue';
 import { OfficeBuilding, Location, Reading, Clock, Document, Link, Search } from '@element-plus/icons-vue';
 import { isPreciseJobSourceUrl } from '@/utils/jobSourceUrl';
-import { getJobDetailHtml } from '@/api/job';
-import { sanitizeSnapshotHtml } from '../utils/sanitize';
 
 interface JobItem {
   id: number; title: string; companyName?: string; sourceSite: string;
   jobStatus: string; city: string; experience: string; education: string;
   minSalary?: number | string; maxSalary?: number | string; salaryUnit: string;
   skills: string; jobDesc?: string; url?: string; publishTime?: string;
-  detailHtml?: string; // 新增：本地存储的详情页HTML
 }
 
 const props = defineProps<{ job: JobItem }>();
 const emit = defineEmits<{ click: [job: JobItem] }>();
-
-// ===== 方案A：本地详情弹窗控制 =====
-const localDetailVisible = ref(false);
-const localDetailHtml = ref('');
-
-/** 是否有本地存储的详情HTML */
-const hasDetailHtml = computed(() => {
-  return props.job.detailHtml != null && props.job.detailHtml.trim().length > 0;
-});
-
-/**
- * 详情快照消毒：**最严格档**，连内联 style 都剥掉。
- *
- * 这里是第三方页面快照（原平台详情页），内容完全不受我们控制：
- * 一段 `style="position:fixed;inset:0;z-index:99999"` 就能做全屏钓鱼遮罩，
- * 所以宁可牺牲还原度（由外层 .local-detail-content 的 CSS 兜底排版），
- * 也不放行 style。原实现只删 script 和 on* 属性，`<iframe src=//evil>`、
- * `<meta http-equiv=refresh>` 全部能过。详见 utils/sanitize.ts
- */
-const sanitizedDetailHtml = computed(() => sanitizeSnapshotHtml(localDetailHtml.value));
 
 // ===== 计算属性 =====
 
@@ -204,28 +175,6 @@ const openOriginalUrl = () => {
 /** 卡片点击事件：触发父组件的点击处理 */
 const handleCardClick = (job: JobItem) => {
   emit('click', job);
-};
-
-/** 显示本地存储的详情页HTML */
-const showLocalDetail = async () => {
-  // 如果本地已有缓存，直接显示
-  if (localDetailHtml.value) {
-    localDetailVisible.value = true;
-    return;
-  }
-  // 否则从后端获取详情HTML
-  try {
-    const res = await getJobDetailHtml(props.job.id);
-    // 拦截器（api/http.ts）已 `return res.data`，拿到的就是业务对象本身，
-    // 这里再 `.data` 会恒为 undefined —— 可选链不报错，表现为「详情弹窗永远空白」。
-    localDetailHtml.value = res?.detailHtml || '';
-    localDetailVisible.value = true;
-  } catch (err) {
-    console.error('获取本地详情失败：', err);
-    // 如果后端没有存储，则尝试直接渲染job对象中的detailHtml字段
-    localDetailHtml.value = props.job.detailHtml || '';
-    localDetailVisible.value = true;
-  }
 };
 
 </script>
