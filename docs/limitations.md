@@ -23,7 +23,7 @@
 | 看板 / 图表展示 | 完整（前端调用链已逐行核对） | 代码静态核对 + 只读 SQL；未起服务 | 平均薪资、企业数量、分析摘要、DataCompare 四处展示缺陷已修；残留口径不一致见 §11 |
 | 声明式规格引擎 | 部分（HTML / CSS / JSON 路径） | 抽取层在公开示例上验证过；真实招聘站未打通 | `type: api` 禁止 `detail.*`；已登记 boss / 51job / quotes_demo，51job 搜索接口被 WAF 拦在 HTML |
 | RAG 问答 | 完整 | 代码静态核对 | 知识库 21 条，与岗位库独立；不能回答「这条岗位具体要求什么」 |
-| 测试基线 | 完整 | 文档声明 1207 项 / 75 个测试文件；本工位未复跑 collect-only | 75 个测试文件为静态实测；1207 项含 parametrize 展开，读源码数不出，数字以 `docs/showcase.md` 声明为准 |
+| 测试基线 | 完整 | 文档声明 1211 项 / 75 个测试文件；本工位未复跑 collect-only | 75 个测试文件为静态实测；1211 项含 parametrize 展开，读源码数不出，数字以 `docs/showcase.md` 声明为准 |
 
 ## 二、逐条说明
 
@@ -108,7 +108,7 @@
     但库内 `skills` 列**未同步**：270 条里只有 15 条与 `extract_skills(title, job_desc)` 结果完全一致。
     即：正文已具备，技能收益尚未落库——这是当前最值得做的一次性补算。
 - **证据**：
-  - `app/crawlers/cleaner.py:7-18` 词表；`:146` `extract_skills`；`:152` 匹配文本 = 标题 + 描述；`:165` 上限 8 个。
+  - `app/crawlers/cleaner.py:7-18` 词表；`:151` `extract_skills`；`:185-186` 匹配文本 = 标题 + 描述；`:148` 上限 8 个。
   - `app/services/job_service.py:31` `VISIBLE_STATUSES = ("NEW", "ACTIVE")`；`app/recommender/analyzer.py:129`（候选池 `in_(["NEW","ACTIVE"])`）、`:134-142`（按 `skills`/`title` LIKE 过滤）、`:156`（技能相似度权重 0.7 / 学历 0.2 / 经验 0.1）。
   - `app/services/skill_profile.py:20,:91`（画像取 `VISIBLE_STATUSES`）、`:101-103`（无 `skills` 直接跳过）。
   - 快照命令：在架 42、有标签 13（`select count(*) from job where job_status='ACTIVE' and skills is not null and skills<>'';`）；在架技能去重仅 Python 8 / Java 4 / 数据分析 2。
@@ -154,9 +154,9 @@
 
 ### 13. 测试基线与文档契约
 
-- **文档声明**：`docs/showcase.md:28` 写 **1207 项，全部通过**（75 个测试文件）；`:63` 写「1207 项全绿」；`:31` 标注口径为测试数取 `pytest` 汇总行、文件数按 `tests/test_*.py` 计。
+- **文档声明**：`docs/showcase.md:28` 写 **1211 项，全部通过**（75 个测试文件）；`:63` 写「1211 项全绿」；`:31` 标注口径为测试数取 `pytest` 汇总行、文件数按 `tests/test_*.py` 计。
 - **本工位可静态核对**：`tests/test_*.py` 共 75 个文件；源码内 `def test_` 1048 个、`@pytest.mark.parametrize` 38 处（参数化会展开，读源码数不出总条数）。
-- **未本地复跑**：本工位全局 Python 缺 `pytest` / `pydantic` / `fastapi`，`scripts/check_docs.py` 与 `pytest --collect-only` 起不来；1207 项未在本工位重跑，数字以 `showcase.md` 声明与各轮报告口径为准（archive-c codebuddy F1 轮 1177、trae 轮 1180、showcase 最终声明 1207）。
+- **未本地复跑**：本工位全局 Python 缺 `pytest` / `pydantic` / `fastapi`，`scripts/check_docs.py` 与 `pytest --collect-only` 起不来；1211 项未在本工位重跑，数字以 `showcase.md` 声明与各轮报告口径为准（archive-c codebuddy F1 轮 1177、trae 轮 1180、showcase 最终声明 1211）。
 
 ### 14. 回填已可执行，并在真实站点跑过一批
 
@@ -203,7 +203,7 @@
 ## 四、明确未做的事（取舍，不是缺陷）
 
 - **薪资预测未做数据训练模型**：系数表硬编码在 `app/recommender/salary_predictor.py:1-30`，定位是规则估算。
-- **技能抽取未做语义理解**：封闭词表字面命中（`app/crawlers/cleaner.py:7-18,:165`）；「抽不到」不等于「岗位不需要」。
+- **技能抽取未做语义理解**：封闭词表字面命中（`app/crawlers/cleaner.py:7-18,:148`）；「抽不到」不等于「岗位不需要」。
 - **RAG 未接入岗位库**：`app/services/knowledge_service.py` 无 `Job` 导入或查询；问答范围限于知识库 21 条。
 - **多 worker 进程内调度重复触发**：compose 默认开启进程内调度，2 worker 下每个 worker 各起一份；compose 注释给出的规避方式是生产环境关闭进程内调度（`docker-compose.yml:62-68`）。
 - **端到端接口未在审计中起服务验证**：能力矩阵结论来自代码阅读 + 只读 SQL 统计，未启动服务做 `/api/jobs/recommend`、`/skill-profile`、`/stat/*` 前后对照（`deliveries/archive-20261113/trae-REPORT-第4轮内容-第5轮未交付.md` §5.5）。
@@ -223,7 +223,7 @@
   但不再逐行提交，1 万行实测 **32.37s → 0.17s**；计数恒等式
   `success + skip + fail + skipped_empty == total` 在异常路径下仍成立。
 
-测试基线同步 **1187 → 1207**（qoder 4 条契约用例 + codebuddy 2 条导入用例）。
+测试基线同步 **1187 → 1211**（qoder 4 条契约用例 + codebuddy 2 条导入用例）。
 
 ## 六、2026-11-17 补记：skills 列已重算
 
@@ -244,3 +244,23 @@
 
 **仍有的局限**：抽取仍是词表字面命中（66 词，单条上限 8），不做语义理解；
 正文提到某词不等于岗位要求它，误报未做人工标注评估。`detail_html` 仍 0/555。
+
+## 七、2026-11-18 补记：`job_desc` 有半数是标题本身
+
+trae 在短文岗位专项里查出一个影响口径的事实，集成端已用 SQL 复核：
+
+| 项 | 实测（555 行） |
+|---|---|
+| `job_desc == title`（原样相等） | **273 条（49.2%）** |
+| 正文 >200 字符 | 270 条 |
+| 正文 >200 **且** ≠ title | **270 条（即 270 条全是独立正文）** |
+| 正文 ≤200 | 285 条 |
+
+**怎么读这组数**：
+- 「完整正文 270」这个数字是**准的**，没有被标题污染——270 条全部 `job_desc != title`。
+- 但反过来说：**555 行里 273 行（49.2%）的"正文"就是标题本身**，这些岗位除了标题没有任何描述。
+- 所以「有一半岗位只有标题信息」是当前数据的真实状态。短文岗位的 `skills` 完全来自标题命中，
+  这解释了为什么它们的标签"精确率 100%"——判定口径上只能算标题命中。
+
+**对展示的影响**：技能分布、推荐、画像里，约一半岗位的证据只有标题。
+不要对外讲「基于岗位描述做画像」——准确说法是「基于标题 + 部分岗位的描述」。

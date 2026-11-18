@@ -109,7 +109,6 @@ const sourceType = computed(() => {
 
 const skillList = computed(() => (props.job.skills || '').split(',').filter(s => s.trim()));
 
-const hasOriginalUrl = computed(() => isPreciseJobSourceUrl(props.job.url));
 // 任何非空 URL 都能跳转：详情页显示「查看原岗」，搜索页/演示数据显示「搜索同类」
 const hasAnyUrl = computed(() => !!props.job.url && props.job.url.trim().length > 0);
 const originalUrlLabel = computed(() => (isPreciseJobSourceUrl(props.job.url) ? '查看原岗' : '搜索同类'));
@@ -163,7 +162,7 @@ const getSkillTagType = (index: number | string) => {
   return types[Number(index) % 4];
 };
 
-// ===== 方案A：跳转 + 本地详情逻辑 =====
+// ===== 跳转逻辑（原岗 / 同类搜索） =====
 
 /** 优先跳转原平台URL */
 const openOriginalUrl = () => {
@@ -234,7 +233,9 @@ const handleCardClick = (job: JobItem) => {
 
 /* 底部 */
 .job-footer { display: flex; justify-content: space-between; align-items: center; padding-top: 14px; border-top: 1px dashed var(--border-lighter); }
-.footer-left { display: flex; align-items: center; gap: 8px; }
+/* 禁用按钮恒显后，窄卡一行可能同时挤 4 个元素（来源 + 原岗 + 本地详情 + 类似岗位）。
+   加 wrap 让它们换行，而不是溢出卡片；未做窄屏目视，交集成端确认观感。 */
+.footer-left { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; }
 .view-original-btn { font-size: 12px; font-weight: 500; }
 /* 【方案A增量】类似岗位按钮样式 */
 .view-similar-btn { font-size: 12px; font-weight: 500; color: #e6a23c; }

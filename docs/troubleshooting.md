@@ -274,8 +274,8 @@ curl http://localhost:11434/api/tags
 | 条件 | 检查方式 | 出处 |
 |---|---|---|
 | 智谱 API Key 已配置 | 看 `.env` / `config.env` 里 `ZHIPUAI_API_KEY` 非空 | `app\services\vision_service.py` 第 138-142 行 |
-| 图片 ≤ 5 MB | 超出会直接 400 | `app\routers\jobs.py` 第 267 行 |
-| 是管理员账号 | 普通用户调用会 403 | `app\routers\jobs.py` 第 252 行 |
+| 图片 ≤ 5 MB | 超出会直接 400 | `app\routers\jobs.py` 第 268 行 |
+| 是管理员账号 | 普通用户调用会 403 | `app\routers\jobs.py` 第 247 行 |
 
 ### 报错怎么读
 
@@ -362,7 +362,7 @@ set JWT_SECRET=ci_only_secret_at_least_32_characters_long
 |---|---|
 | 启动命令 `uvicorn app.main:app --host 0.0.0.0 --port 8080` | `start.bat:61` |
 | `cd /d "%~dp0"`（切到项目根） | `start.bat:11` |
-| `SERVER_PORT` / `SERVER_HOST` 环境变量 | `run_entry.py:24,34` |
+| `SERVER_PORT` / `SERVER_HOST` 环境变量 | `run_entry.py:74,84` |
 | `server_port: int = 8080` | `app\config.py:405` |
 | `sqlite_target` 相对路径 → `./data/recsys.db` | `app\database.py:33-44` |
 | `SQLITE_BUSY_TIMEOUT_MS = 30000` | `app\database.py:115` |
@@ -382,8 +382,8 @@ set JWT_SECRET=ci_only_secret_at_least_32_characters_long
 | `ai_usage` 表 | `app\models\ai_usage.py:20` |
 | 熔断器 3 次失败 / 30 秒冷却 | `app\services\llm_client.py:36-41` |
 | `OLLAMA_ENABLED` 默认 true | `app\config.py:284` |
-| `vision-import` 接口与管理员鉴权 | `app\routers\jobs.py:246,252` |
-| 5MB 图片限制 | `app\routers\jobs.py:267` |
+| `vision-import` 接口与管理员鉴权 | `app\routers\jobs.py:241,247` |
+| 5MB 图片限制 | `app\routers\jobs.py:268` |
 | `VISION_MODEL = "glm-4v-flash"` | `app\services\vision_service.py:24` |
 | `max_tokens = 1024` | `app\services\vision_service.py:158` |
 | 401 → key 失效报错文案 | `app\services\vision_service.py:170-171` |

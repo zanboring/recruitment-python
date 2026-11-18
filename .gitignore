@@ -96,5 +96,6 @@ data/*.json
 
 # SQLite 回滚日志：进程被强杀时会残留，前 8 字节 magic=0 表示无需回滚，可直接删
 *.db-journal
-# 主库提升前的手工备份（2026-11-18 起用这个命名）
-data/*.pre-skills-*
+# 主库提升前的手工备份：命名随轮次变（pre-skills- / pre-2stage- …），按前缀统一拦
+# 漏改过一次：只写了 pre-skills-，结果 pre-2stage- 那份漏网显示成未跟踪
+data/*.pre-*

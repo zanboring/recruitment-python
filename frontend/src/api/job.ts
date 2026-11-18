@@ -175,14 +175,3 @@ export function skillProfile(data: { skills: string; city?: string; limit?: numb
   return http.post('/jobs/skill-profile', data);
 }
 
-/** 方案A：获取岗位本地详情页HTML */
-export interface JobDetailHtmlResult {
-  id: number;
-  detailHtml: string;
-  url?: string;
-}
-
-export function getJobDetailHtml(jobId: number): Promise<JobDetailHtmlResult> {
-  return http.get(`/jobs/${jobId}/detail-html`);
-}
-

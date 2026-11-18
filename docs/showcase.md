@@ -25,7 +25,7 @@
 | 接口规模 | 12 个路由模块 / **104 个 REST 端点**（其中 **103 个在 `/api` 下**） |
 | 业务服务 | 22 个（AI 编排、RAG、爬虫、推荐、日报、用量统计…） |
 | 数据库 | 连接串构造支持 SQLite / MySQL / PostgreSQL；**实测仅 SQLite**，MySQL 未验证，PostgreSQL 有一处 `func.date` 已知不兼容 |
-| **测试** | **1207 项，全部通过**（75 个测试文件，覆盖认证 / 爬虫 / AI 降级 / RAG 评估 / 限流 / 日报 / 空库边界 / 分布对账 / 视觉导入契约 / 安全默认值 / 打包完整性 / 文档契约） |
+| **测试** | **1211 项，全部通过**（75 个测试文件，覆盖认证 / 爬虫 / AI 降级 / RAG 评估 / 限流 / 日报 / 空库边界 / 分布对账 / 视觉导入契约 / 安全默认值 / 打包完整性 / 文档契约） |
 | 代码量 | 约 **1.8 万行 Python**（`app/`，实测 18,124 行）+ 约 **1.3 万行 Vue/TS**（`frontend/src/`，实测 13,104 行） |
 
 > 数字口径（2026-11-04 实测，可复现）：测试数取 `pytest` 汇总行；测试文件数按 `tests/test_*.py` 计
@@ -60,7 +60,7 @@ pip install -r requirements.txt
 cp .env.example .env           # 仅需填 DEEPSEEK_API_KEY（留空自动降级本地/规则引擎）
 python scripts/init_db.py      # 建表 + 播种 admin / admin123
 python run_entry.py            # 默认 http://127.0.0.1:8080，接口文档在 /docs
-python -m pytest -o addopts= -q   # 1207 项全绿，无需密钥即可跑通
+python -m pytest -o addopts= -q   # 1211 项全绿，无需密钥即可跑通
 ```
 
 > Windows 上也可以直接双击 `start.bat`（源码模式：自动建 venv、装依赖、建库、起服务并开浏览器）；

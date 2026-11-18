@@ -143,27 +143,69 @@ def parse_salary(salary_str: str) -> tuple[int, int]:
     return parse_salary_to_monthly(salary_str)
 
 
+# 单条岗位的技能标签上限：skills 列是 String(500)，且标签太多会让技能分布图
+# 变成噪声。8 是原有口径，本轮修漏标时**保留**，没有借机放宽。
+MAX_SKILLS = 8
+
+
 def extract_skills(title: str, description: str) -> str:
-    """从标题与描述里抽取技能标签（最多 8 个，逗号分隔）。
+    """从标题与描述里抽取技能标签（最多 :data:`MAX_SKILLS` 个，逗号分隔）。
 
     匹配规则见 :func:`_build_skill_matcher` —— 短英文词走词边界，
     否则 ``Go`` 会把每一条 ``Django`` 岗位都污染成双技能。
+
+    **两阶段取词（2026-11-22 修漏标）**：
+
+    旧实现把标题和正文拼成一个字符串，词表按**长度降序**扫，收满 8 个就 break。
+    长词（`Spring Cloud` / `RabbitMQ` / `SpringBoot`）会先把 8 个位子占满，
+    标题里的短词 `Java` 永远轮不到：
+
+        extract_skills("Java开发工程师", "熟悉 Spring Cloud、SpringBoot、RabbitMQ、…")
+        # 旧：Spring Cloud,SpringBoot,RabbitMQ,MyBatis,Spring,Docker,Kafka,Nginx（无 Java）
+
+    现在分两轮，**每轮内部仍按长度降序**：
+
+    1. 先在**标题**里命中 —— 标题是岗位最可靠的信号，一条「Java 开发工程师」
+       里 Java 必须排在 Nginx 前面；
+    2. 再在**正文**里补齐剩下的名额 —— 上限仍是 8，不无限扩。
+
+    为什么不在每轮里改成"标题命中加权排序"：那样要先把所有词都匹配一遍再排序，
+    词边界判据不变但多一轮遍历；两阶段在一次遍历里就得到相同语义，也更容易测。
+
+    **保住的性质**：每轮内部仍是长词优先，所以正文只提 `SpringBoot` 时，
+    `Spring` 不会先在字母边界上命中再占一个位子（旧实现修的就是这个）。
+
+    **代价（说清楚，实测口径，别信"不受影响"这种话）**：
+    - 标签顺序从"纯按长度"变成"标题组在前、正文组在后"。下游若假设标签按长度
+      排序会看到变化；
+    - **它不是"只增不减"**：名额固定 8 个，标题词插进来就会把末尾的正文长词挤出去。
+      全库重算的实测口径是「新增 13 个标签 / 移除 13 个标签」—— 移除的全部发生在
+      13 条 Java 岗位上（每条用 `Java` 换掉一个 Linux/Redis/Nginx/Docker 之类的辅助技能），
+      非 Java 岗位零丢失。所以这是**用核心技能换辅助技能**，方向是对的，但
+      "技能集合是旧结果的超集"这句话**不成立**，下游不要据此假设标签只增不减；
+    - 标题里若有 8 个及以上技能，正文技能会被全部挤掉 —— 标题短，这种情况罕见，
+      且比起"标题核心技能被正文长词挤掉"，这个取舍明显更划算；
+    - 词边界规则没动：「JavaScript」岗位仍然不会被打上 Java（回归用例锁着）。
     """
-    text = f"{title} {description}"
-    found = []
+    title_text = str(title or "")
+    body_text = str(description or "")
+
     all_skills = []
     for category, skills in SKILL_KEYWORDS_FULL.items():
         all_skills.extend(skills)
     # 长词优先，避免 "Spring" 抢先占位后 "SpringBoot" 被挤掉
     all_skills.sort(key=len, reverse=True)
-    for skill in all_skills:
-        if skill in found:
-            continue
-        matcher = _SKILL_MATCHERS.get(skill)
-        if matcher is not None and matcher.search(text):
-            found.append(skill)
-        if len(found) >= 8:
-            break
+
+    found = []
+    for text in (title_text, body_text):
+        for skill in all_skills:
+            if len(found) >= MAX_SKILLS:
+                break
+            if skill in found:
+                continue
+            matcher = _SKILL_MATCHERS.get(skill)
+            if matcher is not None and matcher.search(text):
+                found.append(skill)
     return ",".join(found)
 
 

@@ -422,5 +422,6 @@ class KnowledgeService:
             "enabled": enabled,
             "manual": manual,
             "auto": auto,
-            "total_usage": int(total_usage or 0),
+            # COALESCE 已保证非 NULL 且 SUM(int) 是 int，不需要 `or 0` 再兜一层
+            "total_usage": int(total_usage),
         }

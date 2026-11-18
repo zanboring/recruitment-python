@@ -175,3 +175,50 @@ def test_技能抽取允许数字紧邻_Python3仍是Python():
     skills = extract_skills("后端开发", "熟悉 Python3 与 MySQL8.0，有两年经验").split(",")
     assert "Python" in skills
     assert "MySQL" in skills
+
+
+# --------------------------------------------------------------------------
+# 2026-11-22 漏标修复：短技能名被长名挤出 8 个上限
+#
+# 旧实现把标题和正文拼成一个字符串、按词长降序扫，8 个长词先占满名额，
+# 标题里的 Java 永远轮不到。现在两阶段：标题命中先收，正文命中补齐，
+# 每阶段内部仍按长度降序（保住 SpringBoot 优先于 Spring）。
+# --------------------------------------------------------------------------
+
+
+def test_标题命中优先于正文命中():
+    title_only_hit = extract_skills("Java开发工程师", "熟悉 Linux、Docker、Nginx、Git、Maven")
+    tags = title_only_hit.split(",")
+    assert "Java" in tags, title_only_hit
+    assert tags[0] == "Java", f"标题里的核心技能必须排在正文标签前：{title_only_hit}"
+
+
+def test_短技能名不被长名挤出():
+    """集成端复现原文：8 个长词在前，Java 在最后一句。"""
+    desc = (
+        "熟悉 Spring Cloud、SpringBoot、RabbitMQ、MyBatis、Kafka、"
+        "Elasticsearch、Docker、Nginx，Java 基础扎实"
+    )
+    tags = extract_skills("Java开发工程师", desc).split(",")
+    assert "Java" in tags, f"Java 被长词挤出 8 个上限：{tags}"
+    assert len(tags) <= 8, f"上限失效：{tags}"
+
+
+def test_纯前端岗位不含Java():
+    """回归防线：修漏标不能把上一轮修好的 Java/JavaScript 误命中带回来。"""
+    tags = extract_skills("前端开发工程师", "熟悉 JavaScript、Vue、CSS3").split(",")
+    assert "Java" not in tags, tags
+    assert "JavaScript" in tags, tags
+
+
+def test_两阶段仍保住长词优先与上限():
+    """SpringBoot 命中后 Spring 不该再占一个位子；标题命中多时也不能超 8。"""
+    spring = extract_skills("后端开发", "熟悉 SpringBoot 微服务").split(",")
+    assert "SpringBoot" in spring and "Spring" not in spring, spring
+
+    many = extract_skills(
+        "Java、Python、Go、Vue、React、Docker、Kafka、Redis 全栈工程师",
+        "熟悉 Spring Cloud、RabbitMQ、MySQL、Nginx、Git、Maven",
+    ).split(",")
+    assert len(many) == 8, many
+    assert "Java" in many and "Redis" in many
