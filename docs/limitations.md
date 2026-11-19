@@ -23,7 +23,7 @@
 | 看板 / 图表展示 | 完整（前端调用链已逐行核对） | 代码静态核对 + 只读 SQL；未起服务 | 平均薪资、企业数量、分析摘要、DataCompare 四处展示缺陷已修；残留口径不一致见 §11 |
 | 声明式规格引擎 | 部分（HTML / CSS / JSON 路径） | 抽取层在公开示例上验证过；真实招聘站未打通 | `type: api` 禁止 `detail.*`；已登记 boss / 51job / quotes_demo，51job 搜索接口被 WAF 拦在 HTML |
 | RAG 问答 | 完整 | 代码静态核对 | 知识库 21 条，与岗位库独立；不能回答「这条岗位具体要求什么」 |
-| 测试基线 | 完整 | 文档声明 1211 项 / 75 个测试文件；本工位未复跑 collect-only | 75 个测试文件为静态实测；1211 项含 parametrize 展开，读源码数不出，数字以 `docs/showcase.md` 声明为准 |
+| 测试基线 | 完整 | 文档声明 1216 项 / 75 个测试文件；本工位未复跑 collect-only | 75 个测试文件为静态实测；1216 项含 parametrize 展开，读源码数不出，数字以 `docs/showcase.md` 声明为准 |
 
 ## 二、逐条说明
 
@@ -154,9 +154,9 @@
 
 ### 13. 测试基线与文档契约
 
-- **文档声明**：`docs/showcase.md:28` 写 **1211 项，全部通过**（75 个测试文件）；`:63` 写「1211 项全绿」；`:31` 标注口径为测试数取 `pytest` 汇总行、文件数按 `tests/test_*.py` 计。
+- **文档声明**：`docs/showcase.md:28` 写 **1216 项，全部通过**（75 个测试文件）；`:63` 写「1216 项全绿」；`:31` 标注口径为测试数取 `pytest` 汇总行、文件数按 `tests/test_*.py` 计。
 - **本工位可静态核对**：`tests/test_*.py` 共 75 个文件；源码内 `def test_` 1048 个、`@pytest.mark.parametrize` 38 处（参数化会展开，读源码数不出总条数）。
-- **未本地复跑**：本工位全局 Python 缺 `pytest` / `pydantic` / `fastapi`，`scripts/check_docs.py` 与 `pytest --collect-only` 起不来；1211 项未在本工位重跑，数字以 `showcase.md` 声明与各轮报告口径为准（archive-c codebuddy F1 轮 1177、trae 轮 1180、showcase 最终声明 1211）。
+- **未本地复跑**：本工位全局 Python 缺 `pytest` / `pydantic` / `fastapi`，`scripts/check_docs.py` 与 `pytest --collect-only` 起不来；1216 项未在本工位重跑，数字以 `showcase.md` 声明与各轮报告口径为准（archive-c codebuddy F1 轮 1177、trae 轮 1180、showcase 最终声明 1216）。
 
 ### 14. 回填已可执行，并在真实站点跑过一批
 
@@ -223,7 +223,7 @@
   但不再逐行提交，1 万行实测 **32.37s → 0.17s**；计数恒等式
   `success + skip + fail + skipped_empty == total` 在异常路径下仍成立。
 
-测试基线同步 **1187 → 1211**（qoder 4 条契约用例 + codebuddy 2 条导入用例）。
+测试基线同步 **1187 → 1216**（qoder 4 条契约用例 + codebuddy 2 条导入用例）。
 
 ## 六、2026-11-17 补记：skills 列已重算
 
@@ -264,3 +264,25 @@ trae 在短文岗位专项里查出一个影响口径的事实，集成端已用
 
 **对展示的影响**：技能分布、推荐、画像里，约一半岗位的证据只有标题。
 不要对外讲「基于岗位描述做画像」——准确说法是「基于标题 + 部分岗位的描述」。
+
+## 八、2026-11-19 补记：`detail_html` 不是"硬边界"，是缺登录态 + 路径没跑到
+
+上一版把 `detail_html` 0/555 归为"详情页未登录态打不开，硬边界"。doubao 从代码层追完写入链路后，
+这个说法需要修正（依据见 `D:/Dev/_tasks/staging/doubao/docs/detail_html口径.md`，行号均经回读）：
+
+| 写入路径 | 能否写 `detail_html` | 依据 |
+|---|---|---|
+| 静态 HTML | **能**，前提是详情页匿名可开且 `parse_detail_html` 认出结构 | `app/crawlers/detail_fetcher.py:585` |
+| 浏览器渲染 | **不能**，固定写空串，只取 DOM 正文/时间 | `:608` |
+| 搜索兜底 | **不能**，HTML 来自 `:818` 固定返回的空串；搜索 JSON 项无整页 HTML 字段 | `:635`, `:818`, `app/crawlers/job51.py:114-124` |
+| 链接导入 | **能**，且**无需登录**（对匿名可开的静态/SSR 页面） | `app/services/url_import_service.py:328` |
+
+**所以真实原因是**：555 条全是 51job 来源 → 渲染与搜索路径结构上不产 HTML → 静态路径被登录墙挡住，
+且代码里**没有 Cookie / storage_state 的来源**（浏览器每岗位新建匿名上下文 `:489-494`，配置层无 Cookie 项）。
+
+**"硬边界"错在哪**：它暗示"做什么都拿不到"。实际上两条路可补——
+① 给抓取上下文注入登录 Cookie / storage_state；② 链接导入通道对匿名可开的页面直接写 HTML。
+两者都不是代码上不可能，只是当前没做。
+
+**对外表述**：不要说"详情页拿不到"，准确说法是"**51job 详情页需登录态，当前抓取链路未接登录态；
+另有链接导入通道可写整页 HTML**"。

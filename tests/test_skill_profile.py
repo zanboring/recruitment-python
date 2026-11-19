@@ -94,3 +94,91 @@ async def test_skill_profile_market_demand(db_session, profile_jobs):
 async def test_skill_profile_empty_input(db_session, profile_jobs):
     with pytest.raises(ValueError):
         await skill_profile.build_skill_profile(db_session, "  ", limit=10)
+
+
+# ==========================================================================
+# 技能证据来源（2026-11-24）
+#
+# ``skills_sources`` 按标签逐条编码成 ``|title:Java|desc:MySQL|``。
+# 验收问题是「哪些标签来自标题」——下面同时测编码与**真实 SQL 查询**，
+# 避免只测 Python 解析、SQL 里却查不出来（那这一列就白加了）。
+# ==========================================================================
+
+
+def _recompute_module():
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    path = root / "scripts" / "recompute_skills.py"
+    spec = importlib.util.spec_from_file_location("recompute_skills_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_来源编码区分标题与正文():
+    script = _recompute_module()
+    encoded = script.encode_skill_sources(
+        ["Java", "Spring", "MySQL"], "Java开发工程师"
+    )
+    assert encoded == "|title:Java|desc:Spring|desc:MySQL|", encoded
+    assert script.title_labels_from_sources(encoded) == {"Java"}
+    assert script.source_of_label(encoded, "Java") == "title"
+    assert script.source_of_label(encoded, "MySQL") == "desc"
+    assert script.source_of_label(encoded, "Go") == ""
+
+
+def test_短标签不会被长词误判成标题证据():
+    """词表只有 ``Go``（词边界匹配），标题写 Golang 时不该算 Go 的标题证据。
+
+    前后带 ``|`` 的作用另测：查 ``title:Go`` 不能命中 ``title:Golang`` 这类标签。
+    """
+    script = _recompute_module()
+    encoded = script.encode_skill_sources(["Go"], "Golang 工程师")
+    assert encoded == "|desc:Go|", encoded
+    assert script.source_of_label(encoded, "Go") == "desc"
+
+
+def test_用SQL精确查出标题级标签(tmp_path):
+    import sqlite3
+
+    script = _recompute_module()
+    conn = sqlite3.connect(str(tmp_path / "sources.db"))
+    conn.execute("CREATE TABLE job (id INTEGER PRIMARY KEY, skills TEXT, skills_sources TEXT)")
+    conn.executemany(
+        "INSERT INTO job (id, skills, skills_sources) VALUES (?, ?, ?)",
+        [
+            (1, "Java,MySQL", script.encode_skill_sources(["Java", "MySQL"], "Java开发工程师")),
+            (2, "Java,Redis", script.encode_skill_sources(["Java", "Redis"], "后端开发")),
+            (3, "Golang", script.encode_skill_sources(["Golang"], "Golang 工程师")),
+        ],
+    )
+    conn.commit()
+
+    title_java = conn.execute(
+        "SELECT id FROM job WHERE skills_sources LIKE '%|title:Java|%' ORDER BY id"
+    ).fetchall()
+    desc_java = conn.execute(
+        "SELECT id FROM job WHERE skills_sources LIKE '%|desc:Java|%' ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    assert title_java == [(1,)]
+    assert desc_java == [(2,)]
+
+
+def test_老库补列是幂等的(tmp_path):
+    import sqlite3
+
+    script = _recompute_module()
+    conn = sqlite3.connect(str(tmp_path / "old.db"))
+    conn.execute("CREATE TABLE job (id INTEGER PRIMARY KEY, skills TEXT)")
+    conn.commit()
+
+    assert script._ensure_sources_column(conn) is True
+    assert script._ensure_sources_column(conn) is False
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(job)")}
+    conn.close()
+    assert "skills_sources" in cols

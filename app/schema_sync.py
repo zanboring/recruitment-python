@@ -45,6 +45,38 @@ from app.database import Base
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# 手工变更清单（2026-11-24 补）
+#
+# 本模块的自动补齐靠比对 Base.metadata 与数据库实际列，**不需要**在这里登记
+# 新列也会生效。但 README 那份"手工补列清单"已经漏过 job.last_checked_at，
+# 任务书要求把清单补进**代码里**，免得文档再次漂移。
+#
+# 每条：(表, 列, 三库通用的列定义片段说明, 手工 ALTER 示例)
+# 自动驾驶用 CreateColumn 按当前方言编译；这里只是给人看的审计记录 +
+# 测试锚点（新增列必须在这里有条目）。类型选择：
+#   SQLite/MySQL/PG 都接受 VARCHAR(500)；可空、无默认值 → 老行自动填 NULL，
+#   _can_auto_add 判定安全。
+SCHEMA_CHANGELOG = (
+    {
+        "table": "job",
+        "column": "last_checked_at",
+        "type": "DateTime",
+        "note": "补登记此前 README 漏掉的列；ALTER TABLE job ADD COLUMN last_checked_at DATETIME",
+    },
+    {
+        "table": "job",
+        "column": "skills_sources",
+        "type": "String(500)",
+        "note": (
+            "技能证据来源，编码 |title:Java|desc:MySQL|；"
+            "ALTER TABLE job ADD COLUMN skills_sources VARCHAR(500)；"
+            "MySQL/PG 由 CreateColumn 编译，SQLite 实测"
+        ),
+    },
+)
+
+
 @dataclass
 class SyncResult:
     """一次 schema 同步的结果。

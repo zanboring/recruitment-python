@@ -21,6 +21,12 @@ class Job(Base):
     max_salary = Column(DECIMAL(15, 2))
     salary_unit = Column(String(10), default="元")
     skills = Column(String(500))
+    # 每个技能标签的证据来源（2026-11-24 新增）。
+    # 编码为 ``|title:Java|desc:MySQL|`` —— 与 skills 的逗号串一一对应，
+    # 前后都带 | 是为了能精确查「哪些标签来自标题」：
+    #   SELECT ... WHERE skills_sources LIKE '%|title:Java|%'
+    # 不改 skills 的语义；NULL / 空串表示尚未标注（老数据、或爬虫新写入的行）。
+    skills_sources = Column(String(500))
     job_desc = Column(Text)
     url = Column(String(500))
     detail_html = Column(Text)

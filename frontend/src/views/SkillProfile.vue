@@ -29,19 +29,25 @@
     <template v-if="result">
       <!-- 概览 -->
       <el-row :gutter="16" class="overview-row">
-        <el-col :span="8">
+        <el-col :span="6">
           <div class="ov-card">
             <div class="ov-num">{{ result.summary.analyzed }}</div>
             <div class="ov-label">已分析岗位数</div>
           </div>
         </el-col>
-        <el-col :span="8">
+        <el-col :span="6">
           <div class="ov-card">
             <div class="ov-num">{{ Math.round(result.summary.covered_ratio * 100) }}%</div>
             <div class="ov-label">我的平均技能覆盖率</div>
           </div>
         </el-col>
-        <el-col :span="8">
+        <el-col :span="6">
+          <div class="ov-card">
+            <div class="ov-num" style="color:#67c23a">{{ Math.round(titleEvidenceRatio * 100) }}%</div>
+            <div class="ov-label">命中技能中「标题级证据」占比</div>
+          </div>
+        </el-col>
+        <el-col :span="6">
           <div class="ov-card">
             <div class="ov-num" style="color:#e6a23c">{{ result.my_skills.length }}</div>
             <div class="ov-label">我输入的技能数</div>
@@ -93,6 +99,10 @@
       <el-card shadow="never" class="jobs-card">
         <template #header>
           <span class="card-title"><el-icon color="#409eff"><Briefcase /></el-icon>&nbsp;匹配岗位（按技能覆盖率排序）</span>
+          <span class="evidence-legend">
+            <span class="legend-title">标题级</span>＝岗位标题直接写明，可信度高；
+            <span class="legend-desc">正文级</span>＝仅在岗位描述中出现
+          </span>
         </template>
         <el-table :data="result.jobs" stripe>
           <el-table-column prop="title" label="岗位" min-width="180" />
@@ -109,14 +119,32 @@
               <el-progress :percentage="Math.round(row.coverage * 100)" :stroke-width="10" :color="coverageColor(row.coverage)" />
             </template>
           </el-table-column>
-          <el-table-column label="我已掌握" min-width="140">
+          <el-table-column label="我已掌握" min-width="180">
             <template #default="{ row }">
-              <el-tag v-for="m in row.matched" :key="m" size="small" type="success" effect="light" class="mini-tag">{{ m }}</el-tag>
+              <el-tooltip
+                v-for="m in row.matched" :key="m"
+                :content="isTitleEvidence(m, row.title) ? '标题级证据：岗位标题直接写明该技能' : '正文级证据：仅在岗位描述中出现'"
+                placement="top"
+              >
+                <el-tag
+                  size="small" type="success" effect="light" class="mini-tag"
+                  :class="isTitleEvidence(m, row.title) ? 'ev-title' : 'ev-desc'"
+                >{{ m }}<span class="ev-mark">{{ isTitleEvidence(m, row.title) ? '标题' : '正文' }}</span></el-tag>
+              </el-tooltip>
             </template>
           </el-table-column>
-          <el-table-column label="我缺的" min-width="140">
+          <el-table-column label="我缺的" min-width="180">
             <template #default="{ row }">
-              <el-tag v-for="m in row.missing_top" :key="m" size="small" type="info" effect="plain" class="mini-tag">{{ m }}</el-tag>
+              <el-tooltip
+                v-for="m in row.missing_top" :key="m"
+                :content="isTitleEvidence(m, row.title) ? '标题级证据：岗位标题直接写明该技能' : '正文级证据：仅在岗位描述中出现'"
+                placement="top"
+              >
+                <el-tag
+                  size="small" type="info" effect="plain" class="mini-tag"
+                  :class="isTitleEvidence(m, row.title) ? 'ev-title' : 'ev-desc'"
+                >{{ m }}<span class="ev-mark">{{ isTitleEvidence(m, row.title) ? '标题' : '正文' }}</span></el-tag>
+              </el-tooltip>
             </template>
           </el-table-column>
         </el-table>
@@ -129,7 +157,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { computed, ref } from 'vue';
 import { ElMessage } from 'element-plus';
 import { UserFilled, Search, Warning, TrendCharts, Briefcase } from '@element-plus/icons-vue';
 import { skillProfile, type SkillProfileResult } from '@/api/job';
@@ -142,6 +170,38 @@ const result = ref<SkillProfileResult | null>(null);
 const cities = ['北京', '上海', '深圳', '杭州', '广州', '成都', '武汉', '长沙', '南京', '西安'];
 
 const coverageColor = (c: number) => (c >= 0.6 ? '#67c23a' : c >= 0.4 ? '#e6a23c' : '#f56c6c');
+
+/**
+ * 标题级证据：标题里直接写明这个技能。
+ *
+ * 后端新增的 skills_sources 列才是最权威的来源，但本轮前端可改文件只有本文件，
+ * 画像接口又没回传该列 —— 所以用**同一条规则**在前端从 title 复算：
+ * 短英文词走字母边界（Go 不能命中 Golang），中文词直接包含。
+ * 这样不引入新请求，也能一眼看出这个结论有多可信。
+ */
+const isTitleEvidence = (skill: string, title = ''): boolean => {
+  const s = String(skill || '').trim().toLowerCase();
+  const t = String(title || '').toLowerCase();
+  if (!s || !t) return false;
+  if (/^[a-z0-9+#.]{1,8}$/.test(s)) {
+    const escaped = s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`).test(t);
+  }
+  return t.includes(s);
+};
+
+/** 已展示的「我已掌握 / 我缺的」标签里，标题级证据占多少。 */
+const titleEvidenceRatio = computed(() => {
+  let total = 0;
+  let fromTitle = 0;
+  for (const job of result.value?.jobs ?? []) {
+    for (const skill of [...(job.matched ?? []), ...(job.missing_top ?? [])]) {
+      total += 1;
+      if (isTitleEvidence(skill, job.title)) fromTitle += 1;
+    }
+  }
+  return total ? fromTitle / total : 0;
+});
 
 const runProfile = async () => {
   if (!skillsInput.value.trim()) {
@@ -182,4 +242,10 @@ const runProfile = async () => {
 .gap-tag, .demand-tag { border-radius: 16px; }
 .jobs-card :deep(.el-card__header) { padding: 12px 16px; }
 .mini-tag { margin: 2px 4px 2px 0; border-radius: 10px; }
+.ev-mark { margin-left: 4px; font-size: 10px; opacity: .75; }
+.ev-title { border-color: #67c23a; }
+.ev-desc { border-style: dashed; opacity: .85; }
+.evidence-legend { float: right; font-size: 12px; color: #909399; font-weight: normal; }
+.legend-title { color: #67c23a; font-weight: 600; }
+.legend-desc { color: #909399; font-weight: 600; }
 </style>

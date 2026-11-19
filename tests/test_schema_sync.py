@@ -339,3 +339,24 @@ def test_旧库启动时会自动补列(tmp_path):
         "以及它是否排在 create_all 之后。\n"
         f"--- stdout ---\n{result.stdout[-1500:]}"
     )
+
+
+def test_手工变更清单登记了本次新增列():
+    """schema_sync 靠 Base.metadata 自动比对，但 README 那份手工清单曾漏过项。
+
+    现在清单放进代码里，并由这条用例锚住：新增的 ``job.skills_sources``
+    必须同时出现在模型与变更清单，不能只改其中一处。
+    """
+    from app.models.job import Job
+    from app.schema_sync import SCHEMA_CHANGELOG
+
+    model_columns = set(Job.__table__.columns.keys())
+    logged = {(item["table"], item["column"]) for item in SCHEMA_CHANGELOG}
+
+    assert "skills_sources" in model_columns
+    assert ("job", "skills_sources") in logged
+    assert ("job", "last_checked_at") in logged, "此前 README 漏掉的那列也要补登记"
+    assert all(table == "job" and column in model_columns for table, column in logged)
+
+    entry = next(i for i in SCHEMA_CHANGELOG if i["column"] == "skills_sources")
+    assert "VARCHAR(500)" in entry["note"], "三库通用 DDL 要写在清单里，别让人再去翻模型"

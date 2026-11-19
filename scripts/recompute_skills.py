@@ -8,11 +8,12 @@
 ``extract_skills(title, job_desc)`` 一致）。推荐、技能画像、技能分布全读这一列，
 不重算等于回填只落地了一半。
 
-**三条硬约束**
+**四条硬约束**
 
-1. **只 UPDATE ``skills`` 一列**。``job_status`` / 薪资 / 标题 / 正文 /
-   ``job_key`` / ``updated_at`` 一个字不碰。写前写后对其它列做一次指纹比对
-   （:func:`_fingerprint`），不一致就报红线并返回退出码 3。
+1. **只 UPDATE ``skills`` 与 ``skills_sources`` 两列**。``skills`` 的语义不变
+   （还是逗号串标签），``skills_sources`` 是 2026-11-24 新增的证据来源列。
+   ``job_status`` / 薪资 / 标题 / 正文 / ``job_key`` / ``updated_at`` 一个字不碰。
+   写前写后对其它列做一次指纹比对（:func:`_fingerprint`），不一致就报红线并返回退出码 3。
 2. **覆盖而非合并**。库里的旧值与 ``extract_skills`` 同源，当年只是正文短所以少；
    集成端在副本上实测「变多 120 行 / 变少 0 行 / 相同 20 行」。
    脚本仍把「变多 / 变少 / 同数不同序」分开统计 —— 真出现变少也不会被
@@ -91,13 +92,78 @@ _NON_SKILLS_COLUMNS = (
 )
 
 
+SOURCES_COLUMN = "skills_sources"
+
+
 def _labels(value) -> list:
     """把逗号分隔的技能串拆成列表（去空白、去空项）。"""
     return [s.strip() for s in str(value or "").split(",") if s.strip()]
 
 
+def encode_skill_sources(labels, title) -> str:
+    """给 ``skills`` 的**每个**标签标一个来源，编码成 ``|title:X|desc:Y|``。
+
+    为什么按标签逐条编码（而不是 ``title=...,...|desc=...``）：
+    验收问题是「哪些标签来自标题」——逐条编码后，精确查询就是一个 LIKE：
+
+        SELECT id FROM job WHERE skills_sources LIKE '%|title:Java|%'
+
+    逗号分组的写法要先把整段取回再切字符串，在 SQL 里查不了。
+    前后都带 ``|`` 是为了防止 ``title:Go`` 命中 ``title:Golang`` 这种假阳性。
+
+    判定复用 ``cleaner._SKILL_MATCHERS``（抽取逻辑本轮**不改**，只是读一下
+    哪些标签能从标题匹配到）。注意这是**只读引用**：改抽取规则仍只在 cleaner 一处。
+    """
+    from app.crawlers.cleaner import _SKILL_MATCHERS
+
+    title_hits = {
+        skill for skill, matcher in _SKILL_MATCHERS.items()
+        if matcher.search(str(title or ""))
+    }
+    if not labels:
+        return ""
+    return "|" + "|".join(
+        f"{'title' if label in title_hits else 'desc'}:{label}" for label in labels
+    ) + "|"
+
+
+def title_labels_from_sources(value) -> set:
+    """解析出「标题级证据」的标签集合（验证与反查都用它）。"""
+    return {
+        part[len("title:"):] for part in str(value or "").split("|")
+        if part.startswith("title:")
+    }
+
+
+def source_of_label(value, label: str) -> str:
+    """查一个具体标签的来源：``title`` / ``desc`` / ``""``（未标注）。"""
+    text = str(value or "")
+    if f"|title:{label}|" in text:
+        return "title"
+    if f"|desc:{label}|" in text:
+        return "desc"
+    return ""
+
+
+def _has_sources_column(conn: sqlite3.Connection) -> bool:
+    return SOURCES_COLUMN in {row[1] for row in conn.execute("PRAGMA table_info(job)")}
+
+
+def _ensure_sources_column(conn: sqlite3.Connection) -> bool:
+    """老库上补列（SQLite）。返回是否真的补了。
+
+    正常部署走 ``app/schema_sync.py`` 启动时自动加列；这里再兜一层，是因为
+    重算脚本常被直接拿一个旧副本跑，那种情况下不能让 UPDATE 报 no such column。
+    """
+    if _has_sources_column(conn):
+        return False
+    conn.execute(f"ALTER TABLE job ADD COLUMN {SOURCES_COLUMN} VARCHAR(500)")
+    conn.commit()
+    return True
+
+
 def _fingerprint(conn: sqlite3.Connection) -> tuple:
-    """整表非 ``skills`` 列的指纹（行数 + 每行这些列的内容）。
+    """整表非 ``skills`` / ``skills_sources`` 列的指纹（行数 + 每行这些列的内容）。
 
     只用来证明"这次重算没碰别的列"，不追求密码学强度 —— 只要在几百行的规模上
     能区分"变了 / 没变"就够了。整表而不是只算被处理的行：``--limit`` 时
@@ -118,19 +184,28 @@ def _collect_changes(conn: sqlite3.Connection, limit: int, stats: dict) -> list:
     stats["rows_total"] = conn.execute("SELECT COUNT(*) FROM job").fetchone()[0]
 
     changes = []
-    cursor = conn.execute("SELECT id, title, job_desc, skills FROM job ORDER BY id")
-    for job_id, title, desc, old_value in cursor:
+    has_sources = _has_sources_column(conn)
+    select = "SELECT id, title, job_desc, skills" + (
+        f", {SOURCES_COLUMN}" if has_sources else ""
+    ) + " FROM job ORDER BY id"
+    for row in conn.execute(select):
+        job_id, title, desc, old_value = row[:4]
+        old_sources = str(row[4] or "") if has_sources else ""
         if limit > 0 and stats["processed"] >= limit:
             break
         old_labels = _labels(old_value)
         new_value = extract_skills(title or "", desc or "")
         new_labels = _labels(new_value)
+        new_sources = encode_skill_sources(new_labels, title)
 
         stats["processed"] += 1
         stats["labels_before"] += len(old_labels)
         stats["labels_after"] += len(new_labels)
 
-        if tuple(old_labels) == tuple(new_labels):
+        if old_sources != new_sources:
+            stats["sources_changed"] += 1
+
+        if tuple(old_labels) == tuple(new_labels) and old_sources == new_sources:
             stats["same"] += 1
             continue
 
@@ -144,16 +219,17 @@ def _collect_changes(conn: sqlite3.Connection, limit: int, stats: dict) -> list:
         old_set, new_set = set(old_labels), set(new_labels)
         stats["added"] += len(new_set - old_set)
         stats["removed"] += len(old_set - new_set)
-        changes.append((job_id, old_labels, new_labels, new_value))
+        changes.append((job_id, old_labels, new_labels, new_value, new_sources))
     return changes
 
 
 def _apply_changes(conn: sqlite3.Connection, changes: list) -> int:
-    """只写 ``skills`` 一列，单事务提交；返回实际影响行数。"""
+    """只写 ``skills`` 与 ``skills_sources`` 两列，单事务提交；返回实际影响行数。"""
     before = conn.total_changes
     conn.executemany(
-        "UPDATE job SET skills = ? WHERE id = ?",
-        [(new_value, job_id) for job_id, _old, _new, new_value in changes],
+        f"UPDATE job SET skills = ?, {SOURCES_COLUMN} = ? WHERE id = ?",
+        [(new_value, sources, job_id)
+         for job_id, _old, _new, new_value, sources in changes],
     )
     conn.commit()
     return conn.total_changes - before
@@ -177,8 +253,12 @@ def _print_summary(*, stats: dict, elapsed: float, dry_run: bool,
         f"（{stats['labels_after'] - stats['labels_before']:+d}）"
         f"；新增 {stats['added']} 个 / 移除 {stats['removed']} 个"
     )
+    print(
+        f"来源标注：{stats['sources_changed']} 条新增/更新"
+        "（title=标题直接写明 / desc=仅正文提及；编码 |title:X|desc:Y|）"
+    )
     if not dry_run:
-        print(f"写入：{written} 行（只改 skills 一列）")
+        print(f"写入：{written} 行（只改 skills 与 skills_sources 两列）")
         if fingerprint_ok is True:
             print("红线校验：其它列指纹前后一致（job_status / 薪资 / 标题 / 正文 / job_key 未变）")
         elif fingerprint_ok is False:
@@ -208,7 +288,7 @@ def run(args) -> int:
     started = time.time()
     stats = {
         "processed": 0, "changed": 0, "same": 0, "more": 0, "fewer": 0,
-        "reordered": 0, "added": 0, "removed": 0,
+        "reordered": 0, "added": 0, "removed": 0, "sources_changed": 0,
         "labels_before": 0, "labels_after": 0, "rows_total": 0,
     }
     backup_path = None
@@ -228,7 +308,7 @@ def run(args) -> int:
             f"标签 {stats['labels_before']} → {stats['labels_after']}"
             f"（{stats['labels_after'] - stats['labels_before']:+d}）"
         )
-        for idx, (job_id, old_labels, new_labels, _new_value) in enumerate(changes, 1):
+        for idx, (job_id, old_labels, new_labels, _new_value, _sources) in enumerate(changes, 1):
             print(
                 f"[{idx}/{len(changes)}] id={job_id} "
                 f"{len(old_labels)}→{len(new_labels)} 个标签：{','.join(new_labels)[:80]}"
@@ -245,6 +325,10 @@ def run(args) -> int:
             print(f"\n[ABORT] {exc}\n        未做任何写入；坏备份已删除。")
             return 5
         print(f"已备份：{backup_path}（{backup_path.stat().st_size} 字节，integrity_check=ok）")
+
+        # 老库副本可能还没有新列：在备份之后、写入之前补上（dry-run 不会走到这里）
+        if _ensure_sources_column(conn):
+            print(f"已补列：job.{SOURCES_COLUMN} VARCHAR(500)（旧库副本，schema_sync 同款 DDL）")
 
         written = _apply_changes(conn, changes)
         after_fingerprint = _fingerprint(conn)
